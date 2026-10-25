@@ -2254,11 +2254,14 @@ struct EngineState {
 
     // Called only by the worker. Terminal delivery is deliberately insufficient:
     // finished requests still in active_requests may retain KV/recurrent state.
-    Request* PopReadyPendingRequest(bool exclusive_execution) {
+    Request* PopReadyPendingRequest(bool exclusive_execution, int max_active_requests = 0) {
         bool blocked = false;
-        if (exclusive_execution) {
+        if (exclusive_execution || max_active_requests > 0) {
             std::lock_guard<std::mutex> lock(active_mu);
-            blocked = !active_requests.empty();
+            const size_t capacity = exclusive_execution ? 1u : static_cast<size_t>(max_active_requests);
+            // Finished requests retain their state until worker retirement.
+            // Pending requests must stay raw until that memory slot is free.
+            blocked = active_requests.size() >= capacity;
         }
         if (!blocked) return pending_requests.Pop();
         return pending_requests.PopMatching([this](Request* req) {

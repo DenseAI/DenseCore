@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,7 @@ void EnablePauseAfterPendingPublishForTest(bool enabled);
 bool WaitForPauseAfterPendingPublishForTest(int timeout_ms);
 void ReleasePauseAfterPendingPublishForTest();
 void EnablePauseAfterSchedulerAdmissionForTest(bool enabled);
+void SetSchedulerAdmissionPauseCountForTest(int count);
 bool WaitForPauseAfterSchedulerAdmissionForTest(int timeout_ms);
 void ReleasePauseAfterSchedulerAdmissionForTest();
 }  // namespace testing
@@ -553,4 +555,150 @@ TEST_F(RequestLifecycleTest, AutoEmbeddingRejectsUnsupportedMetadataBeforeAdmiss
     ASSERT_TRUE(explicit_last.Wait(15s));
     EXPECT_EQ(explicit_last.callback_count, 1);
     EXPECT_GT(explicit_last.terminal_size, 0);
+}
+
+TEST_F(RequestLifecycleTest, RecurrentAdmissionCapsEightSlotsAndCancellationBypassesTheRawQueue) {
+    constexpr int capacity = 8, count = 64;
+    auto* state = static_cast<EngineState*>(engine_);
+    std::array<CallbackState, count> callbacks;
+    std::array<int, count> ids;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    for (int i = 0; i < count; ++i) {
+        ids[i] = SubmitRequestWithSamplingConstraintsCallbackEx(
+            engine_, "queued-state-budget", 32, nullptr, 0.0f, 1.0f, 1, 1.0f, nullptr, 0, nullptr, 0, 0, nullptr, 0,
+            LifecycleCallbackEx, &callbacks[i]);
+        ASSERT_GT(ids[i], 0) << DenseCoreGetLastError();
+    }
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    // The dequeue pause precedes recurrent allocation. Use a tiny synthetic SSM
+    // to prove actual state allocation without any external model artifact.
+    auto* entry = state->GetDefaultModel();
+    ASSERT_NE(entry, nullptr);
+    entry->kv_config.max_num_seqs = capacity;
+    state->fast_path_config.worker.prefix_cache_reuse_disabled = true;
+    auto* model = entry->model.get();
+    model->arch_flags.is_hybrid_ssm = true;
+    model->ssm_inner_size = 2;
+    model->ssm_group_count = 1;
+    model->ssm_state_size = 2;
+    model->ssm_time_step_rank = 1;
+    model->ssm_conv_kernel = 2;
+    model->ssm_layer_states.resize(1);
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    densecore::testing::SetSchedulerAdmissionPauseCountForTest(capacity);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    {
+        std::lock_guard<std::mutex> lock(state->active_mu);
+        ASSERT_EQ(state->active_requests.size(), capacity);
+        for (const auto* active : state->active_requests) {
+            ASSERT_EQ(active->ssm_runtime_states.size(), 1u);
+            EXPECT_EQ(active->ssm_runtime_states[0].conv_state.size(), 6u);
+            EXPECT_EQ(active->ssm_runtime_states[0].ssm_state.size(), 4u);
+        }
+    }
+    EXPECT_EQ(state->pending_requests.Size(), count - capacity);
+    Request* canceled_raw = nullptr;
+    int raw_count = 0;
+    EXPECT_EQ(state->pending_requests.PopMatching([&](Request* pending) {
+        ++raw_count;
+        EXPECT_TRUE(pending->ssm_runtime_states.empty());
+        if (pending->id == ids.back()) canceled_raw = pending;
+        return false;
+    }), nullptr);
+    EXPECT_EQ(raw_count, count - capacity);
+    ASSERT_NE(canceled_raw, nullptr);
+    // Select a cancelled request at the tail even while all eight slots remain
+    // occupied. Its ownership is still covered by fatal dequeue cleanup.
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    ASSERT_EQ(CancelRequest(engine_, ids.back()), DENSECORE_STATUS_OK);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    EXPECT_TRUE(canceled_raw->cancelled.load());
+    EXPECT_TRUE(canceled_raw->ssm_runtime_states.empty());
+    EXPECT_EQ(state->pending_requests.Size(), count - capacity - 1);
+    {
+        std::lock_guard<std::mutex> lock(state->active_mu);
+        EXPECT_EQ(state->active_requests.size(), capacity);
+    }
+    state->fail_worker_for_test.store(true);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    for (auto& callback : callbacks) {
+        ASSERT_TRUE(callback.WaitForFinal());
+        EXPECT_EQ(callback.final_count, 1);
+    }
+    FreeEngine(engine_);
+    engine_ = nullptr;
+    for (const auto& callback : callbacks) EXPECT_EQ(callback.final_count, 1);
+}
+
+TEST_F(RequestLifecycleTest, FullBudgetPreservesNormalCompletionAndPendingUserCancellation) {
+    constexpr int count = 24;
+    auto* state = static_cast<EngineState*>(engine_);
+    std::array<CallbackState, count> callbacks;
+    std::array<int, count> ids;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    for (int i = 0; i < count; ++i) {
+        ids[i] = SubmitRequestWithSamplingConstraintsCallbackEx(
+            engine_, "bounded-normal-completion", 2, nullptr, 0.0f, 1.0f, 1, 1.0f, nullptr, 0, nullptr, 0, 0, nullptr, 0,
+            LifecycleCallbackEx, &callbacks[i]);
+        ASSERT_GT(ids[i], 0) << DenseCoreGetLastError();
+    }
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    state->GetDefaultModel()->kv_config.max_num_seqs = 1;
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    {
+        std::lock_guard<std::mutex> lock(state->active_mu);
+        EXPECT_EQ(state->active_requests.size(), 1u);
+    }
+    EXPECT_EQ(state->pending_requests.Size(), count - 1);
+    ASSERT_EQ(CancelRequest(engine_, ids.back()), DENSECORE_STATUS_OK);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    for (auto& callback : callbacks) {
+        ASSERT_TRUE(callback.WaitForFinal());
+        EXPECT_EQ(callback.final_count, 1);
+    }
+    ASSERT_EQ(callbacks.back().final_texts.size(), 1u);
+    EXPECT_EQ(callbacks.back().final_texts[0], "Error: request canceled");
+    for (int i = 0; i < count - 1; ++i) {
+        ASSERT_EQ(callbacks[i].final_texts.size(), 1u);
+        EXPECT_TRUE(callbacks[i].final_texts[0].empty());
+    }
+}
+
+TEST_F(RequestLifecycleTest, FullBudgetShutdownFinalizesActiveAndRawPendingRequestsOnce) {
+    constexpr int count = 24;
+    auto* state = static_cast<EngineState*>(engine_);
+    std::array<CallbackState, count> callbacks;
+    EngineCloseGuard close_before_callbacks{&engine_};
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    for (auto& callback : callbacks) {
+        ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+            engine_, "bounded-shutdown", 2, nullptr, 0.0f, 1.0f, 1, 1.0f, nullptr, 0, nullptr, 0, 0, nullptr, 0,
+            LifecycleCallbackEx, &callback), 0);
+    }
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    state->GetDefaultModel()->kv_config.max_num_seqs = 1;
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    EXPECT_EQ(state->pending_requests.Size(), count - 1);
+    std::thread shutdown([&] { BeginEngineShutdown(engine_); });
+    const bool began = WaitForEngineShutdownStarted(state);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    shutdown.join();
+    ASSERT_TRUE(began);
+    for (auto& callback : callbacks) {
+        ASSERT_TRUE(callback.WaitForFinal());
+        EXPECT_EQ(callback.final_count, 1);
+    }
+    EXPECT_TRUE(state->pending_requests.Empty());
+    EXPECT_EQ(state->metrics.active_requests.load(), 0);
+    FreeEngine(engine_);
+    engine_ = nullptr;
+    for (const auto& callback : callbacks) EXPECT_EQ(callback.final_count, 1);
 }

@@ -660,6 +660,8 @@ struct SchedulerAdmissionPauseHookState {
     bool pause_enabled = false;
     bool worker_waiting = false;
     bool release_requested = false;
+    int target_admissions = 1;
+    int admissions_seen = 0;
 };
 
 PendingDequeuePauseHookState& PendingDequeuePauseHook() {
@@ -738,6 +740,7 @@ void MaybePauseAfterSchedulerAdmissionForTest() {
     if (!hook.pause_enabled) {
         return;
     }
+    if (++hook.admissions_seen < hook.target_admissions) return;
     hook.worker_waiting = true;
     hook.cv.notify_all();
     hook.cv.wait(lock, [&hook]() { return !hook.pause_enabled || hook.release_requested; });
@@ -750,9 +753,18 @@ void EnablePauseAfterSchedulerAdmissionForTest(bool enabled) {
     auto& hook = SchedulerAdmissionPauseHook();
     std::lock_guard<std::mutex> lock(hook.mu);
     hook.pause_enabled = enabled;
+    hook.target_admissions = 1;
+    hook.admissions_seen = 0;
     hook.worker_waiting = false;
     hook.release_requested = !enabled;
     hook.cv.notify_all();
+}
+
+void SetSchedulerAdmissionPauseCountForTest(int count) {
+    auto& hook = SchedulerAdmissionPauseHook();
+    std::lock_guard<std::mutex> lock(hook.mu);
+    hook.target_admissions = std::max(1, count);
+    hook.admissions_seen = 0;
 }
 
 bool WaitForPauseAfterSchedulerAdmissionForTest(int timeout_ms) {
@@ -1193,7 +1205,8 @@ void EngineLoop(EngineState* state) {
                 // semantics.
 
                 while (state->status == EngineStatus::RUNNING) {
-                    Request* req = state->PopReadyPendingRequest(exclusive_execution);
+                    Request* req = state->PopReadyPendingRequest(
+                        exclusive_execution, std::max(1, model_entry->kv_config.max_num_seqs));
                     if (!req) break;  // Queue empty
                     dequeued_request = req;
 #ifdef DENSECORE_TEST_BUILD

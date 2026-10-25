@@ -274,3 +274,34 @@ TEST(EngineShutdownWakeupTest, ProducerCompletionCannotBeLostBeforeCallbackWait)
 }
 
 }  // namespace
+
+TEST_F(RequestSubmissionTest, BudgetCapacityWaitsForRetirementAndStillSelectsPendingCancellation) {
+    ActiveRequestGuard active(state);
+    active.request.finished = true;
+    active.request.generation_terminal_dispatched.store(true);
+    const int tokens[] = {17};
+    const int first = SubmitRequestIds(&state, tokens, 1, 4, nullptr, nullptr);
+    const int canceled = SubmitRequestIds(&state, tokens, 1, 4, nullptr, nullptr);
+    const int last = SubmitRequestIds(&state, tokens, 1, 4, nullptr, nullptr);
+    ASSERT_GT(first, 0);
+    ASSERT_GT(canceled, 0);
+    ASSERT_GT(last, 0);
+    EXPECT_EQ(state.PopReadyPendingRequest(false, 1), nullptr);
+    state.RecordPendingCancellation(canceled);
+    auto* request = state.PopReadyPendingRequest(false, 1);
+    ASSERT_NE(request, nullptr);
+    EXPECT_EQ(request->id, canceled);
+    EXPECT_TRUE(request->cancelled.load());
+    EXPECT_TRUE(request->ssm_runtime_states.empty());
+    state.RemovePendingRequest(canceled);
+    state.request_pool.Release(request);
+    EXPECT_EQ(state.PopReadyPendingRequest(false, 1), nullptr);
+    state.active_requests.clear();
+    for (int id : {first, last}) {
+        request = state.PopReadyPendingRequest(false, 1);
+        ASSERT_NE(request, nullptr);
+        EXPECT_EQ(request->id, id);
+        state.RemovePendingRequest(id);
+        state.request_pool.Release(request);
+    }
+}
