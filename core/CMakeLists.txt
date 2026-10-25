@@ -611,6 +611,7 @@ set(SOURCES
     src/llm/models/common/family_internal.cpp
     src/llm/sampling/exec.cpp
     src/llm/speculative/verification.cpp
+    src/llm/speculative/nextn_graph.cpp
     src/runtime/inference_context.cpp
     src/runtime/inference.cpp
     src/models/model_types.cpp

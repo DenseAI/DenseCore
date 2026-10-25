@@ -76,6 +76,7 @@ void ggml_gemv_q4_K_8x4_q8_K(int n, float* s, size_t bs, const void* vx, const v
 #include "llm/config/runtime_config.h"
 #include "llm/decoder/spec_runtime.h"
 #include "llm/graph/planning.h"
+#include "llm/graph/build_internal.h"
 #include "llm/matmul/diagnostics.h"
 #include "llm/matmul/graph_ops.h"
 #include "llm/models/common/family_internal.h"
@@ -122,7 +123,8 @@ using namespace densecore::llm::graph::detail;
 struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, PagedKVCache* cache,
                                                     struct ggml_context* ctx_c, const BatchSpec& batch,
                                                     bool embedding_mode, struct ggml_cgraph* gf,
-                                                    struct ggml_tensor** out_embd, struct ggml_tensor** out_pos) {
+                                                    struct ggml_tensor** out_embd, struct ggml_tensor** out_pos,
+                                                    const GraphAssemblyOverrides* overrides) {
     // ENSURE: ctx_c must be initialized with sufficient memory (e.g. 128MB+)
     // to hold the compute graph nodes, especially for deep models like Qwen.
     // This initialization happens in worker.cpp (InitGraphCache or temp
@@ -152,7 +154,9 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     }
     if (out_embd) *out_embd = embd_inp;
 
-    struct ggml_tensor* cur = ggml_get_rows(ctx_c, model->tok_embeddings, embd_inp);
+    struct ggml_tensor* cur = overrides && overrides->input_embeddings
+                                 ? overrides->input_embeddings
+                                 : ggml_get_rows(ctx_c, model->tok_embeddings, embd_inp);
     if (const float embedding_scale = densecore::models::ResolveInputEmbeddingScale(model); embedding_scale != 1.0f) {
         cur = ggml_scale(ctx_c, cur, embedding_scale);
     }
@@ -2945,6 +2949,11 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             cur = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, hidden_ud);
         }
     }
+    if (overrides && overrides->pre_output_norm_hidden) {
+        *overrides->pre_output_norm_hidden = cur;
+        ggml_set_output(cur);
+        if (gf) ggml_build_forward_expand(gf, cur);
+    }
     if (batch.skip_output_logits && !embedding_mode) {
         ggml_set_name(cur, "prefill_no_logits_output");
         if (gf) {
@@ -2972,6 +2981,12 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     }
 
     cur = apply_weighted_rms_norm(cur, model->output_norm, "output_norm", static_cast<int>(model->layers.size()));
+
+    if (overrides && overrides->normalized_hidden) {
+        *overrides->normalized_hidden = cur;
+        ggml_set_output(cur);
+        if (gf) ggml_build_forward_expand(gf, cur);
+    }
 
     if (embedding_mode) {
         if (gf) {

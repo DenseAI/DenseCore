@@ -1547,6 +1547,14 @@ struct EngineState {
     // Dependency Injected Op Registry
     std::unique_ptr<densecore::OpRegistry> op_registry;
     InferenceConfig inference_config{};
+    // Internal policy codes match the additive init API: auto=0, none=1, mtp=2.
+    // Automatic eligibility has no entries until model/CPU/concurrency evidence
+    // is qualified; requested and selected policies must remain distinct.
+    int speculation_requested = 0;
+    int speculation_selected = 1;
+    int spec_draft_n_max = 2;
+    std::string speculation_reason = "no qualified automatic MTP profile";
+
     // Declared after op_registry so backends release their borrowed registry
     // before that registry is destroyed.
     std::unique_ptr<densecore::BackendRegistry> backend_registry;

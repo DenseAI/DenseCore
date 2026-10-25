@@ -6,6 +6,8 @@
 #include <numeric>
 #include "llm/sampling/sampling_rng.h"
 #include "densecore/runtime/scheduler.h"
+#include "llm/speculative/nextn_graph.h"
+#include "ggml-cpu.h"
 #include <random>
 #include <stdexcept>
 
@@ -13,6 +15,88 @@
 
 namespace {
 using namespace densecore::llm::speculative;
+
+TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
+    TransformerModel source{};
+    source.arch = ModelArch::QWEN35;
+    source.variant = ModelVariant::QWEN35;
+    source.arch_flags.is_hybrid_ssm = true;
+    source.arch_flags.requires_q_norm = true;
+    source.arch_flags.requires_k_norm = true;
+    source.hparams.n_embd = 2;
+    source.hparams.n_vocab = 2;
+    source.hparams.n_head = 1;
+    source.hparams.n_head_kv = 1;
+    source.hparams.n_embd_head_k = 2;
+    source.hparams.n_embd_head_v = 2;
+    source.hparams.n_rot = 2;
+    source.hparams.n_ctx = 16;
+    source.hparams.n_layer = 4;
+    source.hparams.n_ff = 2;
+    source.ctx_w = ggml_init({1024 * 1024, nullptr, false});
+    ASSERT_NE(source.ctx_w, nullptr);
+    const auto weight = [&](int columns, int rows, float value) {
+        auto* t = ggml_new_tensor_2d(source.ctx_w, GGML_TYPE_F32, columns, rows);
+        std::fill_n(static_cast<float*>(t->data), columns * rows, value);
+        return t;
+    };
+    source.tok_embeddings = weight(2, 2, 1);
+    source.output_norm = weight(2, 1, 1);
+    source.output = weight(2, 2, 0);
+    const float identity[] = {1, 0, 0, 1};
+    std::memcpy(source.output->data, identity, sizeof(identity));
+    source.mtp_heads.resize(1);
+    auto& head = source.mtp_heads[0];
+    head.gguf_layer_index = 4;
+    head.tensors["nextn.enorm.weight"] = weight(2, 1, 1);
+    head.tensors["nextn.hnorm.weight"] = weight(2, 1, 1);
+    auto* eh = weight(4, 2, 0);
+    const float hidden_selector[] = {0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(eh->data, hidden_selector, sizeof(hidden_selector));
+    head.tensors["nextn.eh_proj.weight"] = eh;
+    for (const char* name : {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
+                             "attn_k_norm.weight"}) head.tensors[name] = weight(2, 1, 1);
+    for (const char* name : {"attn_k.weight", "attn_v.weight", "attn_output.weight",
+                             "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}) {
+        head.tensors[name] = weight(2, 2, 0);
+    }
+    head.tensors["attn_q.weight"] = weight(2, 4, 0); // [q | gate] per head
+    NextNGraph nextn(source);
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&nextn.Model(), 1, 16, GGML_TYPE_F32, -1));
+    ASSERT_NE(cache, nullptr);
+    const auto blocks = cache->block_manager->Allocate(1);
+    ASSERT_EQ(blocks.size(), 1u);
+    BatchSpec batch{};
+    batch.num_seqs = 1;
+    batch.tokens = {1}; batch.pos = {0}; batch.seq_id = {0}; batch.n_past = {0};
+    batch.block_tables = {blocks};
+    std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
+        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    SetCurrentWorkContext(work.get());
+    ResetInferenceWorkContext(work.get());
+    SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+    SetCurrentBatch(&batch);
+    auto* ctx = ggml_init({32 * 1024 * 1024, nullptr, false});
+    ASSERT_NE(ctx, nullptr);
+    auto* hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+    const float h[] = {3, 4};
+    std::memcpy(hidden->data, h, sizeof(h));
+    auto* graph = ggml_new_graph_custom(ctx, 32768, false);
+    ggml_tensor* next_hidden = nullptr;
+    auto* output = nextn.Build(ctx, cache.get(), batch, hidden, graph, &next_hidden);
+    ASSERT_NE(output, nullptr);
+    ASSERT_NE(next_hidden, nullptr);
+    EXPECT_EQ(ggml_graph_compute_with_ctx(ctx, graph, 1), GGML_STATUS_SUCCESS);
+    const auto* logits = static_cast<float*>(output->data);
+    EXPECT_NEAR(logits[0], 3.0f / std::sqrt(12.5f), 2e-5f);
+    EXPECT_NEAR(logits[1], 4.0f / std::sqrt(12.5f), 2e-5f);
+    EXPECT_NEAR(static_cast<float*>(next_hidden->data)[0], logits[0], 1e-6f);
+    EXPECT_NEAR(static_cast<float*>(next_hidden->data)[1], logits[1], 1e-6f);
+    ggml_free(ctx);
+    SetCurrentBatch(nullptr);
+    SetCurrentWorkContext(nullptr);
+    cache->block_manager->Free(blocks);
+}
 
 TEST(SpeculativeDistribution, MatchesRegularSamplerWithPenaltiesAndFilters) {
     ggml_init_params init{8192, nullptr, false};
@@ -130,7 +214,7 @@ TEST(SpeculativeVerification, RejectsMalformedInputBeforeAdvancingRandomness) {
 }
 
 TEST(SpeculativeRollback, ReleasesOnlyExclusiveSuffixAndResetsTailSlots) {
-    densecore::BlockManager manager(32, BLOCK_SIZE);
+    BlockManager manager(32, BLOCK_SIZE);
     auto blocks = manager.Allocate(3);
     ASSERT_EQ(blocks.size(), 3u);
     const auto original = blocks;
@@ -147,8 +231,21 @@ TEST(SpeculativeRollback, ReleasesOnlyExclusiveSuffixAndResetsTailSlots) {
     EXPECT_EQ(manager.GetFreeBlockCount(), 32);
 }
 
+TEST(SpeculativeRollback, RejectsBoundaryBeyondFilledSlotsWithoutMutation) {
+    BlockManager manager(32, BLOCK_SIZE);
+    auto blocks = manager.Allocate(2);
+    const auto original = blocks;
+    manager.SetFilledSlots(blocks.front(), 2);
+    const int free_before = manager.GetFreeBlockCount();
+    EXPECT_FALSE(manager.RollbackExclusiveSuffix(&blocks, 3));
+    EXPECT_EQ(blocks, original);
+    EXPECT_EQ(manager.GetFilledSlots(blocks.front()), 2);
+    EXPECT_EQ(manager.GetFreeBlockCount(), free_before);
+    manager.Free(blocks);
+}
+
 TEST(SpeculativeRollback, RejectsSharedTailWithoutChangingAnyOwnershipOrSlots) {
-    densecore::BlockManager manager(32, BLOCK_SIZE);
+    BlockManager manager(32, BLOCK_SIZE);
     auto blocks = manager.Allocate(3);
     ASSERT_EQ(blocks.size(), 3u);
     const auto original = blocks;
@@ -171,7 +268,7 @@ TEST(SpeculativeRollback, RejectsSharedTailWithoutChangingAnyOwnershipOrSlots) {
 }
 
 TEST(SpeculativeRollback, SchedulerAndRecurrentStateRestoreTogetherAtBoundary) {
-    densecore::BlockManager manager(32, BLOCK_SIZE);
+    BlockManager manager(32, BLOCK_SIZE);
     densecore::SchedulerConfig config;
     config.max_num_seqs = 1;
     config.max_prefill_seqs = 1;
@@ -190,6 +287,8 @@ TEST(SpeculativeRollback, SchedulerAndRecurrentStateRestoreTogetherAtBoundary) {
     ASSERT_EQ(blocks.size(), 2u);
     scheduler.OnDecodeStepComplete(seq, 3);
     int n_past = 19;
+    manager.SetFilledSlots(blocks.front(), BLOCK_SIZE);
+    manager.SetFilledSlots(blocks.back(), 3);
     RecurrentCheckpoints::States states(1);
     states[0].conv_state = {1}; states[0].ssm_state = {2};
     RecurrentCheckpoints bank(3);
