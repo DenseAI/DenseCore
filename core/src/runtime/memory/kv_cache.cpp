@@ -235,8 +235,10 @@ PagedKVCache* InitPagedKVCache(TransformerModel* model, int max_num_seqs, int ma
         cache->cache_type = type;
     }
 
-    int64_t total_tokens = static_cast<int64_t>(max_num_seqs) * static_cast<int64_t>(max_seq_len);
-    int64_t max_blocks = (total_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // Blocks cannot be shared between sequences merely because their last
+    // partially filled blocks would fit when token counts are summed.
+    const int64_t blocks_per_sequence = (static_cast<int64_t>(max_seq_len) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int64_t max_blocks = static_cast<int64_t>(max_num_seqs) * blocks_per_sequence;
     if (max_blocks > std::numeric_limits<int>::max()) {
         std::cerr << "[KVCache] Error: Requested KV cache too large (" << max_blocks << " blocks)." << std::endl;
         delete cache;

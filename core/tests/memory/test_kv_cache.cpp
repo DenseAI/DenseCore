@@ -1080,3 +1080,18 @@ TEST_F(BlockManagerTest, HybridSnapshotBudgetRefusesOversizedSnapshotAndReclaims
     EXPECT_EQ(restored[0].ssm_state[0], 3.f);
     manager->FreeSingle(block);
 }
+
+TEST(PagedKVCache, SmallContextsReserveOnePrivateBlockPerSequence) {
+    TransformerModel model{};
+    model.hparams.n_layer = 1;
+    model.hparams.n_head_kv = 1;
+    model.hparams.n_embd_head_k = 32;
+    model.hparams.n_embd_head_v = 32;
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model, 4, 8, GGML_TYPE_F16, -1));
+    ASSERT_TRUE(cache);
+    EXPECT_EQ(cache->max_blocks, 4);
+    auto blocks = cache->block_manager->Allocate(4);
+    ASSERT_EQ(blocks.size(), 4u);
+    EXPECT_EQ(cache->block_manager->AllocateSingle(), -1);
+    cache->block_manager->Free(blocks);
+}
