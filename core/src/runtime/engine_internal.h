@@ -816,6 +816,18 @@ struct Request {
     GraphResultCallback graph_callback = nullptr;
     std::atomic<bool> graph_callback_completed{false};
 
+    // A retired object may wait in the pool while other queued objects run.
+    // Release the budgeted execution payload now, preserving terminal flags
+    // and completion state until the object is actually acquired and reset.
+    void ReleaseExecutionState() noexcept {
+        ssm_runtime_states.clear();
+        swap_state.active = false;
+        swap_state.total_tokens = 0;
+        swap_state.num_blocks = 0;
+        std::vector<uint8_t>().swap(swap_state.k_data);
+        std::vector<uint8_t>().swap(swap_state.v_data);
+    }
+
     // Reset request state for pool reuse
     void Reset() {
         id = -1;
@@ -1479,6 +1491,9 @@ struct ModelEntry {
 // Object Pool for efficient resource reuse
 template <typename T> class ObjectPool {
 public:
+    using RetireCallback = void (*)(T*) noexcept;
+    explicit ObjectPool(RetireCallback retire = nullptr) : retire_(retire) {}
+
     T* Acquire() {
         std::lock_guard<std::mutex> lock(mu_);
         if (pool_.empty()) {
@@ -1491,6 +1506,7 @@ public:
 
     void Release(T* obj) noexcept {
         if (!obj) return;
+        if (retire_) retire_(obj);
         try {
             std::lock_guard<std::mutex> lock(mu_);
             pool_.push(obj);
@@ -1509,6 +1525,7 @@ public:
     }
 
 private:
+    RetireCallback retire_ = nullptr;
     std::stack<T*> pool_;
     std::mutex mu_;
 };
@@ -1647,7 +1664,7 @@ struct EngineState {
     std::vector<Request*> active_requests;  // Non-owning pointers
 
     // Object Pool for requests (thread-safe)
-    ObjectPool<Request> request_pool;
+    ObjectPool<Request> request_pool{[](Request* request) noexcept { request->ReleaseExecutionState(); }};
 
     // Mutex only for active_requests (rarely contested, not on hot path)
     std::mutex active_mu;

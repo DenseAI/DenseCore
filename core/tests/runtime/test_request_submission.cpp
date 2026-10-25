@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <array>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -303,5 +304,28 @@ TEST_F(RequestSubmissionTest, BudgetCapacityWaitsForRetirementAndStillSelectsPen
         EXPECT_EQ(request->id, id);
         state.RemovePendingRequest(id);
         state.request_pool.Release(request);
+    }
+}
+
+TEST_F(RequestSubmissionTest, RetiredPoolObjectsReleaseExecutionPayloadWithoutResettingTerminalState) {
+    std::array<Request*, 24> requests;
+    for (auto*& request : requests) {
+        request = state.request_pool.Acquire();
+        request->Reset();
+        request->ssm_runtime_states.resize(1);
+        request->ssm_runtime_states[0].conv_state.assign(32, 1.0f);
+        request->ssm_runtime_states[0].ssm_state.assign(64, 2.0f);
+        request->swap_state.k_data.assign(128, 3);
+        request->swap_state.v_data.assign(128, 4);
+        request->finished = true;
+        request->generation_terminal_dispatched.store(true);
+    }
+    for (auto* request : requests) {
+        state.request_pool.Release(request);
+        EXPECT_TRUE(request->ssm_runtime_states.empty());
+        EXPECT_EQ(request->swap_state.k_data.capacity(), 0u);
+        EXPECT_EQ(request->swap_state.v_data.capacity(), 0u);
+        EXPECT_TRUE(request->finished);
+        EXPECT_TRUE(request->generation_terminal_dispatched.load());
     }
 }
