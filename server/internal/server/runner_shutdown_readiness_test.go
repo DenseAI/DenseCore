@@ -64,6 +64,9 @@ func TestRunnerWithdrawsReadinessBeforeBlockingProductDrain(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer response.Body.Close()
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			t.Fatal(err)
+		}
 		return response.StatusCode
 	}
 	if got := status(http.MethodGet, "/health/ready"); got != http.StatusOK {
@@ -140,6 +143,7 @@ func TestRunnerWithdrawsReadinessBeforeBlockingProductDrain(t *testing.T) {
 		t.Fatal("accepted handler completed before release")
 	default:
 	}
+	client.CloseIdleConnections()
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case body := <-requestDone:
