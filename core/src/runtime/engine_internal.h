@@ -1,5 +1,6 @@
 #include "densecore/runtime/resource_budget.h"
 #include "densecore/runtime/resource_ledger.h"
+#include "runtime/callback_scratch.h"
 #include "llm/speculative/target_checkpoints.h"
 #ifndef DENSECORE_ENGINE_INTERNAL_H
 #define DENSECORE_ENGINE_INTERNAL_H
@@ -92,6 +93,12 @@ enum class DecodeSilentFinishReason : uint8_t {
 };
 
 struct AutomaticSpeculationContext;
+struct RuntimeGraphPlanningContext {
+    int callback_threads = 1;
+    densecore::runtime::CallbackScratchBudget* callback_owner = nullptr;
+    const densecore::llm::config::FastPathRuntimeConfig* fast_path = nullptr;
+    const densecore::runtime::ResourceBudget* resources = nullptr; // Deterministic private planner fixtures.
+};
 struct KVCacheConfig {
     int max_num_seqs = 4;
     int max_seq_len = 4096;
@@ -119,7 +126,8 @@ size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_h
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type,
                                       int speculation_mode = DENSECORE_SPEC_NONE, int draft_n_max = 2,
-                                      const AutomaticSpeculationContext* automatic = nullptr);
+                                      const AutomaticSpeculationContext* automatic = nullptr,
+                                      const RuntimeGraphPlanningContext* graph_context = nullptr);
 DenseCoreHandle InitializeEngineWithOptionsInternal(const char* model_path, const char* reserved, int threads,
     int numa_node_id, int pinning_policy, int kv_type, int spec_type, int draft_n_max);
 
@@ -1792,6 +1800,8 @@ struct EngineState {
     // an explicit pool, GGML creates and joins N-1 threads for every graph.
     ggml_threadpool_t ggml_compute_threadpool = nullptr;
     int ggml_compute_threadpool_threads = 0;
+    std::shared_ptr<densecore::runtime::CallbackScratchBudget> callback_scratch_budget =
+        std::make_shared<densecore::runtime::CallbackScratchBudget>();
 
     // Thread pinning policy for compute threads
     // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
@@ -2002,6 +2012,8 @@ struct EngineState {
      * Returns size in bytes.
      */
     struct GraphContextEstimate {
+        bool cached_paged_gemma = false;
+        size_t callback_scratch_bytes = 0;
         size_t base_graph_working_set_bytes = 0;
         size_t hybrid_ssm_extra_bytes = 0;
         size_t long_context_safety_pad_bytes = 0;

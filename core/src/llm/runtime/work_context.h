@@ -2,6 +2,11 @@
 #define DENSECORE_LLM_RUNTIME_WORK_CONTEXT_H
 
 #include "densecore/runtime/inference.h"
+namespace densecore::runtime { class CallbackScratchBudget; }
+void ConfigureCallbackScratch(InferenceWorkContext*, const std::shared_ptr<densecore::runtime::CallbackScratchBudget>&);
+std::shared_ptr<densecore::runtime::CallbackScratchBudget> GetCallbackScratchBudget(InferenceWorkContext*);
+void MarkCallbackScratchFailure(InferenceWorkContext*) noexcept;
+bool HasCallbackScratchFailure(const InferenceWorkContext*) noexcept;
 
 // Policy provenance remains the caller's context. A callback binding supplies
 // identity/telemetry without enabling a fast path on previously unbound threads.

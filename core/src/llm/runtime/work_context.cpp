@@ -664,3 +664,17 @@ GemvBatchedUserData* GetGemvBatchedUserData() {
     ud->qwen36_prefill_q4k_probe_max_abs_error_bits.store(0, std::memory_order_relaxed);
     return ud;
 }
+
+void ConfigureCallbackScratch(InferenceWorkContext* context,
+    const std::shared_ptr<densecore::runtime::CallbackScratchBudget>& budget) {
+    if(context){context->callback_scratch_budget=budget;context->callback_scratch_failed.store(false,std::memory_order_release);}
+}
+std::shared_ptr<densecore::runtime::CallbackScratchBudget> GetCallbackScratchBudget(InferenceWorkContext* context) {
+    return context?context->callback_scratch_budget:nullptr;
+}
+void MarkCallbackScratchFailure(InferenceWorkContext* context) noexcept {
+    if(context)context->callback_scratch_failed.store(true,std::memory_order_release);
+}
+bool HasCallbackScratchFailure(const InferenceWorkContext* context) noexcept {
+    return context && context->callback_scratch_failed.load(std::memory_order_acquire);
+}

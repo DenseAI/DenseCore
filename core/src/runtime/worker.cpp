@@ -44,6 +44,9 @@
 #include "ggml.h"
 #include "kernels/q4k_repacked_gemv.h"
 #include "llm/attention/exec.h"
+#include "llm/attention/internal.h"
+#include "llm/runtime/work_context.h"
+#include "llm/attention/diagnostics.h"
 #include "llm/config/runtime_config.h"
 #include "llm/graph/cache.h"
 #include "llm/sampling/sampling_errors.h"
@@ -595,18 +598,119 @@ int GetDebugFirstTokenSamplingLogitsOffset() {
     return value;
 }
 
+ggml_status ComputeGraphWithCallbackScratch(ggml_backend_t backend,ggml_cgraph* graph,
+    const std::shared_ptr<densecore::runtime::CallbackScratchBudget>& owner) {
+    if(owner && !owner->BindMaster(densecore::runtime::CallbackScratchMasterToken()))
+        throw densecore::OutOfMemoryException("callback scratch owner belongs to a different GGML master");
+    struct Params { ggml_custom_op_t fun;int tasks;void* userdata; };
+    for(int i=0;i<ggml_graph_n_nodes(graph);++i) {
+        auto* node=ggml_graph_node(graph,i);if(node->op!=GGML_OP_CUSTOM)continue;
+        Params params{};std::memcpy(&params,node->op_params,sizeof(params));
+        if(params.fun!=cb_paged_attention_decode)continue;
+        auto* ud=static_cast<PagedAttentionUserData*>(params.userdata);
+        if(owner && (!ud || !ud->work_ctx))
+            throw densecore::GraphBuildException("callback scratch graph has no owned work context");
+        if(ud)ConfigureCallbackScratch(ud->work_ctx,owner);
+    }
+    const auto status=ggml_backend_graph_compute(backend,graph);
+    for(int i=0;i<ggml_graph_n_nodes(graph);++i) {
+        auto* node=ggml_graph_node(graph,i);if(node->op!=GGML_OP_CUSTOM)continue;
+        Params params{};std::memcpy(&params,node->op_params,sizeof(params));
+        if(params.fun!=cb_paged_attention_decode)continue;
+        const auto* ud=static_cast<const PagedAttentionUserData*>(params.userdata);
+        if(ud && HasCallbackScratchFailure(ud->work_ctx))
+            throw densecore::OutOfMemoryException("paged attention callback scratch budget/allocation failed before sampling");
+    }
+    return status;
+}
+
 EngineState::GraphContextEstimate EstimateRuntimeGraphRequirement(
     const TransformerModel* model, size_t context, size_t sequences, size_t query_per_sequence,
     size_t total_queries, bool cached_generation,
-    const densecore::llm::config::FastPathRuntimeConfig* fast_path) {
-    (void)cached_generation;
-    (void)fast_path;
-    return EngineState::EstimateGraphContextSize(model,context,sequences,query_per_sequence,total_queries);
+    const densecore::llm::config::FastPathRuntimeConfig* fast_path, int callback_threads) {
+    const auto legacy = [&] { return EngineState::EstimateGraphContextSize(
+        model,context,sequences,query_per_sequence,total_queries); };
+    // Absence of a cache/generation capability is deliberately conservative.
+    // Diagnostic references can materialize histories outside the normal graph.
+    if (!cached_generation || !model || !model->arch_flags.is_gemma4 || model->arch != ModelArch::GEMMA ||
+        model->variant != ModelVariant::GEMMA4 || model->arch_flags.is_glm_dsa || ModelHasMoEGraphLayers(model) ||
+        model->arch_flags.is_hybrid_ssm || !context || !sequences || !query_per_sequence ||
+        sequences > 8 || context > INT_MAX || query_per_sequence > context || total_queries < sequences ||
+        total_queries > 8192 || total_queries > sequences*query_per_sequence ||
+        IsDebugPagedAttentionReferenceEnabled() || IsDebugPagedAttentionEagerReferenceEnabled()) return legacy();
+    const auto& hp=model->hparams;
+    if (!hp.n_embd || !hp.n_ff || !hp.n_layer || !hp.n_head || !hp.n_head_kv ||
+        !hp.n_embd_head_k || !hp.n_embd_head_v || hp.n_head%hp.n_head_kv) return legacy();
+    const auto config = fast_path ? *fast_path : densecore::llm::config::LoadFastPathRuntimeConfig();
+    PagedKVCache cache{};
+    cache.head_dim=hp.n_embd_head_k;cache.v_head_dim=hp.n_embd_head_v;
+    cache.n_head_kv=hp.n_head_kv;cache.n_layer=hp.n_layer;cache.cache_type=GGML_TYPE_Q8_0;
+    const size_t blocks=(context+BLOCK_SIZE-1)/BLOCK_SIZE;
+    if (blocks > INT_MAX/sequences) return legacy();
+    cache.max_blocks=static_cast<int>(blocks*sequences);
+    BatchSpec batch{};batch.num_seqs=static_cast<int>(sequences);
+    batch.n_past.resize(sequences);batch.block_tables.resize(sequences);
+    size_t remaining=total_queries;
+    for(size_t seq=0;seq<sequences;++seq) {
+        const size_t queries=std::min(query_per_sequence,remaining-(sequences-seq-1));
+        remaining-=queries;batch.n_past[seq]=static_cast<int>(context-queries);
+        for(size_t b=0;b<blocks;++b)batch.block_tables[seq].push_back(static_cast<int>(seq*blocks+b));
+        for(size_t q=0;q<queries;++q) {
+            batch.tokens.push_back(0);batch.seq_id.push_back(static_cast<int>(seq));
+            batch.pos.push_back(static_cast<int>(context-queries+q));
+        }
+    }
+    using namespace densecore::llm::attention;
+    const auto base=ResolveBasePagedDecodeExecutionDecision(config.decode_paged_attention,model,&cache,batch,
+        static_cast<int>(total_queries),hp.n_head,hp.n_head_kv,hp.n_embd_head_k,hp.n_embd_head_k);
+    const auto dispatch=ResolveDecodeAttentionDispatchDecision(model,base,true,0,static_cast<int>(total_queries),
+        static_cast<int>(context-query_per_sequence),hp.n_head,hp.n_head_kv,hp.n_embd_head_k,hp.n_embd_head_k,
+        hp.n_embd_head_v,densecore::DeviceType::CPU,true,false,false,true,true,true,-1,true,true,true,sequences==1);
+    if(!dispatch.use_paged_decode_attention)return legacy();
+    constexpr size_t MB=1024ULL*1024;
+    const auto add=[](size_t a,size_t b){return b>SIZE_MAX-a?SIZE_MAX:a+b;};
+    const auto mul=[](size_t a,size_t b){return a && b>SIZE_MAX/a?SIZE_MAX:a*b;};
+    // Sum, rather than assume backend liveness reuse: ordinary decode contexts
+    // allocate every non-view tensor, while transient prefill uses gallocr.
+    // These bounds cover Q/K/V+norm/projection/residual copies, FFN gate/up,
+    // activations/product/down, and the complete local PLE branch per layer.
+    size_t per_layer=add(mul(hp.n_embd,32),mul(hp.n_ff,8));
+    per_layer=add(per_layer,mul(mul(hp.n_head,std::max(hp.n_embd_head_k,hp.n_embd_head_v)),8));
+    per_layer=add(per_layer,mul(std::max(0,model->gemma4_hidden_size_per_layer_input),16));
+    size_t tensors=mul(mul(mul(per_layer,total_queries),hp.n_layer),sizeof(float));
+    // Global PLE lookup/project/norm/add and full-vocabulary output staging.
+    tensors=add(tensors,mul(mul(mul(std::max(0,model->gemma4_hidden_size_per_layer_input),hp.n_layer),total_queries),32));
+    tensors=add(tensors,mul(mul(hp.n_vocab,total_queries),16));
+    EngineState::GraphContextEstimate estimate{};
+    estimate.cached_paged_gemma=true;estimate.effective_seq_len=context;
+    estimate.effective_query_len=query_per_sequence;estimate.effective_num_seqs=sequences;
+    estimate.chunk_token_hint=query_per_sequence;estimate.base_graph_working_set_bytes=tensors;
+    estimate.long_context_safety_pad_bytes=add(std::max(tensors/4,128*MB),12*MB);
+    // Explicit extra/min are honored without a live-memory ceiling. A capacity
+    // shortage must reject the requirement, never change the required geometry.
+    const auto env_mb=[](const char* key,size_t fallback) {
+        uint64_t mb=0;const char* text=std::getenv(key);
+        return text && densecore::runtime::ResourceUnsigned(text,mb) && mb<=SIZE_MAX/(1024*1024)
+            ? static_cast<size_t>(mb)*1024*1024:fallback;
+    };
+    estimate.env_extra_bytes=env_mb("DENSECORE_GRAPH_CTX_EXTRA_MB",128*MB);
+    estimate.total_bytes=std::max({1536*MB,env_mb("DENSECORE_GRAPH_CTX_MIN_MB",1536*MB),
+        add(add(tensors,estimate.long_context_safety_pad_bytes),estimate.env_extra_bytes)});
+    if(estimate.total_bytes>SIZE_MAX/16)
+        throw densecore::OutOfMemoryException("cached Gemma graph requirement arithmetic overflow");
+    // TLS is independent of graph storage, reused across layers. Include both
+    // scalar and optimized pointer arrays because the same thread can use both.
+    size_t per_thread=add(mul(blocks,4*sizeof(void*)),
+        mul(add(add(hp.n_embd_head_k,hp.n_embd_head_v),context),sizeof(float)));
+    per_thread=add(per_thread,2048); // vector headers, alignment and stack row unpack guards.
+    estimate.callback_scratch_bytes=mul(per_thread,std::max(1,callback_threads));
+    if(estimate.callback_scratch_bytes>SIZE_MAX/16)
+        throw densecore::OutOfMemoryException("cached Gemma callback scratch arithmetic overflow");
+    return estimate;
 }
 
-size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, size_t sequences,
-                                 size_t query_per_sequence, size_t total_queries, size_t available_bytes) {
-    const auto estimate = EngineState::EstimateGraphContextSize(model,context,sequences,query_per_sequence,total_queries);
+size_t PlanRuntimeGraphPoolBytesFromRequirement(const TransformerModel* model,
+    const EngineState::GraphContextEstimate& estimate,size_t available_bytes) {
     const size_t floor = IncludeGgmlGraphObjectMetadata(estimate.total_bytes);
     const size_t metadata = IncludeGgmlGraphObjectMetadata(1) - 64ULL*1024*1024;
     if (!model || floor > available_bytes || available_bytes <= metadata) return floor;
@@ -616,6 +720,12 @@ size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, 
                                                                  available_bytes-metadata);
     const size_t requested = IncludeGgmlGraphObjectMetadata(sizing.reserved_bytes);
     return std::max(floor,std::min(requested,available_bytes));
+}
+
+size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model,size_t context,size_t sequences,
+    size_t query_per_sequence,size_t total_queries,size_t available_bytes) {
+    return PlanRuntimeGraphPoolBytesFromRequirement(model,EstimateRuntimeGraphRequirement(
+        model,context,sequences,query_per_sequence,total_queries,true),available_bytes);
 }
 
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req) {
@@ -2867,9 +2977,10 @@ void EngineLoop(EngineState* state) {
                     seq_len_hint = std::max(seq_len_hint, request_key_hint);
                     chunk_token_hint = std::max(chunk_token_hint, static_cast<size_t>(token_count));
                 }
-                return EngineState::EstimateGraphContextSize(
-                    current_model, seq_len_hint, static_cast<size_t>(std::max(1, batch.num_seqs)), chunk_token_hint,
-                    batch.tokens.size());
+                return EstimateRuntimeGraphRequirement(current_model,seq_len_hint,
+                    static_cast<size_t>(std::max(1,batch.num_seqs)),chunk_token_hint,batch.tokens.size(),
+                    current_kv_cache!=nullptr && !is_embedding_batch && batch.lora_map.empty(),
+                    &state->fast_path_config,base_threads);
             };
             const EngineState::GraphContextEstimate graph_ctx_estimate = compute_graph_context_estimate();
             size_t prefill_graph_ctx_bytes = prefill_graph_cache_active_effective ? graph_ctx_estimate.total_bytes : 0;
@@ -3793,10 +3904,12 @@ void EngineLoop(EngineState* state) {
                                                     static_cast<size_t>(candidate) > req->tokens.size()) {
                                                     continue;
                                                 }
-                                                const auto candidate_estimate = EngineState::EstimateGraphContextSize(
+                                                const auto candidate_estimate = EstimateRuntimeGraphRequirement(
                                                     current_model,
                                                     static_cast<size_t>(std::max(1, req->n_past + candidate)),
-                                                    /*num_seqs_hint=*/1, static_cast<size_t>(candidate));
+                                                    /*num_seqs_hint=*/1, static_cast<size_t>(candidate),static_cast<size_t>(candidate),
+                                                current_kv_cache!=nullptr && !is_embedding_batch && batch.lora_map.empty(),
+                                                &state->fast_path_config,base_threads);
                                                 size_t candidate_ctx_bytes = candidate_estimate.total_bytes;
                                                 if (IsFlexibleGraphPoolSizingEnabled(current_model)) {
                                                     const FlexibleGraphPoolSizing candidate_sizing =
@@ -3959,10 +4072,12 @@ void EngineLoop(EngineState* state) {
                                                 static_cast<size_t>(candidate) > req->tokens.size()) {
                                                 continue;
                                             }
-                                            const auto candidate_estimate = EngineState::EstimateGraphContextSize(
+                                            const auto candidate_estimate = EstimateRuntimeGraphRequirement(
                                                 current_model,
                                                 static_cast<size_t>(std::max(1, req->n_past + candidate)),
-                                                /*num_seqs_hint=*/1, static_cast<size_t>(candidate));
+                                                /*num_seqs_hint=*/1, static_cast<size_t>(candidate),static_cast<size_t>(candidate),
+                                                current_kv_cache!=nullptr && !is_embedding_batch && batch.lora_map.empty(),
+                                                &state->fast_path_config,base_threads);
                                             size_t candidate_ctx_bytes = candidate_estimate.total_bytes;
                                             if (IsFlexibleGraphPoolSizingEnabled(current_model)) {
                                                 const FlexibleGraphPoolSizing candidate_sizing =
@@ -4120,9 +4235,11 @@ void EngineLoop(EngineState* state) {
                                             static_cast<size_t>(candidate) > req->tokens.size()) {
                                             continue;
                                         }
-                                        const auto candidate_estimate = EngineState::EstimateGraphContextSize(
+                                        const auto candidate_estimate = EstimateRuntimeGraphRequirement(
                                             current_model, static_cast<size_t>(std::max(1, req->n_past + candidate)),
-                                            /*num_seqs_hint=*/1, static_cast<size_t>(candidate));
+                                            /*num_seqs_hint=*/1, static_cast<size_t>(candidate),static_cast<size_t>(candidate),
+                                                current_kv_cache!=nullptr && !is_embedding_batch && batch.lora_map.empty(),
+                                                &state->fast_path_config,base_threads);
                                         size_t candidate_ctx_bytes = candidate_estimate.total_bytes;
                                         if (IsFlexibleGraphPoolSizingEnabled(current_model)) {
                                             const FlexibleGraphPoolSizing candidate_sizing =
@@ -4543,7 +4660,9 @@ void EngineLoop(EngineState* state) {
                         // compute so this regression mode does not perturb generation.
                         MaybeLogMoEGraphSummary(gf, current_model, is_prefill_batch);
                         ResetPagedDecodeGraphExecutionState(gf);
-                        ggml_backend_graph_compute(active_backend, gf);
+                        ComputeGraphWithCallbackScratch(active_backend,gf,
+                            model_entry->kv_config.memory_plan.callback_scratch_envelope_bytes
+                                ? state->callback_scratch_budget:nullptr);
 
                         if (!output || !output->data) {
                             std::cerr << "[DecodeGraphCacheCheck] skipped: cached output missing" << std::endl;
@@ -4627,7 +4746,9 @@ void EngineLoop(EngineState* state) {
 
                                             MaybeLogMoEGraphSummary(uncached_gf, current_model, is_prefill_batch);
                                             ResetPagedDecodeGraphExecutionState(uncached_gf);
-                                            ggml_backend_graph_compute(active_backend, uncached_gf);
+                                            ComputeGraphWithCallbackScratch(active_backend,uncached_gf,
+                            model_entry->kv_config.memory_plan.callback_scratch_envelope_bytes
+                                ? state->callback_scratch_budget:nullptr);
                                             if (!uncached_output->data) {
                                                 std::cerr << "[DecodeGraphCacheCheck] skipped due to shape mismatch: "
                                                              "uncached "
@@ -4769,7 +4890,9 @@ void EngineLoop(EngineState* state) {
                 "graph_compute_begin", !batch_requests.empty() ? batch_requests.front() : nullptr, current_model,
                 !batch_requests.empty() && batch_requests.front() ? batch_requests.front()->seq_id : -1, batch.num_seqs,
                 static_cast<int>(batch.tokens.size()), active_threads, is_decode_batch ? "decode" : "prefill");
-            ggml_backend_graph_compute(active_backend, gf);
+            ComputeGraphWithCallbackScratch(active_backend,gf,
+                            model_entry->kv_config.memory_plan.callback_scratch_envelope_bytes
+                                ? state->callback_scratch_budget:nullptr);
             const auto compute_end = std::chrono::steady_clock::now();
             if (is_prefill_batch && batch.tokens.size() >= 32) {
                 const Request* trace_req = !batch_requests.empty() ? batch_requests.front() : nullptr;
@@ -5854,7 +5977,9 @@ void EngineLoop(EngineState* state) {
 
                         maybe_set_cpu_threads();
                         MaybeLogMoEGraphSummary(verify_gf, current_model, is_prefill_batch);
-                        ggml_backend_graph_compute(active_backend, verify_gf);
+                        ComputeGraphWithCallbackScratch(active_backend,verify_gf,
+                            model_entry->kv_config.memory_plan.callback_scratch_envelope_bytes
+                                ? state->callback_scratch_budget:nullptr);
 
                         if (!verify_output->data || static_cast<int>(verify_output->ne[0]) != n_vocab) {
                             std::cerr << "[DecodeCorrectness] skipped: verify output shape mismatch for seq " << i

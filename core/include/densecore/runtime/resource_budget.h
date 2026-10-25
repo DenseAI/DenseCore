@@ -40,9 +40,11 @@ struct RuntimeMemoryPlan {
     uint64_t prefix_snapshot_bytes = 0;
     uint64_t mtp_checkpoint_bytes = 0;
     uint64_t allocator_bytes = 0;
+    uint64_t callback_scratch_envelope_bytes = 0; // Geometry only; not an additional reservation.
+    uint64_t callback_scratch_bytes = 0; // Retained numeric TLS/pool reservation, outside graph arena.
     uint64_t RequiredBytes() const {
         uint64_t total = 0;
-        for (uint64_t bytes : {kv_bytes,graph_bytes,repack_bytes,recurrent_bytes,prefix_snapshot_bytes,mtp_checkpoint_bytes,allocator_bytes}) {
+        for (uint64_t bytes : {kv_bytes,graph_bytes,repack_bytes,recurrent_bytes,prefix_snapshot_bytes,mtp_checkpoint_bytes,allocator_bytes,callback_scratch_bytes}) {
             if (bytes > UINT64_MAX-total) return UINT64_MAX;
             total += bytes;
         }

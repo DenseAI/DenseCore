@@ -2460,7 +2460,25 @@ TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWi
     // No model file, compute, weight payload, or KV arena is allocated. All
     // descriptors have actual E4B geometry; no_alloc construction must not read weights.
     auto model=MakeE4BMetadataOnlyBudgetModel();
-    for(const auto shape:std::vector<std::pair<int,int>>{{1,1},{2,1},{4,1},{8,1},{1,32},{4,32},{8,32},{1,256},{1,2048},{4,512},{8,512}}){
+    std::vector<std::pair<int,int>> shapes{{1,1},{2,1},{4,1},{8,1},{1,32},{4,32},{8,32},{1,256},{1,2048},{4,512},{8,512}};
+    ScopedEnvOverride context_override("DENSECORE_MAX_SEQ_LEN","2048");
+    for(int capacity:{1,2,4,8}) {
+        const std::string value=std::to_string(capacity);
+        ScopedEnvOverride sequences_override("DENSECORE_MAX_NUM_SEQS",value.c_str());
+        densecore::runtime::ResourceBudget resources;
+        resources.memory={densecore::runtime::ResourceState::Finite,
+            4681576448ULL+densecore::runtime::ProcessPlannedMemoryBytes()};resources.effective_threads=8;
+        const RuntimeGraphPlanningContext planning{8,nullptr,nullptr,&resources};
+        const auto selected=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_Q8_0,DENSECORE_SPEC_NONE,2,nullptr,&planning);
+        ASSERT_EQ(selected.max_seq_len,2048);ASSERT_EQ(selected.max_num_seqs,capacity);
+        const auto scheduler=BuildRuntimeSchedulerConfig(selected,model.get());
+        shapes.push_back({1,scheduler.max_prefill_tokens});
+        const int mixed=std::min(scheduler.max_prefill_tokens,scheduler.max_mixed_prefill_tokens);
+        if(capacity>1)shapes.push_back({capacity,mixed});
+        std::cout<<"[E4BSelectedShape] capacity="<<capacity<<" prefill="<<scheduler.max_prefill_tokens
+                 <<" mixed="<<mixed<<" callback="<<selected.memory_plan.callback_scratch_envelope_bytes<<std::endl;
+    }
+    for(const auto shape:shapes){
         const auto [width,chunk]=shape;SCOPED_TRACE("width="+std::to_string(width)+" chunk="+std::to_string(chunk));
         PagedKVCache cache{};cache.head_dim=cache.v_head_dim=512;cache.n_head_kv=2;cache.n_layer=42;
         cache.max_blocks=128*width;cache.cache_type=GGML_TYPE_Q8_0;cache.layer_n_head_kv.assign(42,2);
@@ -2482,8 +2500,9 @@ TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWi
         std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init(params),ggml_free);ASSERT_NE(ctx,nullptr);
         auto* graph=ggml_new_graph_custom(ctx.get(),32768,false);
         auto* output=BuildTransformerGraph(model.get(),&cache,ctx.get(),batch,false,graph);ASSERT_NE(output,nullptr);
-        int paged=0,gathers=0,ple_post_norms=0;
+        int paged=0,gathers=0,ple_post_norms=0;size_t all_tensor_bytes=0;
         for(auto* t=ggml_get_first_tensor(ctx.get());t;t=ggml_get_next_tensor(ctx.get(),t)){
+            if(!t->view_src)all_tensor_bytes+=ggml_nbytes_pad(t);
             ple_post_norms+=std::string(ggml_get_name(t))=="gemma4_post_per_layer_input_norm";
             if(t->op!=GGML_OP_CUSTOM)continue;
             ggml_custom_op_t fn=nullptr;std::memcpy(&fn,t->op_params,sizeof(fn));
@@ -2498,10 +2517,47 @@ TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWi
         size_t backend=0;ggml_gallocr_reserve_n_size(allocator,graph,nullptr,nullptr,&backend);ggml_gallocr_free(allocator);
         const auto estimate=EstimateRuntimeGraphRequirement(model.get(),2048,width,chunk,batch.tokens.size(),true);
         std::cout<<"[E4BGraphBudget] width="<<width<<" chunk="<<chunk<<" queries="<<batch.tokens.size()
-                 <<" metadata="<<ggml_used_mem(ctx.get())<<" backend="<<backend<<" estimated="<<estimate.total_bytes<<std::endl;
+                 <<" metadata="<<ggml_used_mem(ctx.get())<<" backend="<<backend<<" all_tensor_bytes="<<all_tensor_bytes<<" estimated="<<estimate.total_bytes<<std::endl;
         EXPECT_GE(estimate.total_bytes,ggml_used_mem(ctx.get())+backend);
+        EXPECT_GE(estimate.total_bytes,ggml_used_mem(ctx.get())+all_tensor_bytes);
         // Restore the sentinel before another graph is constructed: no native
         // repack/fingerprint or data-dependent operation may see fake bytes.
         for(auto* t=ggml_get_first_tensor(model->ctx_w);t;t=ggml_get_next_tensor(model->ctx_w,t))t->data=nullptr;
     }
+}
+
+TEST(Gemma4GraphBudget, CallbackQuotaFailureWaitsForKvBarriersAndCannotPublishThenRecovers) {
+    auto model=MakeBaseGemma4GraphModel(1);
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(),4,8,GGML_TYPE_F32,-1));ASSERT_NE(cache,nullptr);
+    BatchSpec batch{};batch.num_seqs=4;batch.n_past.assign(4,1);
+    for(int i=0;i<4;++i){
+        int block=cache->block_manager->AllocateSingle();ASSERT_GE(block,0);
+        batch.tokens.push_back(0);batch.seq_id.push_back(i);batch.pos.push_back(1);batch.block_tables.push_back({block});
+        const float zero[2]={0,0};cache->WriteKSlot(block,0,0,zero);cache->WriteVSlot(block,0,0,zero);
+    }
+    std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+    struct Restore {InferenceWorkContext* old=GetCurrentWorkContext();~Restore(){SetCurrentWorkContext(old);}} restore;
+    SetCurrentWorkContext(work.get());ResetInferenceWorkContext(work.get());SetCurrentBatch(&batch);
+    SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+    ggml_init_params params{4*1024*1024,nullptr,false};
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init(params),ggml_free);ASSERT_NE(ctx,nullptr);
+    auto* graph=ggml_new_graph_custom(ctx.get(),32768,false);
+    auto* output=BuildTransformerGraph(model.get(),cache.get(),ctx.get(),batch,false,graph);ASSERT_NE(output,nullptr);
+    auto* backend=ggml_backend_cpu_init();ASSERT_NE(backend,nullptr);ggml_backend_cpu_set_n_threads(backend,4);
+    const auto budget=[&](uint64_t bytes){
+        densecore::runtime::RuntimeMemoryPlan p;p.available_bytes=p.resource_capacity_bytes=1024ULL*1024*1024;
+        p.allocator_bytes=256ULL*1024*1024;p.callback_scratch_bytes=bytes;
+        densecore::runtime::ResourcePlanLease source(p);
+        auto owner=std::make_shared<densecore::runtime::CallbackScratchBudget>();
+        if(!owner->Adopt(source,bytes))throw std::runtime_error("test scratch adoption");return owner;
+    };
+    auto insufficient=budget(1);bool published=false;
+    try {ComputeGraphWithCallbackScratch(backend,graph,insufficient);published=true;}
+    catch(const densecore::OutOfMemoryException&){}
+    EXPECT_FALSE(published);EXPECT_TRUE(HasCallbackScratchFailure(work.get()));
+    EXPECT_EQ(insufficient->Used(),0u);
+    auto adequate=budget(65536);
+    EXPECT_NO_THROW(EXPECT_EQ(ComputeGraphWithCallbackScratch(backend,graph,adequate),GGML_STATUS_SUCCESS));
+    EXPECT_FALSE(HasCallbackScratchFailure(work.get()));
+    ggml_backend_free(backend);
 }

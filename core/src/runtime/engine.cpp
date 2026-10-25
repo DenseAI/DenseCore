@@ -134,7 +134,8 @@ namespace fs = std::filesystem;
 std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
                                            std::unique_ptr<TransformerModel> model,
                                            std::unique_ptr<PagedKVCache> kv_cache, const KVCacheConfig& kv_config,
-                                           std::unique_ptr<densecore::runtime::ResourcePlanLease> resource_lease) {
+                                           std::unique_ptr<densecore::runtime::ResourcePlanLease> resource_lease,
+                                           const std::shared_ptr<densecore::runtime::CallbackScratchBudget>& scratch_owner) {
     auto entry = std::make_unique<ModelEntry>();
     entry->kv_config = kv_config;
     if (kv_config.memory_plan.RequiredBytes() > 0 && kv_cache) {
@@ -159,6 +160,11 @@ std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string mod
     entry->is_loaded = true;
     if (entry->model) {
         entry->transformer_execution_plan = densecore::ResolveTransformerGraphExecutionPlan(entry->model.get());
+    }
+    if(kv_config.memory_plan.callback_scratch_envelope_bytes) {
+        std::string error;
+        if(!scratch_owner || !scratch_owner->Adopt(*entry->resource_lease,kv_config.memory_plan.callback_scratch_envelope_bytes,&error))
+            throw densecore::OutOfMemoryException("callback scratch reservation transfer: "+error);
     }
     return entry;
 }
@@ -439,7 +445,8 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
 // Keep the legacy effective default context, then fit concurrency around it.
 // Explicit context is a contract and must not silently shrink to a KV target.
 KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type,
-                                      int speculation_mode, int draft_n_max, const AutomaticSpeculationContext* automatic) {
+                                      int speculation_mode, int draft_n_max, const AutomaticSpeculationContext* automatic,
+                                      const RuntimeGraphPlanningContext* graph_context) {
     if (speculation_mode < DENSECORE_SPEC_AUTO || speculation_mode > DENSECORE_SPEC_MTP ||
         draft_n_max < 1 || draft_n_max > 3 || (speculation_mode == DENSECORE_SPEC_MTP && !model))
         throw std::invalid_argument("invalid speculation resource configuration");
@@ -451,7 +458,8 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
     const int context = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", config.max_seq_len, &explicit_context);
     const int concurrency = ReadEnvInt("DENSECORE_MAX_NUM_SEQS", 0, &explicit_concurrency);
     if (explicit_context) config.max_seq_len = context;
-    auto resources = densecore::runtime::DetectResourceBudget();
+    auto resources = graph_context && graph_context->resources ? *graph_context->resources
+        : densecore::runtime::DetectResourceBudget();
     const char* hint = std::getenv("DENSECORE_KV_AVAILABLE_MB_HINT");
     uint64_t hint_mb = 0;
     if (hint && densecore::runtime::ResourceUnsigned(hint,hint_mb) && hint_mb <= SIZE_MAX/(1024*1024) &&
@@ -501,28 +509,38 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         plan.mtp_checkpoint_bytes = selected_mode == DENSECORE_SPEC_MTP
             ? CalculateSpeculationMemory(*model, config.max_seq_len, sequences, selected_k).Total() : 0;
         plan.allocator_bytes = std::max<uint64_t>(256*MB,plan.available_bytes/16);
-        const uint64_t fixed = plan.RequiredBytes();
-        const size_t cache_reserve = DecodeGraphCacheCtxBytes();
-        const uint64_t graph_available = fixed >= plan.available_bytes ? 0 : plan.available_bytes-fixed;
-        const size_t pool_available = graph_available > cache_reserve ? graph_available-cache_reserve : 0;
         const size_t key_context = static_cast<size_t>(config.max_seq_len);
-        const size_t prefill_pool = PlanRuntimeGraphPoolBytes(model,key_context,1,prefill_chunk,prefill_chunk,pool_available);
-        const size_t decode_pool = PlanRuntimeGraphPoolBytes(model,key_context,sequences,1,sequences,pool_available);
-        size_t peak_pool = std::max(prefill_pool,decode_pool);
-        if (selected_mode == DENSECORE_SPEC_MTP) {
-            const size_t width = std::min<size_t>(selected_k + 1, key_context);
-            peak_pool = std::max(peak_pool, PlanRuntimeGraphPoolBytes(model, key_context, 1, width, width, pool_available));
+        const int callback_threads=graph_context ? graph_context->callback_threads : resources.effective_threads;
+        const auto* fast_path=graph_context ? graph_context->fast_path : nullptr;
+        const bool cached_generation=!unchunked_embedding;
+        std::vector<EngineState::GraphContextEstimate> requirements;
+        const auto append=[&](size_t n,size_t q,size_t total) {
+            requirements.push_back(EstimateRuntimeGraphRequirement(model,key_context,n,q,total,
+                cached_generation,fast_path,callback_threads));
+        };
+        append(1,prefill_chunk,prefill_chunk);append(sequences,1,sequences);
+        if(selected_mode==DENSECORE_SPEC_MTP) {
+            const size_t width=std::min<size_t>(selected_k+1,key_context);append(1,width,width);
         }
-        auto candidate_config = config;
-        candidate_config.max_num_seqs = sequences;
-        candidate_config.max_prefill_chunk_tokens = prefill_chunk;
-        const auto scheduler = BuildRuntimeSchedulerConfig(candidate_config,model);
-        if (scheduler.enable_mixed_prefill_decode && sequences > 1) {
-            const size_t mixed_chunk = std::min(prefill_chunk,scheduler.max_mixed_prefill_tokens);
-            const size_t mixed_queries = mixed_chunk + static_cast<size_t>(sequences-1);
-            peak_pool = std::max(peak_pool,PlanRuntimeGraphPoolBytes(model,key_context,sequences,mixed_chunk,
-                                                                   mixed_queries,pool_available));
+        auto candidate_config=config;candidate_config.max_num_seqs=sequences;
+        candidate_config.max_prefill_chunk_tokens=prefill_chunk;
+        const auto scheduler=BuildRuntimeSchedulerConfig(candidate_config,model);
+        if(scheduler.enable_mixed_prefill_decode && sequences>1) {
+            const size_t mixed_chunk=std::min(prefill_chunk,scheduler.max_mixed_prefill_tokens);
+            append(sequences,mixed_chunk,mixed_chunk+static_cast<size_t>(sequences-1));
         }
+        for(const auto& requirement:requirements)
+            plan.callback_scratch_envelope_bytes=std::max<uint64_t>(plan.callback_scratch_envelope_bytes,requirement.callback_scratch_bytes);
+        const uint64_t prior_scratch=graph_context && graph_context->callback_owner ? graph_context->callback_owner->Capacity():0;
+        plan.callback_scratch_bytes=plan.callback_scratch_envelope_bytes>prior_scratch
+            ? plan.callback_scratch_envelope_bytes-prior_scratch:0;
+        const uint64_t fixed=plan.RequiredBytes();
+        const size_t cache_reserve=DecodeGraphCacheCtxBytes();
+        const uint64_t graph_available=fixed>=plan.available_bytes?0:plan.available_bytes-fixed;
+        const size_t pool_available=graph_available>cache_reserve?graph_available-cache_reserve:0;
+        size_t peak_pool=0;
+        for(const auto& requirement:requirements)
+            peak_pool=std::max(peak_pool,PlanRuntimeGraphPoolBytesFromRequirement(model,requirement,pool_available));
         plan.graph_bytes = densecore::runtime::resource_detail::Add(peak_pool,cache_reserve);
         return plan;
     };
@@ -575,7 +593,9 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
                           << " required_bytes=" << plan.RequiredBytes() << " available_bytes=" << plan.available_bytes
                           << " kv=" << plan.kv_bytes << " graph=" << plan.graph_bytes << " repack=" << plan.repack_bytes
                           << " recurrent=" << plan.recurrent_bytes << " prefix_snapshot=" << plan.prefix_snapshot_bytes
-                          << " mtp_checkpoint=" << plan.mtp_checkpoint_bytes << " allocator=" << plan.allocator_bytes << std::endl;
+                          << " mtp_checkpoint=" << plan.mtp_checkpoint_bytes << " allocator=" << plan.allocator_bytes
+                          << " callback_scratch_delta=" << plan.callback_scratch_bytes
+                          << " callback_scratch_envelope=" << plan.callback_scratch_envelope_bytes << std::endl;
                 return config;
             }
             if (chunk == 1 || unchunked_embedding) break;
@@ -732,7 +752,8 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
         return false;
     }
 
-    KVCacheConfig draft_kv_config = ComputeSafeKVCacheConfig(draft_model, cache_type);
+    const RuntimeGraphPlanningContext draft_graph{state->n_threads,state->callback_scratch_budget.get(),&state->fast_path_config};
+    KVCacheConfig draft_kv_config = ComputeSafeKVCacheConfig(draft_model,cache_type,DENSECORE_SPEC_NONE,2,nullptr,&draft_graph);
     auto draft_reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(draft_kv_config.memory_plan);
     if (draft_kv_config.effective_cache_type != draft_kv_config.requested_cache_type) {
         LOG_WARN("Draft model KV cache request {} is incompatible with head_dim={}, using {} instead",
@@ -747,7 +768,7 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
     }
 
     auto draft_entry = MakeModelEntry("draft", draft_model_path, std::move(draft_model_owner),
-                                      std::unique_ptr<PagedKVCache>(draft_cache), draft_kv_config, std::move(draft_reservation));
+                                      std::unique_ptr<PagedKVCache>(draft_cache), draft_kv_config, std::move(draft_reservation),state->callback_scratch_budget);
 
     state->models["draft"] = std::move(draft_entry);
     state->draft_model_id = "draft";
@@ -1005,8 +1026,9 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
             return densecore::runtime::CaptureAutomaticRuntimeConditions(*state,*model,context,concurrency,type);
         };
     }
-    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type, spec_type, draft_n_max,
-                                                             inspect_automatic_identity ? &automatic : nullptr);
+    const RuntimeGraphPlanningContext graph_context{state->n_threads,state->callback_scratch_budget.get(),&state->fast_path_config};
+    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model,default_cache_type,spec_type,draft_n_max,
+        inspect_automatic_identity ? &automatic : nullptr,&graph_context);
     auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
     if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
         LOG_WARN("Requested KV type {} is incompatible with this model; using {}",
@@ -1051,7 +1073,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
         return nullptr;
     }
     auto entry = MakeModelEntry("default", paths.model_path, std::move(model_owner),
-                                std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation));
+                                std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation),state->callback_scratch_budget);
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
 
@@ -1734,7 +1756,8 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
         }
 
         // Initialize KV cache for this model
-        KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, state->requested_kv_cache_type);
+        const RuntimeGraphPlanningContext graph_context{state->n_threads,state->callback_scratch_budget.get(),&state->fast_path_config};
+        KVCacheConfig kv_config=ComputeSafeKVCacheConfig(model,state->requested_kv_cache_type,DENSECORE_SPEC_NONE,2,nullptr,&graph_context);
         auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
         PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
                                                kv_config.effective_cache_type, state->numa_node_id);
@@ -1746,7 +1769,7 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
 
         // Create model entry with unique_ptr ownership
         auto entry = MakeModelEntry(model_id, canonical_model_path, std::move(model_owner),
-                                    std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation));
+                                    std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation),state->callback_scratch_budget);
 
         // Add to pool only if shutdown did not begin while loading.
         {

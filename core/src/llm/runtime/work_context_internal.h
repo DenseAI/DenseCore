@@ -9,6 +9,7 @@
 #include "llm/runtime/profile_types.h"
 #include "runtime/inference_types_internal.h"
 #include <mutex>
+#include "runtime/callback_scratch.h"
 #include <string>
 #include <vector>
 struct InferenceWorkContext {
@@ -18,6 +19,8 @@ struct InferenceWorkContext {
     ModelVariant model_variant = ModelVariant::UNKNOWN;
     InferenceExecutionPhase phase = InferenceExecutionPhase::Unknown;
     bool graph_build_no_alloc = false;
+    std::shared_ptr<densecore::runtime::CallbackScratchBudget> callback_scratch_budget;
+    std::atomic<bool> callback_scratch_failed{false};
     Qwen36ProfileCounters qwen36_profile;
     KVCacheUserData kv_pool[256];
     std::vector<Gemma4SharedKVState> gemma4_shared_kv_states;

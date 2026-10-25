@@ -8,6 +8,7 @@
 #include "runtime/speculation_config.h"
 #include "llm/speculative/head_memory.h"
 #include "llm/speculative/nextn_graph.h"
+#include "llm/attention/paged_scratch.h"
 #include "densecore/exceptions.h"
 #include <limits>
 
@@ -989,7 +990,10 @@ TEST(EngineKVCacheConfig, GemmaPagedDecodePlanFitsSnapshotResidualWithoutCutting
 }
 
 namespace {
+uint64_t CallbackReservationAt(const void* key);
 struct PagedScratchPoolLifetimeProbe {
+    std::weak_ptr<densecore::runtime::CallbackScratchBudget> budget;
+    std::atomic<bool> failed{false};
     std::atomic<int> live{0}, constructed{0}, destroyed{0};
 };
 struct PagedScratchTlsLifetimeProbe {
@@ -998,14 +1002,24 @@ struct PagedScratchTlsLifetimeProbe {
 };
 void ObserveGraphCallbackTlsOwner(ggml_tensor*,int,int,void* userdata) {
     auto owner=*static_cast<std::shared_ptr<PagedScratchPoolLifetimeProbe>*>(userdata);
+    auto& workspace=densecore::llm::attention::ThreadPagedScratch();
+    if(auto budget=owner->budget.lock()) {
+        if(!workspace.Prepare(budget,128,512,512,2048))owner->failed.store(true);
+    }
     static thread_local PagedScratchTlsLifetimeProbe lifetime;
     if(!lifetime.owner){lifetime.owner=std::move(owner);++lifetime.owner->live;++lifetime.owner->constructed;}
 }
 }
-TEST(EngineKVCacheConfig, ActualGgmlCallbackTlsLifetimeIsObservedAfterWorkerMasterJoin) {
+TEST(EngineKVCacheConfig, ActualGgmlCallbackTlsRetainsNumericReservationAfterMasterAndModelOwnersRetire) {
     // Exercise the exact backend/ggml/OpenMP path with no engine, model or
     // inference. A ggml_threadpool pointer is not itself a TLS-ownership proof.
     auto observed=std::make_shared<PagedScratchPoolLifetimeProbe>();
+    auto budget=std::make_shared<densecore::runtime::CallbackScratchBudget>();
+    densecore::runtime::RuntimeMemoryPlan plan;plan.available_bytes=plan.resource_capacity_bytes=1024ULL*1024*1024;
+    plan.allocator_bytes=256ULL*1024*1024;plan.callback_scratch_bytes=262144;
+    auto model=std::make_unique<densecore::runtime::ResourcePlanLease>(plan);
+    ASSERT_TRUE(budget->Adopt(*model,262144));observed->budget=budget;
+    std::weak_ptr<densecore::runtime::CallbackScratchBudget> weak=budget;const auto* key=budget.get();
     ggml_init_params params{1024*1024,nullptr,false};
     auto* ctx=ggml_init(params);ASSERT_NE(ctx,nullptr);
     auto* input=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,32);ggml_tensor* args[]={input};
@@ -1022,5 +1036,118 @@ TEST(EngineKVCacheConfig, ActualGgmlCallbackTlsLifetimeIsObservedAfterWorkerMast
     ggml_backend_free(backend);ggml_threadpool_free(pool);ggml_free(ctx);
     std::cout<<"[GraphCallbackTlsLifetime] after_ggml_pool_free live="<<observed->live.load()
              <<" destroyed="<<observed->destroyed.load()<<std::endl;
-    EXPECT_EQ(observed->live.load(),0) << "An engine-local lease cannot be released while actual callback TLS survives";
+    EXPECT_FALSE(observed->failed.load());
+    model.reset();budget.reset();
+    // OpenMP may retain workers past both handles. A nonzero live TLS witness
+    // must keep the independent numeric reservation, not the model/engine.
+    if(observed->live.load()>0) {
+        EXPECT_FALSE(weak.expired());EXPECT_EQ(CallbackReservationAt(key),262144u);
+    }
+}
+
+#include "llm/attention/paged_scratch.h"
+
+namespace {
+uint64_t CallbackReservationAt(const void* key) {
+    auto& ledger=densecore::runtime::resource_detail::ProcessLedger();
+    std::lock_guard<std::mutex> lock(ledger.mutex);
+    auto it=ledger.plans.find(key);return it==ledger.plans.end()?0:it->second.callback_scratch_bytes;
+}
+densecore::runtime::RuntimeMemoryPlan ScratchPlan(uint64_t bytes) {
+    densecore::runtime::RuntimeMemoryPlan p;
+    p.resource_capacity_bytes=p.available_bytes=1024ULL*1024*1024;
+    p.allocator_bytes=256ULL*1024*1024;p.callback_scratch_bytes=bytes;
+    return p;
+}
+}
+
+TEST(GraphCallbackScratchBudget, TransferHighWaterDeltaSurvivesModelUnloadAndLastSliceReleasesOnce) {
+    using namespace densecore::runtime;
+    auto owner=std::make_shared<CallbackScratchBudget>();const auto* key=owner.get();
+    auto model=std::make_unique<ResourcePlanLease>(ScratchPlan(65536));
+    ASSERT_TRUE(owner->Adopt(*model,65536));
+    EXPECT_EQ(CallbackReservationAt(model.get()),0u);EXPECT_EQ(owner->Capacity(),65536u);
+    CallbackScratchSlice first,second;
+    ASSERT_TRUE(first.Grow(owner,16384));ASSERT_TRUE(first.Grow(owner,16384));
+    EXPECT_EQ(owner->Used(),16384u);
+    ASSERT_TRUE(second.Grow(owner,16384));EXPECT_EQ(owner->Used(),32768u);
+    EXPECT_FALSE(first.Grow(owner,65537));EXPECT_EQ(owner->Used(),32768u);
+    auto larger=std::make_unique<ResourcePlanLease>(ScratchPlan(65536));
+    ASSERT_TRUE(owner->Adopt(*larger,131072));EXPECT_EQ(owner->Capacity(),131072u);
+    EXPECT_EQ(CallbackReservationAt(larger.get()),0u);
+    model.reset();larger.reset();EXPECT_EQ(CallbackReservationAt(key),131072u);
+    std::weak_ptr<CallbackScratchBudget> weak=owner;owner.reset();
+    EXPECT_FALSE(weak.expired());first.Reset();EXPECT_EQ(CallbackReservationAt(key),131072u);
+    second.Reset();EXPECT_TRUE(weak.expired());EXPECT_EQ(CallbackReservationAt(key),0u);
+    second.Reset();EXPECT_EQ(CallbackReservationAt(key),0u);
+}
+
+TEST(GraphCallbackScratchBudget, RejectedTransferAndGrowthLeavePriorReservationUnchanged) {
+    using namespace densecore::runtime;
+    auto owner=std::make_shared<CallbackScratchBudget>();ResourcePlanLease model(ScratchPlan(1024));
+    EXPECT_FALSE(owner->Adopt(model,2048));EXPECT_EQ(owner->Capacity(),0u);
+    EXPECT_EQ(CallbackReservationAt(&model),1024u);
+    ASSERT_TRUE(owner->Adopt(model,1024));EXPECT_EQ(CallbackReservationAt(&model),0u);
+    EXPECT_FALSE(owner->Adopt(model,UINT64_MAX));EXPECT_EQ(owner->Capacity(),1024u);
+    CallbackScratchSlice slice;ASSERT_TRUE(slice.Grow(owner,512));
+    EXPECT_FALSE(slice.Grow(owner,1025));EXPECT_EQ(slice.Bytes(),512u);EXPECT_EQ(owner->Used(),512u);
+}
+
+TEST(GraphCallbackScratchBudget, WorkspaceFailureFreesPayloadBeforeSubreservationAndCanRecover) {
+    using namespace densecore::runtime;
+    using densecore::llm::attention::PagedScratch;
+    auto owner=std::make_shared<CallbackScratchBudget>();ResourcePlanLease model(ScratchPlan(262144));
+    ASSERT_TRUE(owner->Adopt(model,262144));PagedScratch scratch;
+    ASSERT_TRUE(scratch.Prepare(owner,128,512,512,2048));EXPECT_GT(owner->Used(),0u);
+    PagedScratch::FailNextAllocationForTest().store(true);
+    EXPECT_FALSE(scratch.Prepare(owner,256,512,512,4096));
+    EXPECT_FALSE(PagedScratch::FailNextAllocationForTest().load());EXPECT_EQ(owner->Used(),0u);
+    EXPECT_EQ(scratch.scores.capacity(),0u);EXPECT_EQ(scratch.k_blocks.capacity(),0u);
+    ASSERT_TRUE(scratch.Prepare(owner,128,512,512,2048));EXPECT_GT(owner->Used(),0u);
+}
+
+TEST(GraphCallbackScratchBudget, ASecondSequentialMasterIsRejectedBeforeAnyCallback) {
+    using namespace densecore::runtime;
+    auto owner=std::make_shared<CallbackScratchBudget>();ResourcePlanLease model(ScratchPlan(65536));
+    ASSERT_TRUE(owner->Adopt(model,65536));uint64_t one=0,two=0;bool first=false,second=true;
+    std::thread a([&]{one=CallbackScratchMasterToken();first=owner->BindMaster(one);});a.join();
+    std::thread b([&]{two=CallbackScratchMasterToken();second=owner->BindMaster(two);});b.join();
+    EXPECT_NE(one,two);EXPECT_TRUE(first);EXPECT_FALSE(second);EXPECT_EQ(owner->Capacity(),65536u);
+}
+
+TEST(EngineKVCacheConfig, GemmaPagedFallbackIsExplicitAndRequiredBoundPreservesMinimumAndOverflowSafety) {
+    auto model=MakeE4BGraphBudgetShape();
+    ScopedEnvVar available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT","1");
+    ScopedEnvVar min("DENSECORE_GRAPH_CTX_MIN_MB","128");
+    const auto known=EstimateRuntimeGraphRequirement(&model,2048,4,1,4,true);
+    EXPECT_TRUE(known.cached_paged_gemma);EXPECT_GE(known.total_bytes,1536ULL*1024*1024);
+    const auto unknown=EstimateRuntimeGraphRequirement(&model,2048,4,1,4,false);
+    EXPECT_FALSE(unknown.cached_paged_gemma);
+    EXPECT_EQ(unknown.total_bytes,EngineState::EstimateGraphContextSize(&model,2048,4,1,4).total_bytes);
+    auto config=densecore::llm::config::LoadFastPathRuntimeConfig();
+    config.decode_paged_attention.mode=densecore::llm::config::DecodePagedAttentionMode::Off;
+    const auto nonpaged=EstimateRuntimeGraphRequirement(&model,2048,1,1,1,true,&config);
+    EXPECT_FALSE(nonpaged.cached_paged_gemma);
+    EXPECT_EQ(nonpaged.total_bytes,EngineState::EstimateGraphContextSize(&model,2048,1,1,1).total_bytes);
+    model.hparams.n_layer=UINT32_MAX;model.hparams.n_embd=UINT32_MAX;model.hparams.n_ff=UINT32_MAX;
+    EXPECT_THROW(EstimateRuntimeGraphRequirement(&model,2048,8,1024,8192,true),densecore::OutOfMemoryException);
+}
+
+TEST(EngineKVCacheConfig, ExactE4BSnapshotPlanKeepsContextCapacityAndEveryExistingReserve) {
+    auto model=MakeE4BGraphBudgetShape();
+    ScopedEnvVar ctx("DENSECORE_MAX_SEQ_LEN","2048"),seq("DENSECORE_MAX_NUM_SEQS","4");
+    densecore::runtime::ResourceBudget resources;constexpr uint64_t available_snapshot=4681576448ULL;
+    resources.memory={densecore::runtime::ResourceState::Finite,available_snapshot+densecore::runtime::ProcessPlannedMemoryBytes()};resources.effective_threads=8;
+    auto scratch=std::make_shared<densecore::runtime::CallbackScratchBudget>();
+    const RuntimeGraphPlanningContext graph{8,scratch.get(),nullptr,&resources};
+    const auto plan=ComputeSafeKVCacheConfig(&model,GGML_TYPE_Q8_0,DENSECORE_SPEC_NONE,2,nullptr,&graph);
+    EXPECT_EQ(plan.max_seq_len,2048);EXPECT_EQ(plan.max_num_seqs,4);EXPECT_TRUE(plan.memory_plan.Fits());
+    EXPECT_EQ(plan.memory_plan.kv_bytes,748683264u);EXPECT_EQ(plan.memory_plan.repack_bytes,available_snapshot/8);
+    EXPECT_EQ(plan.memory_plan.allocator_bytes,available_snapshot/16);
+    EXPECT_EQ(DecodeGraphCacheCtxBytes(),192ULL*1024*1024);
+    EXPECT_GT(plan.memory_plan.callback_scratch_bytes,0u);
+    EXPECT_GT(plan.max_prefill_chunk_tokens,0);EXPECT_LE(plan.max_prefill_chunk_tokens,2048);
+    std::cout<<"[E4BChosenBudget] prefill_chunk="<<plan.max_prefill_chunk_tokens
+             <<" required="<<plan.memory_plan.RequiredBytes()<<" available="<<resources.memory.bytes
+             <<" callback_scratch="<<plan.memory_plan.callback_scratch_bytes<<std::endl;
 }

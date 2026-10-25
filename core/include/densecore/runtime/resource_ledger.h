@@ -58,6 +58,36 @@ public:
         std::lock_guard<std::mutex> lock(ledger.mutex);
         ledger.plans.erase(this);
     }
+    bool TransferCallbackScratch(const void* owner, uint64_t envelope, std::string* error = nullptr) {
+        auto& ledger=resource_detail::ProcessLedger();
+        std::lock_guard<std::mutex> lock(ledger.mutex);
+        auto source=ledger.plans.find(this);
+        if(source==ledger.plans.end() || !owner) {
+            if(error)*error="callback scratch source reservation is unavailable";return false;
+        }
+        auto target=ledger.plans.find(owner);
+        const uint64_t current=target==ledger.plans.end()?0:target->second.callback_scratch_bytes;
+        const uint64_t delta=envelope>current?envelope-current:0;
+        if(delta>source->second.callback_scratch_bytes) {
+            if(error)*error="callback scratch transfer exceeds accepted source reservation";return false;
+        }
+        if(delta>0) {
+            // Create the target before modifying the source: allocation failure
+            // leaves the accepted reservation exactly intact.
+            if(target==ledger.plans.end()) {
+                RuntimeMemoryPlan numeric;
+                numeric.available_bytes=source->second.available_bytes;
+                numeric.resource_capacity_bytes=source->second.resource_capacity_bytes;
+                target=ledger.plans.emplace(owner,numeric).first;
+                source=ledger.plans.find(this); // unordered_map insertion may rehash.
+            }
+            target->second.callback_scratch_bytes=current+delta;
+        }
+        // A concurrent engine model may already have raised the high water.
+        // Any over-reserved delta is released, never charged a second time.
+        source->second.callback_scratch_bytes=0;
+        return true;
+    }
     bool ExtendMTP(uint64_t bytes, std::string* error = nullptr) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);

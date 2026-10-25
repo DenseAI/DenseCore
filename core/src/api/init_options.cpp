@@ -72,7 +72,7 @@ DENSECORE_API int DenseCoreGetRuntimePlan(DenseCoreHandle handle, DenseCoreRunti
     result.available_bytes = memory.available_bytes;
     result.required_bytes = memory.RequiredBytes();
     result.kv_bytes = memory.kv_bytes;
-    result.graph_bytes = memory.graph_bytes;
+    result.graph_bytes = densecore::runtime::resource_detail::Add(memory.graph_bytes,memory.callback_scratch_bytes);
     result.repack_bytes = memory.repack_bytes;
     result.recurrent_bytes = memory.recurrent_bytes;
     result.prefix_snapshot_bytes = memory.prefix_snapshot_bytes;

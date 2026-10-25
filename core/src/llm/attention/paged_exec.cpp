@@ -8,6 +8,7 @@
 #include "llm/attention/callback_ops.h"
 #include "llm/attention/diagnostics.h"
 #include "llm/attention/internal.h"
+#include "llm/attention/paged_scratch.h"
 #include "llm/attention/kv_exec.h"
 #include "llm/matmul/execution_policy.h"
 #include "llm/runtime/deps.h"
@@ -66,8 +67,8 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
         return;
     }
 
-    thread_local std::vector<const uint8_t*> k_blocks;
-    thread_local std::vector<const uint8_t*> v_blocks;
+    auto& scratch=densecore::llm::attention::ThreadPagedScratch();
+    auto& k_blocks=scratch.scalar_k_blocks;auto& v_blocks=scratch.scalar_v_blocks;
     k_blocks.resize(block_table.size(), nullptr);
     v_blocks.resize(block_table.size(), nullptr);
     for (size_t bi = 0; bi < block_table.size(); ++bi) {
@@ -79,9 +80,7 @@ static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, c
         v_blocks[bi] = reinterpret_cast<const uint8_t*>(ud->cache->GetVBlockPtr(block_id, ud->read_layer));
     }
 
-    thread_local std::vector<float> k_head_scratch;
-    thread_local std::vector<float> v_head_scratch;
-    thread_local std::vector<float> scores;
+    auto& k_head_scratch=scratch.key;auto& v_head_scratch=scratch.value;auto& scores=scratch.scores;
     k_head_scratch.resize(static_cast<size_t>(head_dim));
     v_head_scratch.resize(static_cast<size_t>(v_head_dim));
     scores.resize(static_cast<size_t>(context_len));
@@ -607,8 +606,16 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         (*GetInferenceWorkContextProfile(gemma4_profile_ctx))
             .gemma4_paged_attention_cache_type.store(cache_type_id, std::memory_order_relaxed);
     }
-    thread_local std::vector<const void*> k_block_ptrs;
-    thread_local std::vector<const void*> v_block_ptrs;
+    auto& tls_scratch=densecore::llm::attention::ThreadPagedScratch();
+    size_t scratch_blocks=0,scratch_context=0;
+    for(const auto& table:batch->block_tables)scratch_blocks=std::max(scratch_blocks,table.size());
+    for(int position:batch->pos)if(position>=0)scratch_context=std::max(scratch_context,static_cast<size_t>(position)+1);
+    const auto scratch_budget=ud->is_gemma4?GetCallbackScratchBudget(ud->work_ctx):nullptr;
+    const bool scratch_ok=!HasCallbackScratchFailure(ud->work_ctx) && tls_scratch.Prepare(scratch_budget,
+        scratch_blocks,std::max(ud->head_dim,ud->cache->head_dim),
+        std::max(v_head_dim,ud->cache->v_head_dim),scratch_context);
+    if(!scratch_ok)MarkCallbackScratchFailure(ud->work_ctx);
+    auto& k_block_ptrs=tls_scratch.k_blocks;auto& v_block_ptrs=tls_scratch.v_blocks;
     const void* const* shared_k_block_ptrs_data = nullptr;
     const void* const* shared_v_block_ptrs_data = nullptr;
     int cached_token_idx = -1;
@@ -757,6 +764,11 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                 (static_cast<uint64_t>(static_cast<uint32_t>(h_start)) << 32) | static_cast<uint32_t>(h_end);
             (*GetInferenceWorkContextProfile(gemma4_profile_ctx))
                 .gemma4_paged_attention_head_range.store(head_range, std::memory_order_relaxed);
+        }
+
+        if(!scratch_ok) {
+            zero_token_heads(out_token,h_start,h_end);
+            continue;
         }
 
         // Learned sinks require denominator-only logits; the generic Highway
