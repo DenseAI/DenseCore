@@ -69,6 +69,11 @@ WorkerRuntimeConfig LoadWorkerRuntimeConfig() {
     config.qwen36_prefix_cache_reuse_enabled =
         !config.prefix_cache_reuse_disabled && config.qwen36_hybrid_ssm_snapshot_restore_enabled &&
         env::ParseBoolEnv("DENSECORE_QWEN36_PREFIX_CACHE_REUSE", false);
+    // Qualification control only: Qwen3.5 remains disabled by default until
+    // real-model token parity and snapshot restoration are independently proven.
+    config.qwen35_prefix_cache_reuse_enabled =
+        !config.prefix_cache_reuse_disabled && !config.hybrid_ssm_snapshot_restore_disabled &&
+        env::ParseBoolEnv("DENSECORE_QWEN35_PREFIX_CACHE_REUSE", false);
     config.graph_cache_reuse_disabled = env::ParseDiagnosticEnv("DENSECORE_DEBUG_DISABLE_GRAPH_CACHE_REUSE", false);
     config.moe_trace_plumbing_disabled = env::ParseDiagnosticEnv("DENSECORE_DEBUG_DISABLE_MOE_TRACE_PLUMBING", false);
     config.moe_graph_summary = env::ParseDiagnosticEnv("DENSECORE_DEBUG_MOE_GRAPH_SUMMARY", false);

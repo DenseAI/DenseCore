@@ -33,6 +33,7 @@ struct WorkerRuntimeConfig {
     bool debug_first_token_raw = false;
     int prefill_thread_override = 0;
     CallbackMode callback_mode = CallbackMode::Async;
+    bool qwen35_prefix_cache_reuse_enabled = false;
 };
 
 WorkerRuntimeConfig LoadWorkerRuntimeConfig();

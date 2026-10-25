@@ -150,7 +150,7 @@ bool IsPrefixCacheAllowedForModel(const TransformerModel* model) {
         return false;
     }
     if (IsQwen35HybridSSMModel(model)) {
-        return false;
+        return GetWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled;
     }
     if (IsQwen38HybridSSMModel(model)) {
         return false;
@@ -165,7 +165,7 @@ const char* PrefixCacheSkipReasonForModel(const TransformerModel* model) {
     if (IsQwen36HybridSSMModel(model) && !IsQwen36PrefixCacheReuseEnabled()) {
         return "qwen36_prefix_cache_disabled";
     }
-    if (IsQwen35HybridSSMModel(model)) {
+    if (IsQwen35HybridSSMModel(model) && !GetWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled) {
         return "qwen35_prefix_cache_unqualified";
     }
     if (IsQwen38HybridSSMModel(model)) {
@@ -210,7 +210,7 @@ bool IsHybridSSMSnapshotRestoreAllowedForModel(const TransformerModel* model) {
         return false;
     }
     if (IsQwen35HybridSSMModel(model)) {
-        return false;
+        return GetWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled;
     }
     if (IsQwen38HybridSSMModel(model)) {
         return false;

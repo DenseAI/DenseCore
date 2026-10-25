@@ -737,7 +737,8 @@ int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle, DenseCoreRuntim
     out->token_id_submit_supported = 1;
     out->prefix_cache_reuse_enabled =
         (!config.worker.prefix_cache_reuse_disabled &&
-         (!qwen36_hybrid || config.worker.qwen36_prefix_cache_reuse_enabled) && !qwen35_hybrid && !qwen38_hybrid)
+         (!qwen36_hybrid || config.worker.qwen36_prefix_cache_reuse_enabled) &&
+         (!qwen35_hybrid || config.worker.qwen35_prefix_cache_reuse_enabled) && !qwen38_hybrid)
             ? 1
             : 0;
     // Match worker prefix eligibility and recurrent-state restore gating.

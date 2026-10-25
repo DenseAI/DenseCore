@@ -366,3 +366,24 @@ TEST(ResourceBudgetTest, UnreadableRootLimitIsNotMistakenForUnlimited) {
     }, 16);
     EXPECT_EQ(result.memory.state, densecore::runtime::ResourceState::Unknown);
 }
+
+TEST(LLMRuntimeConfigTest, Qwen35PrefixQualificationOptInHonorsBothGlobalControls) {
+    ScopedEnvVar prefix_reuse("DENSECORE_PREFIX_CACHE_REUSE", nullptr);
+    ScopedEnvVar snapshot_restore("DENSECORE_HYBRID_SSM_SNAPSHOT_RESTORE", nullptr);
+    ScopedEnvVar opt_in("DENSECORE_QWEN35_PREFIX_CACHE_REUSE", nullptr);
+    ScopedEnvVar debug_prefix("DENSECORE_DEBUG_DISABLE_PREFIX_CACHE_REUSE", nullptr);
+    ScopedEnvVar debug_snapshot("DENSECORE_DEBUG_DISABLE_HYBRID_SSM_RESTORE", nullptr);
+    EXPECT_FALSE(densecore::llm::config::LoadWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled);
+    {
+        ScopedEnvVar enabled("DENSECORE_QWEN35_PREFIX_CACHE_REUSE", "1");
+        EXPECT_TRUE(densecore::llm::config::LoadWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled);
+        {
+            ScopedEnvVar disabled("DENSECORE_PREFIX_CACHE_REUSE", "0");
+            EXPECT_FALSE(densecore::llm::config::LoadWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled);
+        }
+        {
+            ScopedEnvVar disabled("DENSECORE_HYBRID_SSM_SNAPSHOT_RESTORE", "0");
+            EXPECT_FALSE(densecore::llm::config::LoadWorkerRuntimeConfig().qwen35_prefix_cache_reuse_enabled);
+        }
+    }
+}
