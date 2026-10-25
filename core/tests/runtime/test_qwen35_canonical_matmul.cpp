@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <iomanip>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -355,4 +356,185 @@ TEST(Qwen35CanonicalMatmulTest, SsmQ5AdmissionRequiresExactRegisteredPoint8NonMo
     EXPECT_FALSE(admitted(weight,ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,1024,4,2)));
     EXPECT_FALSE(admitted(weight,ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1024,16)));
     EXPECT_TRUE(admitted(weight));
+}
+
+namespace {
+struct SsmGateOutQ4Options {
+    densecore::env::RuntimeToggleMode mode=densecore::env::RuntimeToggleMode::On;
+    InferenceExecutionPhase phase=InferenceExecutionPhase::Decode;
+    bool foreign=false,lora=false,reference=false,no_context=false,no_batch=false;
+    bool mixed_tokens=false,mixed_seqs=false,required=false,fused=false,amx=false,metadata_excluded=false;
+};
+std::vector<float> RunSsmGateOutQ4(TransformerModel* model,ggml_tensor* owned,
+                                  const std::vector<float>& values,int columns,int first,int threads,bool padded,
+                                  SsmGateOutQ4Options options={}) {
+    const int n=static_cast<int>(owned->ne[0]),k=static_cast<int>(owned->ne[1]);
+    ggml_tensor lookalike=*owned;auto* weight=options.foreign?&lookalike:owned;
+    std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+    struct Restore{InferenceWorkContext* previous;~Restore(){SetCurrentWorkContext(previous);}}restore{GetCurrentWorkContext()};
+    SetCurrentWorkContext(work.get());ResetInferenceWorkContext(work.get());work->model_variant=model->variant;
+    BatchSpec batch{};batch.num_seqs=columns;batch.tokens.assign(columns,0);
+    for(int c=0;c<columns;++c){batch.seq_id.push_back(c);batch.pos.push_back(37+c);batch.n_past.push_back(37+c);}
+    densecore::llm::config::FastPathRuntimeConfig config;config.q4k_repacked_gemv=options.mode;
+    config.q4k_repacked_gemv_probe=false;config.q4k_repacked_gemv_disable_on_thrash=false;
+    InferenceDependencies deps;deps.fast_path_config=&config;batch.deps=&deps;
+    SetCurrentBatch(&batch);SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({2*1024*1024,nullptr,false}),ggml_free);
+    auto* backing=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,n+(padded?16:0),columns);
+    std::fill_n(static_cast<float*>(backing->data),ggml_nelements(backing),std::numeric_limits<float>::quiet_NaN());
+    auto* input=padded?ggml_view_2d(ctx.get(),backing,n,columns,backing->nb[1],0):backing;
+    for(int c=0;c<columns;++c)std::memcpy(static_cast<char*>(input->data)+c*input->nb[1],values.data()+(first+c)*n,n*sizeof(float));
+    auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(),weight,input,model,static_cast<int>(InferenceExecutionPhase::Decode));
+    struct Params{ggml_custom_op_t fun;int tasks;void* userdata;}params{};
+    if(output->op!=GGML_OP_CUSTOM)throw std::runtime_error("SSM gate/out Q4 fixture lost maintained custom callback");
+    std::memcpy(&params,output->op_params,sizeof(params));
+    if(columns==1)EXPECT_EQ(params.fun,cb_gemv_custom);
+    if(params.fun==cb_gemv_batched_custom){
+        auto* ud=static_cast<GemvBatchedUserData*>(params.userdata);
+        EXPECT_FALSE(ud->qwen35_dense_canonical_q4k_columns); // These are SSM roles, never ordinary DenseProjection.
+        EXPECT_FALSE(ud->qwen35_ssm_qkv_canonical_q5k_columns);
+        ud->force_reference_scalar=options.reference;ud->require_q4k_true_batched=options.required;
+        ud->qwen36_ssm_q8_repacked_batched=options.fused;
+        if(options.amx)ud->qwen38_q4k_8x8_weight=weight;
+        if(options.no_context)ud->work_ctx=nullptr;
+    }
+    if(options.lora)batch.lora_map[nullptr]={0};
+    if(options.mixed_tokens)batch.tokens.push_back(0);
+    if(options.mixed_seqs)batch.num_seqs=columns-1;
+    if(options.no_batch)BindInferenceWorkContextBatch(work.get(),nullptr);
+    SetCurrentExecutionPhase(options.phase);
+    params.tasks=threads;std::memcpy(output->op_params,&params,sizeof(params));
+    auto* graph=ggml_new_graph_custom(ctx.get(),128,false);ggml_build_forward_expand(graph,output);
+    EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,threads),GGML_STATUS_SUCCESS);
+    const auto* profile=GetInferenceWorkContextProfile(work.get());
+    if(columns==1){
+        const bool contiguous=weight->nb[1]==ggml_row_size(GGML_TYPE_Q4_K,n);
+        if(options.mode==densecore::env::RuntimeToggleMode::Off||!contiguous||
+           densecore::kernels::Q4KRepackedGemvCacheLimitBytes()==0)
+            EXPECT_EQ(profile->q4k_repacked_gemv_used_ops.load(),0);
+        else if(densecore::kernels::Q4KRealPackedGemvKernelAvailable())
+            EXPECT_GT(profile->q4k_repacked_gemv_used_ops.load(),0); // Funded On/Auto must actually pack old M1.
+    }
+    const bool excluded=options.foreign||options.lora||options.reference||options.required||options.fused||options.amx||
+        options.no_context||options.no_batch||options.mixed_tokens||options.mixed_seqs||options.metadata_excluded||
+        options.phase!=InferenceExecutionPhase::Decode;
+    if(columns>1&&excluded)EXPECT_EQ(profile->gemv_custom_total_ops.load(),0);
+    std::vector<float> result(k*columns);
+    for(int c=0;c<columns;++c)std::memcpy(result.data()+c*k,static_cast<char*>(output->data)+c*output->nb[1],k*sizeof(float));
+    return result;
+}
+}
+
+TEST(Qwen35CanonicalMatmulTest, SsmGateOutQ4RealShapesPreserveInitializedOldM1Bits) {
+    CacheScope cache;
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({16*1024*1024,nullptr,false}),ggml_free);
+    ASSERT_NE(ctx,nullptr);
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(),ggml_backend_free);
+    ASSERT_NE(cpu,nullptr);
+    const auto* q4=ggml_get_type_traits_cpu(GGML_TYPE_Q4_K);const auto* q8=ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    ASSERT_NE(q4,nullptr);ASSERT_NE(q8,nullptr);ASSERT_NE(q4->vec_dot,nullptr);ASSERT_NE(q8->from_float,nullptr);
+    ASSERT_EQ(q4->vec_dot_type,GGML_TYPE_Q8_K);
+    for(bool gate:{true,false})for(bool padded_weight:{false,true}) {
+        SCOPED_TRACE(gate);
+        SCOPED_TRACE(padded_weight);
+        const int n=gate?1024:2048,k=gate?2048:1024;
+        const char* key=gate?model_keys::kAttnGate:model_keys::kSSMOut;
+        auto model=MakePoint8B();
+        auto* storage=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q4_K,n,k*(padded_weight?2:1));
+        std::memset(storage->data,0xA5,ggml_nbytes(storage));
+        auto* weight=padded_weight?ggml_view_2d(ctx.get(),storage,n,k,2*storage->nb[1],0):storage;
+        ggml_set_name(weight,gate?"blk.0.attn_gate.weight":"blk.0.ssm_out.weight");
+        model->layers[0].Set(key,weight);
+        std::vector<float> row(n),values(8*n);
+        for(int out=0;out<k;++out){
+            for(int i=0;i<n;++i)row[i]=.31f*std::sin((i+7)*(out+3)*.0017f)+.125f*std::cos((i%37-out%19)*.11f);
+            ggml_quantize_chunk(GGML_TYPE_Q4_K,row.data(),static_cast<char*>(weight->data)+out*weight->nb[1],0,1,n,nullptr);
+        }
+        for(int c=0;c<8;++c)for(int i=0;i<n;++i)values[c*n+i]=std::sin((i+1)*.017f+c*.31f)+.37f*std::cos((i+7)*.031f-c*.13f);
+        for(auto mode:{densecore::env::RuntimeToggleMode::Off,densecore::env::RuntimeToggleMode::On,densecore::env::RuntimeToggleMode::Auto}){
+            SCOPED_TRACE(static_cast<int>(mode));
+            ASSERT_GE(densecore::kernels::Q4KRepackedGemvCacheLimitBytes(),static_cast<size_t>(k)*ggml_row_size(GGML_TYPE_Q4_K,n));
+            SsmGateOutQ4Options options;options.mode=mode;
+            std::vector<std::vector<float>> baseline;
+            for(int c=0;c<8;++c){
+                auto singleton=RunSsmGateOutQ4(model.get(),weight,values,1,c,1,false,options);
+                ASSERT_TRUE(std::all_of(singleton.begin(),singleton.end(),[](float x){return std::isfinite(x);}));
+                ASSERT_GT(std::abs(*std::max_element(singleton.begin(),singleton.end(),[](float a,float b){return std::abs(a)<std::abs(b);})),1e-3f);
+                if(mode==densecore::env::RuntimeToggleMode::Off){
+                    alignas(64)std::array<unsigned char,2336> quant{};
+                    ASSERT_LE(ggml_row_size(GGML_TYPE_Q8_K,n),quant.size());q8->from_float(values.data()+c*n,quant.data(),n);
+                    std::vector<float> raw(k);
+                    for(int out=0;out<k;++out)q4->vec_dot(n,&raw[out],0,static_cast<char*>(weight->data)+out*weight->nb[1],0,quant.data(),0,1);
+                    ASSERT_EQ(std::memcmp(raw.data(),singleton.data(),k*sizeof(float)),0)<<"Off oldM1 must equal initialized CPU nrc1";
+                }
+                baseline.push_back(std::move(singleton));
+            }
+            for(int threads:{1,4,5,8})for(bool padded_input:{false,true})for(int columns:{1,2,3,4,8}){
+                SCOPED_TRACE(threads);
+                SCOPED_TRACE(padded_input);
+                SCOPED_TRACE(columns);
+                const auto actual=RunSsmGateOutQ4(model.get(),weight,values,columns,0,threads,padded_input,options);
+                for(int c=0;c<columns;++c)if(std::memcmp(actual.data()+c*k,baseline[c].data(),k*sizeof(float))!=0){
+                    const auto mismatch=std::mismatch(baseline[c].begin(),baseline[c].end(),actual.data()+c*k,
+                        [](float a,float b){return std::memcmp(&a,&b,sizeof(float))==0;});
+                    const int index=static_cast<int>(mismatch.first-baseline[c].begin());
+                    ADD_FAILURE()<<std::setprecision(10)<<"SSM-Q4 gate="<<gate<<" padded_weight="<<padded_weight
+                        <<" mode="<<(mode==densecore::env::RuntimeToggleMode::Off?"off":mode==densecore::env::RuntimeToggleMode::On?"on":"auto")
+                        <<" threads="<<threads<<" padded_input="<<padded_input<<" width="<<columns<<" column="<<c
+                        <<" first_difference="<<index<<" old_m1="<<baseline[c][index]<<" matrix="<<actual[c*k+index];
+                }
+            }
+        }
+        densecore::kernels::RetireRepackedWeightCaches();densecore::kernels::Q4KRepackedGemvSetRuntimeCacheBudgetFloor(0);
+        ASSERT_EQ(densecore::kernels::Q4KRepackedGemvCacheLimitBytes(),0u);
+        for(auto mode:{densecore::env::RuntimeToggleMode::On,densecore::env::RuntimeToggleMode::Auto}){
+            SsmGateOutQ4Options options;options.mode=mode;
+            const auto matrix=RunSsmGateOutQ4(model.get(),weight,values,4,0,5,true,options);
+            for(int c=0;c<4;++c){
+                const auto singleton=RunSsmGateOutQ4(model.get(),weight,values,1,c,5,true,options);
+                EXPECT_EQ(std::memcmp(matrix.data()+c*k,singleton.data(),k*sizeof(float)),0)<<"explicit cache refusal column="<<c;
+            }
+        }
+        densecore::kernels::Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(64*1024*1024);
+        // Exclusions compare against the same tensor bytes/role name but an
+        // unregistered descriptor. This remains a legacy matrix baseline even
+        // after a pointer-owned canonical extension is implemented.
+        for(int exclusion=0;exclusion<20;++exclusion){
+            SCOPED_TRACE(exclusion);SsmGateOutQ4Options options;
+            if(exclusion==0)options.phase=InferenceExecutionPhase::Prefill;
+            if(exclusion==1)options.phase=InferenceExecutionPhase::Unknown;
+            options.lora=exclusion==2;options.reference=exclusion==3;options.no_context=exclusion==4;
+            options.no_batch=exclusion==5;options.mixed_tokens=exclusion==6;options.required=exclusion==7;
+            options.fused=exclusion==8;options.amx=exclusion==9;options.foreign=exclusion==10;
+            options.metadata_excluded=exclusion>=11;
+            options.mixed_seqs=exclusion==12;
+            ggml_tensor clipped=*weight;
+            std::unique_ptr<ggml_context,decltype(&ggml_free)> extra(nullptr,ggml_free);
+            ggml_tensor* tested=weight;
+            if(exclusion==11)model->hybrid_layer_is_ssm[0]=0;
+            if(exclusion==13){model->layers[0].Set(key,nullptr);model->layers[0].Set(model_keys::kAttnQkvWeight,weight);}
+            if(exclusion==14)model->hparams.n_layer=32;
+            if(exclusion==15){clipped.ne[1]-=8;tested=&clipped;model->layers[0].Set(key,tested);}
+            if(exclusion==16){
+                extra.reset(ggml_init({4*1024*1024,nullptr,false}));ASSERT_NE(extra,nullptr);
+                tested=ggml_new_tensor_2d(extra.get(),GGML_TYPE_Q8_0,n,k);ggml_set_name(tested,weight->name);
+                for(int out=0;out<k;++out){
+                    for(int i=0;i<n;++i)row[i]=.31f*std::sin((i+7)*(out+3)*.0017f)+.125f*std::cos((i%37-out%19)*.11f);
+                    ggml_quantize_chunk(GGML_TYPE_Q8_0,row.data(),static_cast<char*>(tested->data)+out*tested->nb[1],0,1,n,nullptr);
+                }
+                model->layers[0].Set(key,tested);
+            }
+            if(exclusion==17)model->variant=ModelVariant::QWEN36;
+            if(exclusion==18)model->hparams.n_experts=2;
+            if(exclusion==19)model->hparams.n_embd=2048;
+            const auto current=RunSsmGateOutQ4(model.get(),tested,values,4,0,5,true,options);
+            options.foreign=true;
+            const auto legacy=RunSsmGateOutQ4(model.get(),tested,values,4,0,5,true,options);
+            ASSERT_EQ(current.size(),legacy.size());
+            EXPECT_EQ(std::memcmp(current.data(),legacy.data(),current.size()*sizeof(float)),0);
+            model->hybrid_layer_is_ssm[0]=1;model->variant=ModelVariant::QWEN35;
+            model->hparams.n_embd=1024;model->hparams.n_layer=24;model->hparams.n_experts=0;
+            model->layers[0].Set(model_keys::kAttnQkvWeight,nullptr);model->layers[0].Set(key,weight);
+        }
+    }
 }
