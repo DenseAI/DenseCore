@@ -12,8 +12,71 @@
 
 #include "densecore.h"
 #include "runtime/engine_internal.h"
+#include "runtime/token_piece.h"
 
 namespace {
+
+TEST(TokenDeliveryPieceTest, CallbackExPreservesActualReasoningBoundariesOnlyForOptedInRequests) {
+    TransformerModel model{};
+    model.vocab_tokens = {"plain", "<think>", "</think>", "<|im_end|>", "<eos>", "<tool_call>",
+                          "<0xE2>", "<0x82>", "<0xAC>"};
+    model.token_types = {1,3,3,3,3,3,6,6,6};
+    for (size_t i=0;i<model.vocab_tokens.size();++i) model.token_to_id[model.vocab_tokens[i]]=static_cast<int>(i);
+    Tokenizer::BuildStreamTokenPieceCache(&model);
+    Request request{};
+    request.callback_ex = [](const char*,int,int,int,void*) {};
+    ASSERT_TRUE(request.suppress_reasoning_tags);  // Both construction and pool reset default closed.
+    for (bool suppress : {true,false}) {
+        request.suppress_reasoning_tags = suppress;
+        EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,1,request),suppress ? "" : "<think>");
+        EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,2,request),suppress ? "" : "</think>");
+        for (int token : {0,3,4,5,6,7,8})
+            EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,token,request),
+                      Tokenizer::Detokenize(&model,token));  // Plain, EOS/control and partial UTF-8 bytes unchanged.
+    }
+    request.callback_ex = nullptr;
+    request.callback = [](const char*,int,void*) {};
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,1,request),"");
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,2,request),"");
+    request.token_result_callback = [](const TokenResult*,void*) {};
+    for (bool suppress : {true,false}) {
+        request.suppress_reasoning_tags = suppress;
+        for (int token=0;token<static_cast<int>(model.vocab_tokens.size());++token)
+            EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,token,request),
+                      Tokenizer::DetokenizeStructured(&model,token));  // Existing structured-result ABI behavior.
+    }
+}
+
+TEST(TokenDeliveryPieceTest, PublishedQwen3ClosingIdSurvivesCallbackExAndJsonGrammarRemainsPlain) {
+    constexpr int open = 151667, close = 151668, eos = 151645;
+    TransformerModel model{};
+    model.vocab_tokens.resize(close+1);
+    model.token_types.assign(close+1,3);
+    model.vocab_tokens[open] = "<think>";
+    model.vocab_tokens[close] = "</think>";
+    model.vocab_tokens[eos] = "<|im_end|>";
+    model.token_to_id = {{"<think>",open},{"</think>",close},{"<|im_end|>",eos}};
+    Tokenizer::BuildStreamTokenPieceCache(&model);
+    Request request{};
+    request.callback_ex = [](const char*,int,int,int,void*) {};
+    request.suppress_reasoning_tags = false;
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,open,request),"<think>");
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,close,request),"</think>");
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,eos,request),"");
+    request.json_mode = true;
+    request.grammar.enabled = true;
+    request.grammar.is_json_mode = true;
+    request.grammar.state = JSONState::EXPECT_OBJECT_START;
+    for (int id : {open,close,eos}) {
+        const auto piece = densecore::runtime::DetokenizeForTokenDelivery(&model,id,request);
+        EXPECT_TRUE(piece.empty());
+        request.grammar.UpdateState(piece); // Same input consumed by the worker's JSON path.
+        EXPECT_EQ(request.grammar.state,JSONState::EXPECT_OBJECT_START);
+    }
+    request.token_result_callback = [](const TokenResult*,void*) {};
+    // Structured-result JSON behavior already exposes actual boundaries; retain it.
+    EXPECT_EQ(densecore::runtime::DetokenizeForTokenDelivery(&model,close,request),"</think>");
+}
 
 // No worker is started: inspect exactly what each public entry point admits,
 // without sampling/execution masking differences in legacy preparation policy.

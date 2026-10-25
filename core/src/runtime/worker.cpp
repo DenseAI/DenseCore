@@ -55,6 +55,7 @@
 #include "runtime/engine_internal.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
+#include "runtime/token_piece.h"
 #include "utils/raii_guards.h"
 
 #include "densecore/arm_runtime.h"
@@ -6343,9 +6344,8 @@ void EngineLoop(EngineState* state) {
 
                     std::string token_str;
                     {
-                        std::string token_piece = req->token_result_callback
-                                                      ? Tokenizer::DetokenizeStructured(current_model, best_token)
-                                                      : Tokenizer::Detokenize(current_model, best_token);
+                        std::string token_piece =
+                            densecore::runtime::DetokenizeForTokenDelivery(current_model, best_token, *req);
                         if (const char* env = densecore::env::GetDiagnosticEnv("DENSECORE_DEBUG_FIRST_TOKEN_RAW");
                             env && env[0] != '\0' && best_token >= 0 &&
                             best_token < static_cast<int>(current_model->vocab_tokens.size()) &&
