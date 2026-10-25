@@ -458,6 +458,50 @@ TEST(RequestLifecycleCallbackModeTest, ShutdownPendingRequestUsesConfiguredDirec
 
 }  // namespace
 
+TEST_F(RequestLifecycleTest, EmptyGrammarIntersectionFailsOnlyItsRequestAndAllowsRecovery) {
+    auto* state = static_cast<EngineState*>(engine_);
+    CallbackState invalid, peer, recovery;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    // The mock vocabulary maps ASCII IDs to their characters. "A" cannot
+    // begin a JSON object, so the strict whitelist and grammar have no overlap.
+    const int allowed = 'A';
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "invalid-json-intersection", 2, nullptr, 0.0f, 1.0f, 1, 1.0f,
+        nullptr, 1, &allowed, 1, 1, nullptr, 0, LifecycleCallbackEx, &invalid), 0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "healthy-peer", 2, nullptr, 0.0f, 1.0f, 1, 1.0f,
+        nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &peer), 0);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+
+    ASSERT_TRUE(invalid.WaitForFinal());
+    ASSERT_TRUE(peer.WaitForFinal());
+    EXPECT_EQ(invalid.final_count, 1);
+    EXPECT_TRUE(invalid.tokens.empty());
+    ASSERT_EQ(invalid.final_texts.size(), 1u);
+    EXPECT_NE(invalid.final_texts.front().find("Error: Sampling constraints:"), std::string::npos);
+    EXPECT_EQ(peer.final_count, 1);
+    ASSERT_EQ(peer.final_texts.size(), 1u);
+    EXPECT_EQ(peer.final_texts.front().find("Error:"), std::string::npos);
+    EXPECT_FALSE(peer.tokens.empty());
+    EXPECT_EQ(state->status.load(), EngineStatus::RUNNING);
+
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(
+        engine_, "healthy-recovery", 2, nullptr, 0.0f, 1.0f, 1, 1.0f,
+        nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &recovery), 0);
+    ASSERT_TRUE(recovery.WaitForFinal());
+    EXPECT_EQ(recovery.final_count, 1);
+    ASSERT_EQ(recovery.final_texts.size(), 1u);
+    EXPECT_EQ(recovery.final_texts.front().find("Error:"), std::string::npos);
+    EXPECT_FALSE(recovery.tokens.empty());
+    FreeEngine(engine_);
+    engine_ = nullptr;
+    EXPECT_EQ(invalid.final_count, 1);
+    EXPECT_EQ(peer.final_count, 1);
+    EXPECT_EQ(recovery.final_count, 1);
+}
+
 TEST_F(RequestLifecycleTest, WorkerExceptionTerminatesActiveAndPendingRequestsAndRejectsAdmission) {
     auto* state = static_cast<EngineState*>(engine_);
     densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
