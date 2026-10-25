@@ -3,6 +3,7 @@
 #include <ggml.h>
 
 #include <chrono>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include "densecore/models/model_execution_contract.h"
 #include "densecore/runtime/ggml_compute_policy.h"
 #include "runtime/worker_internal.h"
+#include "runtime/request_builder.h"
 #include "runtime/kernel_admission.h"
 
 namespace {
@@ -1468,6 +1470,11 @@ struct StopOutputCapture {
     int reason = -1;
     int flushes = 0;
     bool throw_flush = false;
+    bool throw_completion = false;
+    int after_terminal = 0;
+    std::string terminal_text;
+    std::weak_ptr<densecore::runtime::ResourceAllocationLease> payload;
+    bool payload_live_at_terminal = false;
     std::vector<std::string> order;
 };
 void StopLegacy(const char* text, int finished, void* data) {
@@ -1477,7 +1484,14 @@ void StopLegacy(const char* text, int finished, void* data) {
 }
 void StopEx(const char* text, int size, int id, int finished, void* data) {
     auto& capture = *static_cast<StopOutputCapture*>(data);
-    if (finished) { ++capture.terminals; capture.order.push_back("terminal"); return; }
+    if (finished) {
+        ++capture.terminals;
+        capture.payload_live_at_terminal = !capture.payload.expired();
+        capture.terminal_text.assign(text, static_cast<size_t>(size));
+        capture.order.push_back("terminal");
+        return;
+    }
+    if (capture.terminals) ++capture.after_terminal;
     if (id >= 0) capture.ids.push_back(id);
     else {
         capture.order.push_back("flush");
@@ -1490,18 +1504,20 @@ void StopStructured(const TokenResult* result, void* data) {
     StopEx(result->text, result->text ? static_cast<int>(std::strlen(result->text)) : 0,
            result->token_id, result->is_finished, data);
 }
-void StopCompletion(int count, int reason, void* data) {
+void StopCompletion(int count, DenseCoreGenerationFinishReason reason, void* data) {
     auto& capture = *static_cast<StopOutputCapture*>(data);
     ++capture.completions;
     capture.order.push_back("metadata");
     capture.generated = count;
     capture.reason = reason;
+    if (capture.throw_completion) throw std::runtime_error("completion callback failed");
 }
 void InitStopRequest(Request& req, StopOutputCapture& capture, int mode) {
     req.Reset();
     req.stop_sequences = {"<END>"};
     req.stop_buffer_max = 5;
     req.stop_buffer.reserve(req.stop_buffer_max);
+    PrepareGenerationTerminalNode(&req, req.stop_buffer_max);
     req.user_data = &capture;
     if (mode == 0) req.callback = StopLegacy;
     else if (mode == 1) req.callback_ex = StopEx;
@@ -1696,6 +1712,9 @@ TEST(StopOutputIntegration, TerminalAllocationFallbackKeepsFlushMetadataTerminal
     req.decode_finish_cause = DecodeFinishCause::StopToken;
     state.fail_result_publication_for_test.store(true);
     ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, false));
+    EXPECT_TRUE(capture.order.empty());
+    EXPECT_EQ(state.terminal_result_count, 1u);
+    DrainStopEvents(state);
     EXPECT_EQ(capture.visible, "<EN");
     EXPECT_EQ(capture.order, (std::vector<std::string>{"flush", "metadata", "terminal"}));
     EXPECT_EQ(capture.generated, 3);
@@ -1780,4 +1799,190 @@ TEST(StopOutputIntegration, CancelAndShutdownDoNotFinalizeOrMutateHoldbackBefore
     EXPECT_EQ(capture.terminals, 1);
     EXPECT_TRUE(req.stop_buffer.empty());
     EXPECT_TRUE(state.active_requests.empty());
+}
+
+TEST(StopOutputIntegration, QueuedBodyPrecedesReservedTerminalAndSurvivesRequestReset) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    state.generation_completion_callback.store(StopCompletion);
+    StopOutputCapture capture;
+    Request req;
+    InitStopRequest(req, capture, 2);
+    req.generated_count = 2;
+    std::string first = "Hi", held = "<EN";
+    PublishStopFilteredToken(&state, &req, first, 7, false, std::chrono::steady_clock::now());
+    PublishStopFilteredToken(&state, &req, held, 8, false, std::chrono::steady_clock::now());
+    req.decode_finish_cause = DecodeFinishCause::StopToken;
+    state.fail_result_publication_for_test.store(true);
+    ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, false));
+    EXPECT_EQ(capture.terminals, 0);
+    EXPECT_EQ(state.terminal_result_count, 1u);
+    req.Reset();
+    DrainStopEvents(state);
+    EXPECT_EQ(capture.visible, "Hi<EN");
+    EXPECT_EQ(capture.ids, (std::vector<int>{7, 8}));
+    EXPECT_EQ(capture.generated, 2);
+    EXPECT_EQ(capture.terminals, 1);
+    EXPECT_EQ(capture.after_terminal, 0);
+    EXPECT_EQ(state.terminal_result_count, 0u);
+}
+
+TEST(StopOutputIntegration, InFlightPausedBodyCannotBeOvertakenByReservedTerminal) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    struct Paused {
+        StopOutputCapture capture;
+        std::promise<void> entered;
+        std::promise<void> release;
+        std::shared_future<void> gate;
+    } paused;
+    paused.gate = paused.release.get_future().share();
+    auto entered = paused.entered.get_future();
+    Request req;
+    req.Reset();
+    req.id = 77;
+    req.stop_sequences = {"<END>"}; req.stop_buffer_max = 5;
+    PrepareGenerationTerminalNode(&req, 5);
+    req.user_data = &paused;
+    req.callback_ex = [](const char* text, int count, int id, int finished, void* data) {
+        auto& value = *static_cast<Paused*>(data);
+        if (!finished && id == 7) { value.entered.set_value(); value.gate.wait(); }
+        StopEx(text, count, id, finished, &value.capture);
+    };
+    std::string first = "Hi";
+    req.generated_count = 1;
+    PublishStopFilteredToken(&state, &req, first, 7, false, std::chrono::steady_clock::now());
+    std::thread callbacks([&] { CallbackLoop(&state); });
+    const bool started = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(started);
+    std::string held = "<EN";
+    req.generated_count = 2;
+    PublishStopFilteredToken(&state, &req, held, 8, false, std::chrono::steady_clock::now());
+    req.decode_finish_cause = DecodeFinishCause::StopToken;
+    state.fail_result_publication_for_test.store(true);
+    EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, false));
+    // Producer returns without waiting for the callback or freeing its userdata.
+    EXPECT_EQ(paused.capture.terminals, 0);
+    req.Reset();
+    state.result_producers_done.store(true);
+    state.result_cv.notify_all();
+    paused.release.set_value();
+    callbacks.join();
+    EXPECT_EQ(paused.capture.visible, "Hi<EN");
+    EXPECT_EQ(paused.capture.ids, (std::vector<int>{7, 8}));
+    EXPECT_EQ(paused.capture.terminals, 1);
+    EXPECT_EQ(paused.capture.after_terminal, 0);
+}
+
+TEST(StopOutputIntegration, MetadataExceptionDoesNotSkipMatchedOrNoStopTerminal) {
+    for (bool direct : {false, true}) for (bool matched_stop : {false, true}) {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        state.generation_completion_callback.store(StopCompletion);
+        StopOutputCapture capture;
+        capture.throw_completion = true;
+        Request req;
+        InitStopRequest(req, capture, 1);
+        req.generated_count = 1;
+        if (matched_stop) {
+            std::string piece = "Hi<END>";
+            EXPECT_TRUE(PublishStopFilteredToken(&state, &req, piece, 7, direct, std::chrono::steady_clock::now()));
+        } else {
+            req.stop_sequences.clear(); req.stop_buffer_max = 0;
+            EmitRequestResult(&state, &req, "Hi", 7, false, false, direct);
+            req.decode_finish_cause = DecodeFinishCause::StopToken;
+        }
+        EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, direct));
+        if (!direct) DrainStopEvents(state);
+        EXPECT_EQ(capture.visible, "Hi");
+        EXPECT_EQ(capture.completions, 1);
+        EXPECT_EQ(capture.terminals, 1);
+        EXPECT_EQ(capture.flushes, 0);
+        EXPECT_EQ(capture.order, (std::vector<std::string>{"metadata", "terminal"}));
+    }
+}
+
+TEST(StopOutputIntegration, MultipleFatalTerminalsKeepLeaseAndOrderingAfterRequestRetirement) {
+    using namespace densecore::runtime;
+    RuntimeMemoryPlan plan;
+    plan.available_bytes = plan.allocator_bytes = 64 * 1024;
+    ResourcePlanLease deterministic(plan);
+    const auto before = ResourceLedgerUsageSnapshot().admission_bytes;
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    std::array<StopOutputCapture, 4> capture;
+    std::array<Request, 4> requests;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto& req = requests[i];
+        auto lease = ResourceAllocationLease::Acquire(AllocationCategory::Admission, 1024);
+        ASSERT_NE(lease, nullptr);
+        InitStopRequest(req, capture[i], 1);
+        req.id = static_cast<int>(i + 1);
+        req.admission_payload_lease = std::move(lease);
+        capture[i].payload = req.admission_payload_lease;
+        req.generated_count = 1;
+        EmitRequestResult(&state, &req, "body", static_cast<int>(i), false, false, false);
+        req.decode_finish_cause = DecodeFinishCause::GraphBuildFailed;
+        state.fail_result_publication_for_test.store(true);
+        ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "Error: failed", -1, true, false));
+        req.ReleaseExecutionState();
+    }
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes, before + 4096);
+    EXPECT_EQ(state.terminal_result_count, 4u);
+    DrainStopEvents(state);
+    for (const auto& result : capture) {
+        EXPECT_EQ(result.visible, "body");
+        EXPECT_EQ(result.terminals, 1);
+        EXPECT_EQ(result.after_terminal, 0);
+        EXPECT_TRUE(result.payload_live_at_terminal);
+    }
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes, before);
+}
+
+TEST(StopOutputIntegration, EmergencyErrorTextHasExplicitUtf8SafeBoundNormalErrorRemainsFull) {
+    for (bool emergency : {false, true}) {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        StopOutputCapture capture;
+        Request req;
+        InitStopRequest(req, capture, 1);
+        req.decode_finish_cause = DecodeFinishCause::GraphBuildFailed;
+        const std::string error = std::string(255, 'x') + "é and more context";
+        const auto* reserved_bytes = req.reserved_terminal->event.token_str.data();
+        state.fail_result_publication_for_test.store(emergency);
+        ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, error, -1, true, false));
+        if (emergency) {
+            ASSERT_NE(state.terminal_result_head, nullptr);
+            EXPECT_EQ(state.terminal_result_head->event.token_str.data(), reserved_bytes);
+        }
+        DrainStopEvents(state);
+        EXPECT_EQ(capture.terminal_text, emergency ? std::string(255, 'x') : error);
+        EXPECT_EQ(Utf8ValidPrefixLength(capture.terminal_text), capture.terminal_text.size());
+        EXPECT_EQ(capture.terminals, 1);
+    }
+}
+
+TEST(StopOutputIntegration, AdmissionReservesTerminalBeforeRequestPublicationAndReleasesUnusedStorage) {
+    using namespace densecore::runtime;
+    RuntimeMemoryPlan plan;
+    plan.available_bytes = plan.allocator_bytes = 256 * 1024;
+    ResourcePlanLease deterministic(plan);
+    const auto before = ResourceLedgerUsageSnapshot().admission_bytes;
+    {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        const std::string stop(512, 'x');
+        const char* stops[] = {stop.c_str(), nullptr};
+        auto* req = AcquireBoundedTextRequest(&state, "prompt", 0, 8, nullptr, stops);
+        ASSERT_NE(req, nullptr);
+        ASSERT_NE(req->reserved_terminal, nullptr);
+        EXPECT_GE(req->reserved_terminal->event.token_str.capacity(), stop.size());
+        EXPECT_TRUE(state.pending_requests.Empty());
+        const auto admitted = ResourceLedgerUsageSnapshot().admission_bytes;
+        EXPECT_GT(admitted, before + sizeof(TerminalResultNode) + stop.size());
+        state.request_pool.Release(req);
+        EXPECT_EQ(req->reserved_terminal, nullptr);
+        EXPECT_LT(ResourceLedgerUsageSnapshot().admission_bytes, admitted);
+    }
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes, before);
 }

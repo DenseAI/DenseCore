@@ -1421,23 +1421,33 @@ void CallbackLoop(EngineState* state) {
             {
                 std::unique_lock<std::mutex> lock(state->result_mu);
                 state->result_cv.wait(lock, [state]() {
-                    return !state->result_queue.empty() || state->result_producers_done.load(std::memory_order_acquire);
+                    return !state->result_queue.empty() || state->terminal_result_head ||
+                           state->result_producers_done.load(std::memory_order_acquire);
                 });
 
-                if (state->result_queue.empty() &&
+                if (state->result_queue.empty() && !state->terminal_result_head &&
                     state->result_producers_done.load(std::memory_order_acquire)) {
                     break;  // Exit: shutdown complete
                 }
 
-                if (state->result_queue.empty()) continue;
+                if (state->result_queue.empty() && !state->terminal_result_head) continue;
 
-                event = std::move(state->result_queue.front());
-                state->result_queue.pop_front();
+                if (state->terminal_result_head && (state->result_queue.empty() ||
+                    state->terminal_result_head->event.publication_order < state->result_queue.front().publication_order)) {
+                    auto node = std::move(state->terminal_result_head);
+                    state->terminal_result_head = std::move(node->next);
+                    if (!state->terminal_result_head) state->terminal_result_tail = nullptr;
+                    --state->terminal_result_count;
+                    event = std::move(node->event);
+                } else {
+                    event = std::move(state->result_queue.front());
+                    state->result_queue.pop_front();
+                }
 
                 // ===========================================================
                 // BACKPRESSURE RELEASE: Notify producers if queue drains
                 // ===========================================================
-                if (state->result_queue.size() <= EngineState::RESULT_QUEUE_LOW_WATERMARK) {
+                if (state->result_queue.size() + state->terminal_result_count <= EngineState::RESULT_QUEUE_LOW_WATERMARK) {
                     state->result_drain_cv.notify_all();
                 }
             }
@@ -1447,10 +1457,10 @@ void CallbackLoop(EngineState* state) {
                           << " (finished=" << event.finished << ")" << std::endl;
             }
 
-            if (event.prefix_before_terminal) {
-                DispatchStopTerminalBundle(event.token_str, event.callback, event.callback_ex,
-                    event.token_result_callback, event.user_data, event.completion_callback,
-                    event.generated_tokens, event.finish_reason);
+            if (event.finished && !event.emb_callback) {
+                DispatchGenerationTerminal(event.token_str, event.token_id, event.error, event.prefix_before_terminal,
+                    event.callback, event.callback_ex, event.token_result_callback, event.user_data,
+                    event.completion_callback, event.generated_tokens, event.finish_reason);
                 continue;
             }
 

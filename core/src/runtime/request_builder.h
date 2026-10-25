@@ -17,7 +17,7 @@ class RequestGuard;
 Request* AcquireAndInitRequest(EngineState* state, uint64_t payload_bytes = 0);
 Request* AcquireBoundedTextRequest(EngineState* state, const char* prompt, int input_tokens,
     int max_tokens, const char* lora = nullptr, const char* const* stops = nullptr,
-    int allowed = 0, int disallowed = 0);
+    int allowed = 0, int disallowed = 0, bool reserve_terminal = true);
 int PublishPreparedRequest(EngineState* state, Request* request, RequestGuard& guard,
                            const std::string& draining_error);
 

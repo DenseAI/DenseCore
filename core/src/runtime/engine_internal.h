@@ -127,12 +127,14 @@ densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_c
 
 struct Request;
 struct EngineState;
+struct TerminalResultNode;
 void PushResultEvent(EngineState* state, int request_id, const std::string& token, int token_id, bool finished,
                      bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                      void* user_data, GenerationCompletionCallback completion_callback = nullptr,
                      int generated_tokens = 0, DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP,
                      std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {},
-                     bool prefix_before_terminal = false, bool* delivery_error = nullptr);
+                     bool prefix_before_terminal = false, bool* delivery_error = nullptr,
+                     std::unique_ptr<TerminalResultNode>* reserved_terminal = nullptr);
 void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
                               int status, EmbeddingCallback cb, void* user_data,
                               std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {});
@@ -221,6 +223,7 @@ struct ResultEvent {
     bool finished;
     bool error;
     bool prefix_before_terminal = false; // token_str is one text-only flush, then an empty terminal.
+    uint64_t publication_order = 0;
 
     // Callback pointers (copied from Request at event creation time)
     TokenCallback callback;
@@ -284,26 +287,37 @@ struct OwnedGraphInput {
     std::vector<uint8_t> bytes;
 };
 
-// A bundled suffix is one queue item, so terminal allocation fallback cannot
-// overtake it. This does not add a sampled token or change native usage.
-inline bool DispatchStopTerminalBundle(const std::string& prefix, TokenCallback callback,
-    TokenCallbackEx callback_ex, TokenResultCallback structured, void* user_data,
+constexpr size_t kReservedTerminalErrorBytes = 256;
+struct TerminalResultNode {
+    // The consumer detaches next before destruction. Event text is destroyed
+    // before its first-declared admission lease; no Request survives retirement.
+    ResultEvent event;
+    std::unique_ptr<TerminalResultNode> next;
+};
+
+// Metadata and terminal are independent attempts even if either callback throws.
+inline bool DispatchGenerationTerminal(const std::string& payload, int token_id, bool error, bool prefix,
+    TokenCallback callback, TokenCallbackEx callback_ex, TokenResultCallback structured, void* user_data,
     GenerationCompletionCallback completion, int generated, DenseCoreGenerationFinishReason reason) noexcept {
-    auto invoke = [&](const char* text, int size, bool finished) {
-        if (callback_ex) callback_ex(text, size, -1, finished ? 1 : 0, user_data);
+    auto invoke = [&](const char* text, int size, int id, bool finished) {
+        if (callback_ex) callback_ex(text, size, id, finished ? 1 : 0, user_data);
         else if (callback) callback(text, finished ? 1 : 0, user_data);
         else if (structured) {
-            TokenResult result{-1, text, finished ? 1 : 0};
+            TokenResult result{id, text, finished ? 1 : 0};
             structured(&result, user_data);
         }
     };
     bool failed = false;
-    try { invoke(prefix.c_str(), static_cast<int>(prefix.size()), false); } catch (...) { failed = true; }
+    if (prefix && !error && !payload.empty()) {
+        try { invoke(payload.c_str(), static_cast<int>(payload.size()), -1, false); } catch (...) { failed = true; }
+    }
     if (failed) reason = DENSECORE_GENERATION_ERROR;
     if (completion) {
         try { completion(generated, reason, user_data); } catch (...) { failed = true; }
     }
-    try { invoke("", 0, true); } catch (...) { failed = true; }
+    const bool empty_terminal = prefix && !error;
+    try { invoke(empty_terminal ? "" : payload.c_str(), empty_terminal ? 0 : static_cast<int>(payload.size()),
+                 empty_terminal ? -1 : token_id, true); } catch (...) { failed = true; }
     return failed;
 }
 
@@ -419,6 +433,7 @@ struct Request {
     std::vector<std::string> stop_sequences;
     std::string stop_buffer;
     size_t stop_buffer_max = 0;
+    std::unique_ptr<TerminalResultNode> reserved_terminal;
 
     // Timing and metrics
     std::chrono::steady_clock::time_point arrival_time;
@@ -936,6 +951,7 @@ struct Request {
         swap_state.num_blocks = 0;
         std::vector<uint8_t>().swap(swap_state.k_data);
         std::vector<uint8_t>().swap(swap_state.v_data);
+        reserved_terminal.reset(); // Free reserved event storage while its payload charge is still held.
         admission_payload_lease.reset();
     }
 
@@ -1003,6 +1019,7 @@ struct Request {
         stop_sequences.clear();
         stop_buffer.clear();
         stop_buffer_max = 0;
+        reserved_terminal.reset();
         grammar.enabled = false;
         grammar.is_json_mode = false;
         arrival_time = std::chrono::steady_clock::time_point();
@@ -1443,6 +1460,11 @@ struct Request {
     }
 };
 
+inline void PrepareGenerationTerminalNode(Request* req, size_t maximum_stop_bytes) {
+    if (!req->reserved_terminal) req->reserved_terminal = std::make_unique<TerminalResultNode>();
+    req->reserved_terminal->event.token_str.reserve(std::max(maximum_stop_bytes, kReservedTerminalErrorBytes));
+}
+
 void FinalizeDecodeSilentFinishReason(Request* req);
 void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 
@@ -1875,6 +1897,10 @@ struct EngineState {
     static constexpr size_t RESULT_QUEUE_CRITICAL_WATERMARK = 256;
 
     std::deque<ResultEvent> result_queue;
+    std::unique_ptr<TerminalResultNode> terminal_result_head;
+    TerminalResultNode* terminal_result_tail = nullptr;
+    size_t terminal_result_count = 0;
+    uint64_t next_result_order = 0;
     std::mutex result_mu;
     std::condition_variable result_cv;
     std::condition_variable result_drain_cv;  // For blocking wait when critical
@@ -2691,18 +2717,18 @@ void CallbackLoop(EngineState* state);
 // - CRITICAL_WATERMARK: Block until queue drains to LOW_WATERMARK
 // ===========================================================================
 inline void ApplyResultQueueBackpressure(EngineState* state, std::unique_lock<std::mutex>& lock) {
-    if (state->result_queue.size() >= EngineState::RESULT_QUEUE_CRITICAL_WATERMARK) {
+    if (state->result_queue.size() + state->terminal_result_count >= EngineState::RESULT_QUEUE_CRITICAL_WATERMARK) {
         // Critical: block until queue drains to prevent unbounded memory growth
         state->backpressure_events.fetch_add(1, std::memory_order_relaxed);
         state->backpressure_active.store(true, std::memory_order_relaxed);
 
         state->result_drain_cv.wait(lock, [state]() {
-            return state->result_queue.size() <= EngineState::RESULT_QUEUE_LOW_WATERMARK ||
+            return state->result_queue.size() + state->terminal_result_count <= EngineState::RESULT_QUEUE_LOW_WATERMARK ||
                    state->status == EngineStatus::STOPPED;
         });
 
         state->backpressure_active.store(false, std::memory_order_relaxed);
-    } else if (state->result_queue.size() >= EngineState::RESULT_QUEUE_HIGH_WATERMARK) {
+    } else if (state->result_queue.size() + state->terminal_result_count >= EngineState::RESULT_QUEUE_HIGH_WATERMARK) {
         // Warning: signal slowdown but don't block
         state->backpressure_active.store(true, std::memory_order_relaxed);
     } else {
@@ -2716,7 +2742,8 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
                             void* user_data, GenerationCompletionCallback completion_callback,
                             int generated_tokens, DenseCoreGenerationFinishReason finish_reason,
                             std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease,
-                            bool prefix_before_terminal, bool* delivery_error) {
+                            bool prefix_before_terminal, bool* delivery_error,
+                            std::unique_ptr<TerminalResultNode>* reserved_terminal) {
     try {
         ResultEvent event;
         event.admission_payload_lease = admission_lease;
@@ -2742,36 +2769,45 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
     #ifdef DENSECORE_TEST_BUILD
             if (finished && state->fail_result_publication_for_test.exchange(false)) throw std::bad_alloc();
     #endif
+            event.publication_order = state->next_result_order++;
             state->result_queue.push_back(std::move(event));
         }
     } catch (...) {
         if (!finished) throw;
-        // A terminal event cannot be lost after its request CAS commits. Queue
-        // allocation failure falls back to direct delivery without allocating.
-        // Callbacks run outside result_mu, and each is attempted only once.
-        if (prefix_before_terminal) {
-            const bool failed = DispatchStopTerminalBundle(token, cb, cb_ex, token_result_cb, user_data,
-                                                           completion_callback, generated_tokens, finish_reason);
-            if (delivery_error) *delivery_error = failed;
-            return;
+        // Every admitted generation request reserves this node before publish.
+        // Never bypass older queued/in-flight callbacks with direct fallback.
+        if (!reserved_terminal || !*reserved_terminal) throw;
+        auto node = std::move(*reserved_terminal);
+        auto& fallback = node->event;
+        fallback.admission_payload_lease = std::move(admission_lease);
+        fallback.completion_callback = completion_callback;
+        fallback.generated_tokens = generated_tokens;
+        fallback.finish_reason = finish_reason;
+        fallback.request_id = request_id;
+        fallback.token_id = token_id;
+        fallback.finished = finished;
+        fallback.error = error;
+        fallback.prefix_before_terminal = prefix_before_terminal;
+        fallback.callback = cb;
+        fallback.callback_ex = cb_ex;
+        fallback.token_result_callback = token_result_cb;
+        fallback.user_data = user_data;
+        // Full normal errors are preserved. Emergency errors have an explicit
+        // UTF-8-safe 256-byte bound; stop suffixes fit their admission reserve.
+        size_t length = error ? std::min(token.size(), kReservedTerminalErrorBytes) : token.size();
+        while (length < token.size() && length > 0 &&
+               (static_cast<unsigned char>(token[length]) & 0xc0) == 0x80) --length;
+        if (length > fallback.token_str.capacity()) throw std::length_error("missing terminal text reserve");
+        fallback.token_str.assign(token.data(), length);
+        {
+            std::lock_guard<std::mutex> lock(state->result_mu);
+            fallback.publication_order = state->next_result_order++;
+            auto* tail = node.get();
+            if (state->terminal_result_tail) state->terminal_result_tail->next = std::move(node);
+            else state->terminal_result_head = std::move(node);
+            state->terminal_result_tail = tail;
+            ++state->terminal_result_count;
         }
-        if (completion_callback) {
-            try { completion_callback(generated_tokens, finish_reason, user_data); } catch (...) {}
-        }
-        try {
-            if (cb_ex) {
-                cb_ex(token.data(), static_cast<int>(token.size()), token_id, 1, user_data);
-            } else if (cb) {
-                cb(token.c_str(), 1, user_data);
-            } else if (token_result_cb) {
-                TokenResult result;
-                result.token_id = token_id;
-                result.text = token.c_str();
-                result.is_finished = 1;
-                token_result_cb(&result, user_data);
-            }
-        } catch (...) {}
-        return;
     }
     state->result_cv.notify_one();
 }
@@ -2797,6 +2833,7 @@ inline void PushEmbeddingResultEvent(EngineState* state, int request_id, std::ve
 #ifdef DENSECORE_TEST_BUILD
         if (state->fail_result_publication_for_test.exchange(false)) throw std::bad_alloc();
 #endif
+        event.publication_order = state->next_result_order++;
         state->result_queue.push_back(std::move(event));
     } catch (...) {
         // Preserve successful embedding bytes in the local event when queue

@@ -503,15 +503,20 @@ TEST_F(RequestLifecycleTest, WorkerExceptionWhileDequeuedTerminatesEmbeddingBefo
     EXPECT_EQ(state->pending_requests.Size(), 0u);
 }
 
-TEST(RequestTerminalPublicationTest, GenerationQueueFailureFallsBackOnceAndWakesCaller) {
+TEST(RequestTerminalPublicationTest, GenerationQueueFailureUsesReservedOrderedTerminalAndWakesCaller) {
     EngineState state;
     Request req;
     CallbackState callback;
     req.Reset();
     req.callback_ex = LifecycleCallbackEx;
     req.user_data = &callback;
+    PrepareGenerationTerminalNode(&req, 0);
+    state.status = EngineStatus::STOPPED;
     state.fail_result_publication_for_test.store(true);
     EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "failure", -1, true, false));
+    EXPECT_EQ(callback.final_count, 0);
+    state.result_producers_done.store(true);
+    CallbackLoop(&state);
     EXPECT_TRUE(callback.WaitForFinal(10ms));
     EXPECT_EQ(callback.final_count, 1);
     EXPECT_TRUE(state.result_queue.empty());
@@ -861,9 +866,18 @@ TEST(RequestAdmissionBudgetTest, TerminalFallbackCallbacksKeepTheirPayloadReserv
         ++probe.calls;
         probe.charged=size==1 && ResourceLedgerUsageSnapshot().admission_bytes>=probe.expected;
     };
+    auto generation_lease = ResourceAllocationLease::Acquire(AllocationCategory::Admission,1024);
+    auto reserved = std::make_unique<TerminalResultNode>();
+    reserved->event.token_str.reserve(kReservedTerminalErrorBytes);
+    state.status = EngineStatus::STOPPED;
     state.fail_result_publication_for_test.store(true);
     PushResultEvent(&state,1,"terminal",1,true,false,generation_callback,nullptr,nullptr,&generation,nullptr,1,
-                    DENSECORE_GENERATION_STOP,ResourceAllocationLease::Acquire(AllocationCategory::Admission,1024));
+                    DENSECORE_GENERATION_STOP,generation_lease,false,nullptr,&reserved);
+    generation_lease.reset();
+    EXPECT_EQ(generation.calls,0);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before+1024);
+    state.result_producers_done.store(true);
+    CallbackLoop(&state);
     EXPECT_EQ(generation.calls,1);
     EXPECT_TRUE(generation.charged);
     EXPECT_EQ(ResourceLedgerUsageSnapshot().admission_bytes,before);

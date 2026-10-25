@@ -599,25 +599,17 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
         : req->decode_finish_cause == DecodeFinishCause::MaxTokens ? DENSECORE_GENERATION_LENGTH
                                                                  : DENSECORE_GENERATION_STOP;
     if (use_direct_callback) {
-        if (prefix_before_terminal) {
-            const bool failed = DispatchStopTerminalBundle(token, req->callback, req->callback_ex,
-                req->token_result_callback, req->user_data, completion_callback, req->generated_count, finish_reason);
+        if (finished) {
+            const bool failed = DispatchGenerationTerminal(token, token_id, error, prefix_before_terminal,
+                req->callback, req->callback_ex, req->token_result_callback, req->user_data,
+                completion_callback, req->generated_count, finish_reason);
             if (delivery_error) *delivery_error = failed;
-            return;
-        }
-        if (completion_callback) {
-            completion_callback(req->generated_count, finish_reason, req->user_data);
-        }
-        if (req->callback_ex) {
-            req->callback_ex(token.data(), static_cast<int>(token.size()), token_id, finished ? 1 : (error ? 1 : 0),
-                             req->user_data);
+        } else if (req->callback_ex) {
+            req->callback_ex(token.data(), static_cast<int>(token.size()), token_id, error ? 1 : 0, req->user_data);
         } else if (req->callback) {
-            req->callback(token.c_str(), finished ? 1 : 0, req->user_data);
+            req->callback(token.c_str(), 0, req->user_data);
         } else if (req->token_result_callback) {
-            TokenResult result;
-            result.token_id = token_id;
-            result.text = token.c_str();
-            result.is_finished = finished ? 1 : (error ? 1 : 0);
+            TokenResult result{token_id, token.c_str(), error ? 1 : 0};
             req->token_result_callback(&result, req->user_data);
         }
         return;
@@ -629,7 +621,7 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
 
     PushResultEvent(state, req->id, token, token_id, finished, error, req->callback, req->callback_ex,
                     req->token_result_callback, req->user_data, completion_callback, req->generated_count,
-                    finish_reason,req->admission_payload_lease,prefix_before_terminal,delivery_error);
+                    finish_reason,req->admission_payload_lease,prefix_before_terminal,delivery_error,&req->reserved_terminal);
 }
 
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req) {

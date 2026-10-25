@@ -21,7 +21,8 @@ bool IsDebugGraphLoggingEnabled();
 bool IsVerboseTokenTraceEnabled();
 bool IsReasoningTagSuppressionEnabled();
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
-                       bool error, bool use_direct_callback);
+                       bool error, bool use_direct_callback, bool prefix_before_terminal,
+                       bool* delivery_error);
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req);
 bool AllowDecodeThreadsOverBase();
 bool IsDecodeBatchPerfLoggingEnabled();

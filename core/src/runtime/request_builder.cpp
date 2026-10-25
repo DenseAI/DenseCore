@@ -527,7 +527,8 @@ Request* AcquireAndInitRequest(EngineState* state, uint64_t payload_bytes) {
 }
 
 std::shared_ptr<densecore::runtime::ResourceAllocationLease> ReserveTextRequestPayload(EngineState* state, const char* prompt, int input_tokens,
-    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed) {
+    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed,
+    bool reserve_terminal = true) {
     using namespace densecore::runtime;
     const uint64_t available = ResourceAllocationLease::AvailableBytes(AllocationCategory::Admission);
     uint64_t bytes = 16*1024; // queue nodes, control blocks, template and diagnostic overhead
@@ -540,18 +541,24 @@ std::shared_ptr<densecore::runtime::ResourceAllocationLease> ReserveTextRequestP
             " available_bytes="+std::to_string(available));
     };
     auto text = [&](const char* value, uint64_t width) {
-        if (!value) return;
+        if (!value) return uint64_t{0};
         // Stop scanning oversized caller input before any owned copy/tokenization.
         const uint64_t limit = available/width;
         uint64_t length = 0;
         while (length <= limit && value[length]) ++length;
         charge(length,width);
+        return length;
     };
     text(prompt,256); // byte-fallback tokens, transient tokenizer buffers, six token histories
     text(lora,2);
+    uint64_t maximum_stop = 0;
     if (stops) for (uint64_t i=0; stops[i]; ++i) {
         charge(1,sizeof(std::string));
-        text(stops[i],8); // parsed strings and maximum matching buffer
+        maximum_stop = std::max(maximum_stop, text(stops[i],8)); // parsed strings and matching buffer
+    }
+    if (reserve_terminal) {
+        charge(1, sizeof(TerminalResultNode));
+        charge(std::max<uint64_t>(maximum_stop, kReservedTerminalErrorBytes), 1);
     }
     charge(static_cast<uint64_t>(std::max(0,input_tokens)),64);
     charge(static_cast<uint64_t>(std::max(0,allowed)),16);
@@ -580,10 +587,21 @@ std::shared_ptr<densecore::runtime::ResourceAllocationLease> ReserveTextRequestP
     return payload;
 }
 Request* AcquireBoundedTextRequest(EngineState* state, const char* prompt, int input_tokens,
-    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed) {
-    auto payload = ReserveTextRequestPayload(state,prompt,input_tokens,max_tokens,lora,stops,allowed,disallowed);
+    int max_tokens, const char* lora, const char* const* stops, int allowed, int disallowed, bool reserve_terminal) {
+    auto payload = ReserveTextRequestPayload(state,prompt,input_tokens,max_tokens,lora,stops,allowed,disallowed,reserve_terminal);
     auto* request = AcquireAndInitRequest(state);
     request->admission_payload_lease = std::move(payload);
+    try {
+        if (reserve_terminal) {
+            size_t maximum_stop = 0;
+            if (stops) for (size_t i = 0; stops[i]; ++i)
+                maximum_stop = std::max(maximum_stop, std::strlen(stops[i]));
+            PrepareGenerationTerminalNode(request, maximum_stop);
+        }
+    } catch (...) {
+        state->request_pool.Release(request);
+        throw;
+    }
     return request;
 }
 
@@ -704,7 +722,7 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
             return DENSECORE_STATUS_MODEL_LOAD_FAILED;
         }
 
-        Request* req = AcquireBoundedTextRequest(state,prompt,0,0);
+        Request* req = AcquireBoundedTextRequest(state,prompt,0,0,nullptr,nullptr,0,0,false);
         RequestGuard request_guard(state, req);
 
         req->prompt = prompt;
@@ -1420,7 +1438,7 @@ int DenseCoreSubmitRenderedChatWithSamplingConstraintsCallbackEx(
     auto* state = static_cast<EngineState*>(handle);
     std::unique_lock<std::mutex> preparation_lock(state->construction_mu);
     auto preparation_lease = ReserveTextRequestPayload(state,rendered_prompt,0,max_tokens,lora_name,
-                                                       stop_sequences,num_allowed_token_ids,num_disallowed_token_ids);
+                                                       stop_sequences,num_allowed_token_ids,num_disallowed_token_ids,false);
     preparation_lock.unlock();
     DenseCoreRequestSnapshot snapshot{};
     const auto release_snapshot = [](DenseCoreRequestSnapshot* value) { DenseCoreFreeRequestSnapshot(value); };
