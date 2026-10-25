@@ -11,9 +11,10 @@ state ownership. Model-specific execution and platform qualification are tracked
 in the [release gates](V0_2_RELEASE_GATES.md) and [model catalog](MODEL_CATALOG.md).
 
 Use no new performance headline yet. Historical TTFT gains do not establish an
-aggregate-throughput or completion-time lead. The MTP implementation currently
-includes an explicit sequential reference, while its automatic profile registry
-is empty. NUMA defaults remain unpromoted. The gpt-oss packed native execution
+aggregate-throughput or completion-time lead. The MTP candidate includes batched target verification and rollback. A pinned
+0.8B file passed frozen-binary greedy and stream/cancel checks, with final
+integration and performance qualification still pending. Its automatic profile
+registry is empty. NUMA defaults remain unpromoted. The gpt-oss packed native execution
 candidate has no current speed or PC RAM-support claim.
 
 A publishable fact sheet must name the exact source and image digests, model

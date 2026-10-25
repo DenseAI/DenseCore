@@ -15,7 +15,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   versioned initialization/runtime diagnostics and embedding pooling AUTO.
 - Isolate request RNG; retain prefix snapshot/KV ownership through restoration;
   terminate failed worker requests and fix native thread-pool generation races.
-- Add NextN loading and an explicit sequential MTP correctness reference.
+- Add NextN loading, batched MTP target verification, suffix/SSM recovery and
+  bounded speculative service. Automatic qualification profiles remain empty.
   Batched verification/SSM integration and automatic speed qualification remain pending.
 - Add Gemma native float-projection and GPT-OSS native packed-expert/Harmony
   candidates; real-model and final-package gates are tracked separately.
