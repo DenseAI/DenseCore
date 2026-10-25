@@ -3,6 +3,7 @@
 #include "densecore/hal/tensor.h"
 #include "densecore/kernels/paged_attention.h"
 #include "densecore/memory/kv_cache.h"
+#include "densecore/simd/hwy_ops.h"
 #include "llm/attention/exec.h"
 #include <algorithm>
 #include <array>
@@ -1222,5 +1223,65 @@ TEST_F(PagedAttentionTest, GQAF16MatchesScalarReference) {
 
     for (size_t i = 0; i < output_data.size(); ++i) {
         ASSERT_NEAR(output_data[i], reference[i], 3e-3f) << "Mismatch at index " << i;
+    }
+}
+
+
+TEST(PagedAttentionQ4CodecTest, HalfBlockOrderAndPartialHeadsMatchGgml) {
+    // Partial heads exercise the final packed block; each block has a distinct
+    // scale/sign pattern and every low/high-nibble coordinate is observed.
+    for (int dim : {1, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 95, 96}) {
+        SCOPED_TRACE(dim);
+        const int padded = (dim + 31) / 32 * 32;
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_0, padded);
+        std::vector<uint8_t> keys(3 * row_bytes), values(keys.size());
+        std::vector<std::vector<float>> decoded_k(3, std::vector<float>(padded));
+        std::vector<std::vector<float>> decoded_v = decoded_k;
+        const auto* traits = ggml_get_type_traits(GGML_TYPE_Q4_0);
+        for (int t = 0; t < 3; ++t) {
+            std::vector<float> k(padded), v(padded);
+            for (int d = 0; d < padded; ++d) {
+                k[d] = ((d * 7 + t * 11) % 31 - 15) * (d / 32 + 1) / 16.f;
+                v[d] = ((d * 13 + t * 5) % 29 - 14) * (t + d / 32 + 1) / 8.f;
+            }
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, k.data(), keys.data() + t * row_bytes, 0, 1, padded, nullptr);
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, v.data(), values.data() + t * row_bytes, 0, 1, padded, nullptr);
+            traits->to_float(keys.data() + t * row_bytes, decoded_k[t].data(), padded);
+            traits->to_float(values.data() + t * row_bytes, decoded_v[t].data(), padded);
+        }
+        const void* k_ptr = keys.data(); const void* v_ptr = values.data();
+        std::vector<float> canonical_k, canonical_v;
+        for (int t = 0; t < 3; ++t) {
+            canonical_k.insert(canonical_k.end(), decoded_k[t].begin(), decoded_k[t].end());
+            canonical_v.insert(canonical_v.end(), decoded_v[t].begin(), decoded_v[t].end());
+        }
+        const void* canonical_k_ptr = canonical_k.data();
+        const void* canonical_v_ptr = canonical_v.data();
+        for (int coordinate = 0; coordinate < dim; ++coordinate) {
+            std::vector<float> q(dim, 0.f), actual(dim), canonical(dim);
+            q[coordinate] = coordinate % 2 ? -1.75f : 1.25f;
+            constexpr float scale = .125f, cap = .7f;
+            densecore::hwy_kernels::PagedAttention_Hwy(q.data(), &k_ptr, &v_ptr, 4, 1,
+                dim, dim, 1, 1, 3, 0, 2, -1, 2, 0, 0, row_bytes, row_bytes,
+                row_bytes, row_bytes, scale, cap, actual.data());
+            // Identical attention math isolates packed-codec correctness from
+            // the kernel's existing FastExp approximation versus std::exp.
+            densecore::hwy_kernels::PagedAttention_Hwy(q.data(), &canonical_k_ptr, &canonical_v_ptr, 0, 1,
+                dim, dim, 1, 1, 3, 0, 2, -1, 2, 0, 0, padded * sizeof(float), padded * sizeof(float),
+                padded * sizeof(float), padded * sizeof(float), scale, cap, canonical.data());
+            double scores[3], denom = 0;
+            for (int t = 0; t < 3; ++t) {
+                double dot = 0;
+                for (int d = 0; d < dim; ++d) dot += static_cast<double>(q[d]) * decoded_k[t][d];
+                scores[t] = std::exp(std::tanh(dot * scale / cap) * cap);
+                denom += scores[t];
+            }
+            for (int d = 0; d < dim; ++d) {
+                double expected = 0;
+                for (int t = 0; t < 3; ++t) expected += scores[t] / denom * decoded_v[t][d];
+                EXPECT_NEAR(actual[d], canonical[d], 2e-6) << "query-coordinate=" << coordinate << " value-coordinate=" << d;
+                EXPECT_NEAR(actual[d], expected, 1e-3) << "independent std::exp attention oracle";
+            }
+        }
     }
 }

@@ -203,8 +203,8 @@ template <class D> HWY_INLINE float DotProductQ4_0(D d, const float* q, const vo
         // Unpack 16 bytes → 32 float values. Stack buffer is always L1-resident.
         float scratch[QK4_0];
         for (int j = 0; j < QK4_0 / 2; ++j) {
-            scratch[2 * j + 0] = static_cast<float>((qs[j] & 0x0F) - 8);
-            scratch[2 * j + 1] = static_cast<float>((qs[j] >> 4)   - 8);
+            scratch[j] = static_cast<float>((qs[j] & 0x0F) - 8);
+            scratch[j + QK4_0 / 2] = static_cast<float>((qs[j] >> 4)   - 8);
         }
 
         // Vectorized dot product of q[q_base..q_base+32] × scratch[0..32]
@@ -225,8 +225,8 @@ template <class D> HWY_INLINE float DotProductQ4_0(D d, const float* q, const vo
     if (tail_start < head_dim) {
         const float scale = densecore::fp16_to_fp32(blocks[nb].d);
         for (int i = 0; tail_start + i < head_dim; ++i) {
-            const uint8_t packed = blocks[nb].qs[i / 2];
-            const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
+            const uint8_t packed = blocks[nb].qs[i % (QK4_0 / 2)];
+            const int qv = (i >= QK4_0 / 2) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
             total += q[tail_start + i] * (static_cast<float>(qv) * scale);
         }
     }
@@ -331,8 +331,8 @@ template <class D> HWY_INLINE void AccumulateQ4_0(D d, float* accum, const void*
         // Unpack 16 bytes → 32 float values (L1-resident scratch buffer).
         float scratch[QK4_0];
         for (int j = 0; j < QK4_0 / 2; ++j) {
-            scratch[2 * j + 0] = static_cast<float>((qs[j] & 0x0F) - 8);
-            scratch[2 * j + 1] = static_cast<float>((qs[j] >> 4)   - 8);
+            scratch[j] = static_cast<float>((qs[j] & 0x0F) - 8);
+            scratch[j + QK4_0 / 2] = static_cast<float>((qs[j] >> 4)   - 8);
         }
 
         // Vectorized accumulate: accum[i] += scratch[i] * scale
@@ -353,8 +353,8 @@ template <class D> HWY_INLINE void AccumulateQ4_0(D d, float* accum, const void*
     if (accum_offset < head_dim) {
         const float scale = densecore::fp16_to_fp32(blocks[nb].d) * weight;
         for (int i = 0; accum_offset + i < head_dim; ++i) {
-            const uint8_t packed = blocks[nb].qs[i / 2];
-            const int qv = (i & 1) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
+            const uint8_t packed = blocks[nb].qs[i % (QK4_0 / 2)];
+            const int qv = (i >= QK4_0 / 2) ? (((packed >> 4) & 0x0F) - 8) : ((packed & 0x0F) - 8);
             accum[accum_offset + i] += static_cast<float>(qv) * scale;
         }
     }
