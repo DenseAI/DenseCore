@@ -4157,12 +4157,24 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                 gateup_tile_out_ptr, static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0],
                                 numa_node, allow_parallel);
                         } else if (q4_repacked_gateup) {
-                            RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
                             ok = densecore::RunQ4KRepackedMoEFusedSwiGLUProjection(
                                 densecore::llm::runtime::ResolveCpuExecutionOptions(GetCurrentWorkContext()), &backend,
                                 gate_row_start, up_row_start, gateup_input_tile_ptr, gateup_qtile_ptr, qrow_bytes,
                                 gateup_tile_out_ptr, static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0],
                                 numa_node, allow_parallel);
+                            if (ok) RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
+                            if (!ok) {
+                                // The global Repack lease may refuse a cache
+                                // entry. Recompute every tile row from the
+                                // validated packed source, overwriting any
+                                // partial optimized output before scattering.
+                                ok = densecore::RunMoEKQuantRawBatchedFusedSwiGLU(
+                                    densecore::llm::runtime::ResolveCpuExecutionOptions(GetCurrentWorkContext()),
+                                    &backend, static_cast<int>(gate_exps->type), gate_row_start, up_row_start,
+                                    gateup_qtile_ptr, qrow_bytes, gateup_tile_out_ptr,
+                                    static_cast<int64_t>(tile_count), row_count, gate_exps->ne[0],
+                                    numa_node, allow_parallel);
+                            }
                         } else if (qwen36_decode_rowpair) {
                             if (tile_count >= 2) {
                                 ok = densecore::runtime::Qwen36GateUpRowPair(
@@ -4251,7 +4263,18 @@ static void RunQwen35NativeMoEGateUpRawQXKSwiGLU(ggml_tensor* dst, const ggml_te
                                        up_row_start, nullptr, qrow, shared_q8->row_bytes, out, /*rows=*/1, row_count,
                                        gate_exps->ne[0], numa_node, allow_parallel);
                     });
-                    if (ok && !q5_single_copy_8x8) {
+                    const bool packed_swiglu_ok = ok;
+                    if (!ok && q4_repacked_gateup) {
+                        // Q4_K raw execution has the same already-validated
+                        // tensor/row contract and writes the entire row range.
+                        // Q5_K single-copy failures remain explicit errors.
+                        RunNativeMoEOnExpertNode(shared_q8, expert, [&](int) {
+                            ok = Qwen35NativeMoEKQ8KFusedSwiGLURows(
+                                lfm2_w1w3_work_ctx, gate_exps->type, gate_row_start, up_row_start,
+                                qrow, gate_exps->ne[0], row_count, weight_row_bytes, out);
+                        });
+                    }
+                    if (packed_swiglu_ok && !q5_single_copy_8x8) {
                         RecordLFM2NativeMoEW1W3Kernel(lfm2_w1w3_work_ctx, "q4k_repacked");
                     }
                     if (!ok) {

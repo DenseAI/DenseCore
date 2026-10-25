@@ -367,6 +367,14 @@ TEST(NextNMoEGraph, ExpertMetadataBudgetIsBoundedAndRejectsHugeCounts) {
     EXPECT_THROW((void)NextNGraph(source), std::invalid_argument);
 }
 
+TEST(NextNMoEGraph, RepackBudgetRefusalRecomputesAllQuantizedRowsWithoutExpansion) {
+    CheckMoEHead(false, true, 1);
+    CheckMoEHead(false, true, 2);
+    CheckMoEHead(true, true, 1);
+    CheckMoEHead(true, true, 2);
+    CheckMoEHead(false, true, 5);
+    CheckMoEHead(true, true, 5);
+}
 
 TEST(NextNMoEGraph, ValidatedProfileDoesNotPromoteUnmarkedFamilyModels) {
     auto source = MakeMoEHead();
