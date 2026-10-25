@@ -26,3 +26,6 @@ bool RouteMoEGroupedSigmoid(const struct ggml_tensor* gate_logits, const MoEUser
                             densecore::moe::MoERouteResult* routing);
 bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEUserData* ud,
                         densecore::moe::MoERouteResult* routing);
+
+void cb_gpt_oss_moe(struct ggml_tensor* dst, const struct ggml_tensor* input,
+                    const struct ggml_tensor* logits, int ith, int nth, void* userdata);

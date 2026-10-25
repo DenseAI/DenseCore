@@ -30,10 +30,12 @@ densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
     support.supports_shared_dense_ffn = true;
     support.supports_moe_down_scale_sidecar = true;
     support.supports_ffn_post_norms = true;
-    support.supported_moe_routers = {densecore::models::DecoderMoERouter::SoftmaxTopK,
+    support.supported_moe_routers = {densecore::models::DecoderMoERouter::SelectedLogitsSoftmax,
+                                     densecore::models::DecoderMoERouter::SoftmaxTopK,
                                      densecore::models::DecoderMoERouter::Gemma4SoftmaxTopK,
                                      densecore::models::DecoderMoERouter::GroupedSigmoidTopK};
-    support.supported_ffn_activations = {densecore::models::DecoderActivation::Silu,
+    support.supported_ffn_activations = {densecore::models::DecoderActivation::SwiGluOai,
+                                         densecore::models::DecoderActivation::Silu,
                                          densecore::models::DecoderActivation::GeluPytorchTanh};
     support.supported_rope_kinds = {densecore::models::DecoderRopeKind::Standard,
                                     densecore::models::DecoderRopeKind::Neox,
@@ -45,6 +47,8 @@ densecore::models::GraphBuilderSupport MakeDenseCoreInlineGraphSupport() {
         densecore::models::DecoderPrefillLogitsPolicy::LastTokenForMoE,
     };
     support.supported_semantic_ops = {
+        densecore::models::DecoderSemanticOpKind::AttentionSink,
+        densecore::models::DecoderSemanticOpKind::BiasedExpertProjection,
         densecore::models::DecoderSemanticOpKind::AttentionNorm,
         densecore::models::DecoderSemanticOpKind::AttentionProjection,
         densecore::models::DecoderSemanticOpKind::HybridSSMMixer,

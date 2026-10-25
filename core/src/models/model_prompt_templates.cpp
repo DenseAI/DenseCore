@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 
 #include "densecore/models/model_descriptor.h"
 #include "runtime/runtime_env.h"
@@ -44,7 +45,7 @@ bool TryParseBoolEnv(const char* name, bool* out) {
 }
 
 bool PromptAlreadyTemplated(const std::string& prompt) {
-    return prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
+    return prompt.find("<|start|>") != std::string::npos || prompt.find("<|im_start|>") != std::string::npos || prompt.find("<|im_end|>") != std::string::npos ||
            prompt.find("<|assistant|>") != std::string::npos || prompt.find("<|user|>") != std::string::npos ||
            prompt.find("<|turn>") != std::string::npos || prompt.find("<turn|>") != std::string::npos ||
            prompt.find("<start_of_turn>") != std::string::npos || prompt.find("<end_of_turn>") != std::string::npos;
@@ -293,6 +294,18 @@ PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* 
     const bool template_looks_chatml = TemplateContains(model, "<|im_start|>");
     const bool template_looks_turn_tags = TemplateContains(model, "<|turn>");
 
+    if (prompt_family == PromptTemplateFamily::HARMONY) {
+        profile.kind = PromptTemplateKind::HARMONY;
+        profile.open_tag = "<|start|>";
+        profile.close_tag = "<|end|>";
+        profile.system_role = "system";
+        profile.user_role = "user";
+        profile.assistant_role = "assistant";
+        profile.supports_thinking = true;
+        profile.thinking_enabled = true;
+        return profile;
+    }
+
     if (prompt_family == PromptTemplateFamily::CHATML || has_chatml_tokens || template_looks_chatml) {
         profile.kind = PromptTemplateKind::CHATML;
         profile.open_tag = "<|im_start|>";
@@ -510,6 +523,9 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
     }
 
     const PromptTemplateProfile profile = ResolveModelPromptTemplateProfile(model);
+    if (profile.kind == PromptTemplateKind::HARMONY) {
+        return "<|start|>user<|message|>" + prompt + "<|end|><|start|>assistant";
+    }
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string wrapped;
         wrapped.reserve(prompt.size() + 180);
@@ -593,6 +609,21 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
         *thinking_enabled_out = thinking_enabled;
     }
 
+    if (profile.kind == PromptTemplateKind::HARMONY) {
+        std::string rendered;
+        for (const auto& message : messages) {
+            if (message.role != "system" && message.role != "developer" && message.role != "user" &&
+                message.role != "assistant") {
+                throw std::invalid_argument("gpt-oss text chat supports system/developer/user/assistant roles");
+            }
+            rendered += "<|start|>" + message.role;
+            if (message.role == "assistant") rendered += "<|channel|>final";
+            rendered += "<|message|>" + message.content + "<|end|>";
+        }
+        // Official pinned template leaves the generation header open. The
+        // response parser consumes the channel/header before emitting content.
+        return rendered + "<|start|>assistant";
+    }
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string rendered;
         rendered.reserve(messages.size() * 64 + 48);

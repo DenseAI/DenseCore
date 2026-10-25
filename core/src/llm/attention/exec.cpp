@@ -1,4 +1,5 @@
 #include "llm/attention/exec.h"
+#include <stdexcept>
 #include "llm/attention/graph_ops.h"
 
 #include "ggml.h"
@@ -191,6 +192,15 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     ud->sliding_window = fast_attn_sliding_window;
     ud->attention_scale = paged_attn_scale;
     ud->logit_softcap = fast_attn_logit_softcap;
+    ud->attention_sinks = nullptr;
+    if (model->arch == ModelArch::GPT_OSS) {
+        auto* sinks = model->layers.at(static_cast<size_t>(il)).Get("attn_sinks.weight");
+        if (!sinks || sinks->type != GGML_TYPE_F32 || sinks->ne[0] != n_head || !sinks->data) {
+            throw std::invalid_argument("gpt-oss attention: invalid learned sinks");
+        }
+        ud->attention_sinks = static_cast<const float*>(sinks->data);
+    }
+
     ud->epoch_started.store(0, std::memory_order_relaxed);
     ud->epoch_done.store(0, std::memory_order_relaxed);
     ud->kv_writers_done.store(0, std::memory_order_relaxed);
@@ -344,6 +354,13 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
     }
 
     KQ = ggml_soft_max(ctx_c, KQ);
+    if (model->arch == ModelArch::GPT_OSS) {
+        auto* sinks = model->layers.at(static_cast<size_t>(il)).Get("attn_sinks.weight");
+        if (!sinks || sinks->ne[0] != n_head || sinks->type != GGML_TYPE_F32) {
+            throw std::invalid_argument("gpt-oss attention: missing/invalid per-head sink");
+        }
+        ggml_soft_max_add_sinks(KQ, sinks);
+    }
     struct ggml_tensor* V_t = ggml_permute(ctx_c, V_att, 1, 0, 2, 3);
     V_t = ggml_cont(ctx_c, V_t);
     V_t = RepeatGroupedKvHeads(ctx_c, V_t, n_head);

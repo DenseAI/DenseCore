@@ -2543,6 +2543,18 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_u32("context_length", model->hparams.n_ctx);
     get_u32("feed_forward_length", model->hparams.n_ff);
     get_u32("ffn_intermediate_size", model->hparams.n_ff);
+    if (model->arch == ModelArch::GPT_OSS) {
+        uint32_t window = 0, pattern = 2;
+        get_u32("attention.sliding_window", window);
+        get_u32("attention.sliding_window_pattern", pattern);
+        if (window == 0 || window > INT32_MAX || pattern < 2 || pattern > INT32_MAX) {
+            return fail_load("gpt-oss requires a positive sliding window and sliding/full attention pattern >= 2");
+        }
+        model->gpt_oss_sliding_window = static_cast<int>(window);
+        model->gpt_oss_sliding_pattern = static_cast<int>(pattern);
+        get_u32("expert_feed_forward_length", model->hparams.n_ff);
+    }
+
 
     uint32_t nextn_layers = 0;
     if (model->arch == ModelArch::QWEN35) {
@@ -2684,6 +2696,26 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
     get_f32("rope.freq_base", model->hparams.rope_freq_base);
     get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
+    if (model->arch == ModelArch::GPT_OSS) {
+        const std::string scaling = get_exact_string("gpt-oss.rope.scaling.type");
+        if (!scaling.empty() && scaling != "yarn" && scaling != "none") {
+            return fail_load("gpt-oss unsupported RoPE scaling: " + scaling);
+        }
+        if (scaling == "yarn") {
+            float factor = 0.0f;
+            get_f32("rope.scaling.factor", factor);
+            get_u32("rope.scaling.original_context_length", model->gpt_oss_rope_original_context);
+            get_f32("rope.scaling.yarn_beta_fast", model->gpt_oss_yarn_beta_fast);
+            get_f32("rope.scaling.yarn_beta_slow", model->gpt_oss_yarn_beta_slow);
+            if (!std::isfinite(factor) || factor < 1.0f || model->gpt_oss_rope_original_context == 0 ||
+                model->gpt_oss_yarn_beta_slow <= 0.0f || model->gpt_oss_yarn_beta_fast <= 0.0f) {
+                return fail_load("gpt-oss invalid YaRN scaling configuration");
+            }
+            model->hparams.rope_freq_scale = 1.0f / factor;
+            model->gpt_oss_yarn_ext_factor = 1.0f;
+        }
+    }
+
     get_i32_arr4("rope.dimension_sections", model->hparams.rope_sections);
     get_bool("rope.mrope_interleaved", model->hparams.rope_mrope_interleaved);
     get_bool("rope.scaling.mrope_interleaved", model->hparams.rope_mrope_interleaved);
@@ -3306,7 +3338,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
 
     // Check if model actually wants BOS added
     int idx_add_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.add_bos_token");
-    bool add_bos = (idx_bos != -1);
+    bool add_bos = model->arch != ModelArch::GPT_OSS && (idx_bos != -1);
     if (idx_add_bos != -1) {
         add_bos = gguf_get_val_bool(ctx_gguf, idx_add_bos);
     }
@@ -3580,6 +3612,18 @@ TransformerModel* LoadGGUFModel(const char* path) {
             auto it = model->token_to_id.find(tok);
             if (it != model->token_to_id.end()) {
                 add_stop_id(it->second);
+            }
+        }
+
+        if (model->arch == ModelArch::GPT_OSS) {
+            for (const char* token : {"<|return|>", "<|call|>"}) {
+                const auto found = model->token_to_id.find(token);
+                if (found != model->token_to_id.end()) add_stop_id(found->second);
+            }
+            const auto message_end = model->token_to_id.find("<|end|>");
+            if (message_end != model->token_to_id.end()) {
+                model->stop_token_ids.erase(std::remove(model->stop_token_ids.begin(), model->stop_token_ids.end(),
+                                                        message_end->second), model->stop_token_ids.end());
             }
         }
 
@@ -3964,7 +4008,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
                                                       "attention_norm.weight", "self_attn_layernorm.weight"}));
         model->layers[i].Set(model_keys::kFfnNorm,
                              get_layer_tensor_any(i, {"ffn_norm.weight", "pre_feedforward_layernorm.weight",
-                                                      "post_attention_layernorm.weight", "post_attention_norm.weight",
+                                                      "post_attention_layernorm.weight", "post_attention_norm.weight", "attn_post_norm.weight",
                                                       "mlp_layernorm.weight"}));
         model->layers[i].Set(model_keys::kPostAttnNorm, get_layer_tensor_any(i, {"post_attention_norm.weight",
                                                                                  "post_attention_layernorm.weight"}));
@@ -5016,6 +5060,40 @@ TransformerModel* LoadGGUFModel(const char* path) {
     // the model will produce incorrect outputs. Fail fast instead of silently
     // corrupting results.
     // =========================================================================
+    if (model->arch == ModelArch::GPT_OSS) {
+        if (model->hparams.n_experts == 0 || model->hparams.n_experts_used == 0 ||
+            model->hparams.n_experts_used > model->hparams.n_experts) {
+            return fail_load("gpt-oss has invalid expert count/top-k");
+        }
+        const int64_t embedding = model->hparams.n_embd;
+        const int64_t intermediate = model->hparams.n_ff;
+        const int64_t experts = model->hparams.n_experts;
+        auto shape = [](const ggml_tensor* t, ggml_type type, int64_t a, int64_t b = 1, int64_t c = 1) {
+            return t && t->type == type && t->ne[0] == a && t->ne[1] == b && t->ne[2] == c && t->ne[3] == 1;
+        };
+        for (const auto& layer : model->layers) {
+            if (!shape(layer.Get(model_keys::kAttnOBias), GGML_TYPE_F32, embedding) ||
+                !shape(layer.Get("attn_sinks.weight"), GGML_TYPE_F32, model->hparams.n_head) ||
+                !shape(layer.Get("ffn_gate_inp.bias"), GGML_TYPE_F32, experts) ||
+                !shape(layer.Get(model_keys::kMoeGate), GGML_TYPE_F32, embedding, experts)) {
+                return fail_load("gpt-oss invalid/missing projection bias, router, or attention sink");
+            }
+            for (const char* name : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+                const bool down = std::strcmp(name, "ffn_down_exps.weight") == 0;
+                if (!shape(layer.Get(name), GGML_TYPE_MXFP4, down ? intermediate : embedding,
+                           down ? embedding : intermediate, experts) || embedding % 32 || intermediate % 32) {
+                    return fail_load(std::string("gpt-oss requires native MXFP4 stacked expert shape: ") + name);
+                }
+            }
+            for (const char* name : {"ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"}) {
+                const bool down = std::strcmp(name, "ffn_down_exps.bias") == 0;
+                if (!shape(layer.Get(name), GGML_TYPE_F32, down ? embedding : intermediate, experts)) {
+                    return fail_load(std::string("gpt-oss requires F32 expert bias shape: ") + name);
+                }
+            }
+        }
+    }
+
     if (model->arch == ModelArch::QWEN3 || model->arch == ModelArch::QWEN35) {
         bool has_qk_norms = true;
         for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {

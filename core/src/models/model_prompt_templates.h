@@ -14,6 +14,7 @@ enum class PromptTemplateKind {
     CHATML,
     ROLE_TAGS,
     TURN_TAGS,
+    HARMONY,
 };
 
 struct PromptTemplateProfile {

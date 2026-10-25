@@ -353,6 +353,7 @@ bool IsByteLevelBpeTokenizer(const TransformerModel* model) {
 
     switch (densecore::models::ResolveTokenizerFamily(model)) {
     case densecore::models::TokenizerFamily::GEMMA_SENTENCEPIECE: return false;
+    case densecore::models::TokenizerFamily::O200K_BYTE_BPE:
     case densecore::models::TokenizerFamily::GPT2_BYTE_BPE:
     case densecore::models::TokenizerFamily::QWEN_BYTE_BPE:
     case densecore::models::TokenizerFamily::QWEN35_UNICODE_BPE:
@@ -1005,7 +1006,92 @@ void AppendBertBpeTokens(const TransformerModel* model, const std::string& span,
     }
 }
 
+#include "models/o200k_categories.inl"
+
+uint8_t O200kCategory(uint32_t cp) {
+    const auto* end = std::end(kO200kCategories);
+    const auto* range = std::lower_bound(std::begin(kO200kCategories), end, cp,
+        [](const auto& item, uint32_t value) { return item.last < value; });
+    return range != end && range->first <= cp ? range->mask : 0;
+}
+
+std::vector<std::string> PretokenizeO200k(const std::string& text) {
+    const auto cps = DecodeUtf8Codepoints(text);
+    const size_t count = cps.size();
+    auto category = [&](size_t i) { return i < count ? O200kCategory(cps[i].cp) : uint8_t{0}; };
+    auto whitespace = [&](size_t i) { return i < count && IsUnicodeWhitespace(cps[i].cp); };
+    auto newline = [&](size_t i) { return i < count && (cps[i].cp == '\r' || cps[i].cp == '\n'); };
+    auto contraction = [&](size_t i) {
+        if (i >= count || cps[i].cp != '\'') return i;
+        for (const char* suffix : {"s", "t", "re", "ve", "m", "ll", "d"}) {
+            size_t j = 0;
+            while (suffix[j] && i + 1 + j < count &&
+                   (cps[i + 1 + j].cp == static_cast<uint32_t>(suffix[j]) ||
+                    cps[i + 1 + j].cp == static_cast<uint32_t>(suffix[j] - 'a' + 'A'))) ++j;
+            if (!suffix[j]) return i + 1 + j;
+        }
+        return i;
+    };
+    std::vector<std::string> pieces;
+    size_t pos = 0;
+    while (pos < count) {
+        size_t end = pos;
+        // Ordered alternatives: optional non-letter prefix, upper* lower+,
+        // then upper+ lower*. Backtracking is needed for uncased letters/marks.
+        const bool prefix = !newline(pos) && !(category(pos) & (4 | 8));
+        for (int branch = 0; branch < 2 && end == pos; ++branch) {
+            for (int prefixed = prefix ? 1 : 0; prefixed >= 0 && end == pos; --prefixed) {
+                const size_t begin = pos + static_cast<size_t>(prefixed);
+                size_t upper_end = begin;
+                while (upper_end < count && (category(upper_end) & 1)) ++upper_end;
+                if (branch == 0) {
+                    size_t lower_begin = upper_end;
+                    while (true) {
+                        size_t lower_end = lower_begin;
+                        while (lower_end < count && (category(lower_end) & 2)) ++lower_end;
+                        if (lower_end > lower_begin) { end = contraction(lower_end); break; }
+                        if (lower_begin == begin) break;
+                        --lower_begin;
+                    }
+                } else if (upper_end > begin) {
+                    end = upper_end;
+                    while (end < count && (category(end) & 2)) ++end;
+                    end = contraction(end);
+                }
+            }
+        }
+        if (end == pos && (category(pos) & 8)) {
+            end = pos;
+            while (end < count && (category(end) & 8) && end - pos < 3) ++end;
+        }
+        if (end == pos) {
+            size_t begin = pos + (cps[pos].cp == ' ' ? 1 : 0);
+            size_t punct_end = begin;
+            while (punct_end < count && !whitespace(punct_end) && !(category(punct_end) & (4 | 8))) ++punct_end;
+            if (punct_end > begin) {
+                end = punct_end;
+                while (end < count && (newline(end) || cps[end].cp == '/')) ++end;
+            }
+        }
+        if (end == pos && whitespace(pos)) {
+            size_t ws_end = pos;
+            size_t last_newline = pos;
+            while (whitespace(ws_end)) { if (newline(ws_end)) last_newline = ws_end + 1; ++ws_end; }
+            if (last_newline > pos) end = last_newline;
+            else if (ws_end == count || ws_end - pos == 1) end = ws_end;
+            else end = ws_end - 1;
+        }
+        if (end == pos) ++end;
+        pieces.push_back(SliceCodepointSpan(text, cps, pos, end));
+        pos = end;
+    }
+    return pieces;
+}
+
 std::vector<std::string> PretokenizeForByteBpe(const TransformerModel* model, const std::string& text) {
+    if (densecore::models::ResolveTokenizerFamily(model) == densecore::models::TokenizerFamily::O200K_BYTE_BPE) {
+        return PretokenizeO200k(text);
+    }
     if (UseGemmaPretokenizer(model)) {
         // Hugging Face GemmaTokenizer normalizes spaces to U+2581 before BPE
         // and relies on byte fallback inside the BPE model. Over-splitting the
@@ -1501,6 +1587,12 @@ std::string Tokenizer::Detokenize(const TransformerModel* model, int token_id) {
 std::string Tokenizer::DetokenizeStructured(const TransformerModel* model, int token_id) {
     if (!model || token_id < 0 || token_id >= static_cast<int>(model->vocab_tokens.size())) {
         return "";
+    }
+    if (model->arch == ModelArch::GPT_OSS) {
+        const auto& literal = model->vocab_tokens[static_cast<size_t>(token_id)];
+        for (const char* boundary : {"<|start|>", "<|end|>", "<|channel|>", "<|message|>", "<|return|>", "<|call|>"}) {
+            if (literal == boundary) return literal;
+        }
     }
     static const char* kStructuredBoundaries[] = {
         "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",

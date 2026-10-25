@@ -13,6 +13,7 @@ namespace densecore::models {
 enum class DecoderActivation : uint8_t {
     Silu = 0,
     GeluPytorchTanh,
+    SwiGluOai,
 };
 
 enum class DecoderMoERouter : uint8_t {
@@ -20,6 +21,7 @@ enum class DecoderMoERouter : uint8_t {
     SoftmaxTopK,
     Gemma4SoftmaxTopK,
     GroupedSigmoidTopK,
+    SelectedLogitsSoftmax,
 };
 
 enum class DecoderRopeKind : uint8_t {
@@ -60,6 +62,8 @@ enum class DecoderSemanticOpKind : uint8_t {
     DenseFfn,
     FfnPostNorm,
     ResidualAdd,
+    AttentionSink,
+    BiasedExpertProjection,
 };
 
 enum class DecoderSpecializationKind : uint8_t {

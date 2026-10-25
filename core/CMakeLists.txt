@@ -1347,6 +1347,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_lfm2_model_loader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_chat_template.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_descriptor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gpt_oss.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decoder_model_spec.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_tokenizer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_model_loader.cpp

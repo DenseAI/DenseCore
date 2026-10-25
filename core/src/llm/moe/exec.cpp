@@ -1,4 +1,5 @@
 #include "llm/moe/exec.h"
+#include "densecore/models/gpt_oss_math.h"
 #include "backend/cpu_moe_execution.h"
 #include "densecore/backend/cpu_backend.h"
 #include "densecore/exceptions.h"
@@ -985,6 +986,68 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
         const int call_id = moe_out_count.fetch_add(1);
         if (call_id < 8) {
             DebugLogTensorFiniteStats("MOE_OUT", dst);
+        }
+    }
+}
+
+// GPT-OSS expert execution deliberately bypasses the generic SiLU and expert
+// dequantization routes. Quantized weights remain in the mapped GGUF.
+void cb_gpt_oss_moe(ggml_tensor* dst, const ggml_tensor* input, const ggml_tensor* logits,
+                    int ith, int nth, void* userdata) {
+    const auto* state = static_cast<const MoEUserData*>(userdata);
+    if (!state || !state->layer || !state->model || !input || !logits || !dst ||
+        input->type != GGML_TYPE_F32 || logits->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        throw std::invalid_argument("gpt-oss MoE: invalid callback state");
+    }
+    const auto& layer = *state->layer;
+    const size_t experts = state->model->hparams.n_experts;
+    if (logits->ne[0] != static_cast<int64_t>(experts) || logits->ne[1] != input->ne[1] ||
+        dst->ne[0] != input->ne[0] || dst->ne[1] != input->ne[1] || input->nb[0] != sizeof(float) ||
+        logits->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        throw std::invalid_argument("gpt-oss MoE: inconsistent callback shapes/strides");
+    }
+    auto* router_bias = layer.Get("ffn_gate_inp.bias");
+    if (!router_bias || router_bias->type != GGML_TYPE_F32 || router_bias->ne[0] != static_cast<int64_t>(experts)) {
+        throw std::invalid_argument("gpt-oss MoE: missing/invalid router bias");
+    }
+    auto matrix = [&](const char* name, size_t expert) {
+        auto* tensor = layer.Get(name);
+        if (!tensor || tensor->type != GGML_TYPE_MXFP4 || !tensor->data ||
+            tensor->ne[2] != static_cast<int64_t>(experts) || tensor->ne[3] != 1 ||
+            tensor->nb[1] != ggml_row_size(GGML_TYPE_MXFP4, tensor->ne[0])) {
+            throw std::invalid_argument(std::string("gpt-oss MoE: invalid packed tensor ") + name);
+        }
+        return densecore::models::gpt_oss::MxFp4Matrix{
+            static_cast<const uint8_t*>(tensor->data) + expert * tensor->nb[2],
+            static_cast<size_t>(ggml_row_size(GGML_TYPE_MXFP4, tensor->ne[0]) * tensor->ne[1]),
+            static_cast<size_t>(tensor->ne[1]), static_cast<size_t>(tensor->ne[0])};
+    };
+    auto bias = [&](const char* name, size_t expert, size_t width) {
+        auto* tensor = layer.Get(name);
+        if (!tensor || tensor->type != GGML_TYPE_F32 || !tensor->data || tensor->ne[0] != static_cast<int64_t>(width) ||
+            tensor->ne[1] != static_cast<int64_t>(experts) || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+            tensor->nb[0] != sizeof(float)) {
+            throw std::invalid_argument(std::string("gpt-oss MoE: invalid expert bias ") + name);
+        }
+        return reinterpret_cast<const float*>(static_cast<const uint8_t*>(tensor->data) + expert * tensor->nb[1]);
+    };
+    for (int64_t token = ith; token < input->ne[1]; token += nth) {
+        const float* in = reinterpret_cast<const float*>(static_cast<const uint8_t*>(input->data) + token * input->nb[1]);
+        const float* scores = reinterpret_cast<const float*>(static_cast<const uint8_t*>(logits->data) + token * logits->nb[1]);
+        float* out = reinterpret_cast<float*>(static_cast<uint8_t*>(dst->data) + token * dst->nb[1]);
+        std::fill_n(out, input->ne[0], 0.0f);
+        const auto routes = densecore::models::gpt_oss::Route(scores, static_cast<const float*>(router_bias->data),
+                                                             experts, static_cast<size_t>(state->k));
+        for (const auto& route : routes) {
+            const auto gate = matrix("ffn_gate_exps.weight", route.expert);
+            const auto up = matrix("ffn_up_exps.weight", route.expert);
+            const auto down = matrix("ffn_down_exps.weight", route.expert);
+            const densecore::models::gpt_oss::Expert expert{
+                gate, up, down, bias("ffn_gate_exps.bias", route.expert, gate.rows),
+                bias("ffn_up_exps.bias", route.expert, up.rows),
+                bias("ffn_down_exps.bias", route.expert, down.rows)};
+            const auto result = densecore::models::gpt_oss::ForwardExpert(expert, in);
+            for (size_t i = 0; i < result.size(); ++i) out[i] += route.weight * result[i];
         }
     }
 }

@@ -19,6 +19,7 @@ enum class TokenizerFamily : uint8_t {
     GLM_BYTE_BPE,
     BERT_WORDPIECE,
     BERT_BPE,
+    O200K_BYTE_BPE,
 };
 
 enum class PromptTemplateFamily : uint8_t {
@@ -26,6 +27,7 @@ enum class PromptTemplateFamily : uint8_t {
     CHATML,
     ROLE_TAGS,
     TURN_TAGS,
+    HARMONY,
 };
 
 struct ModelDescriptor {

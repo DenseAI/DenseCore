@@ -33,6 +33,7 @@ struct PagedAttentionUserData {
     std::atomic<int> shared_block_ptrs_ready{0};
     std::vector<const void*>* shared_k_block_ptrs = nullptr;
     std::vector<const void*>* shared_v_block_ptrs = nullptr;
+    const float* attention_sinks = nullptr;  // learned per-query-head denominator-only logits
 };
 
 struct PagedAttentionCallbackThreadSelection {

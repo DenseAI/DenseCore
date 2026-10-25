@@ -38,6 +38,7 @@ DecoderMoERouter ResolveMoERouter(const TransformerModel* model, const Transform
     if (!layer_uses_moe) {
         return DecoderMoERouter::None;
     }
+    if (model && model->arch == ModelArch::GPT_OSS) return DecoderMoERouter::SelectedLogitsSoftmax;
     if (is_gemma4_moe) {
         return DecoderMoERouter::Gemma4SoftmaxTopK;
     }
@@ -54,6 +55,7 @@ DecoderMoERouter ResolveMoERouter(const TransformerModel* model, const Transform
 }
 
 DecoderRopeKind ResolveRopeKind(const TransformerModel* model, int layer_idx) {
+    if (model && model->arch == ModelArch::GPT_OSS) return DecoderRopeKind::Neox;
     if (!model || !model->arch_flags.is_gemma4) {
         return DecoderRopeKind::Standard;
     }
@@ -228,7 +230,9 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
 
         auto& attn = layer_spec.attention;
         attn.has_hybrid_ssm_mixer = IsHybridSSMLayer(model, layer_idx);
-        attn.is_sliding_window = IsGemma4SlidingLayer(model, layer_idx);
+        attn.is_sliding_window = model->arch == ModelArch::GPT_OSS
+            ? (model->gpt_oss_sliding_pattern >= 2 && (layer_idx + 1) % model->gpt_oss_sliding_pattern != 0)
+            : IsGemma4SlidingLayer(model, layer_idx);
         attn.kv_source_layer = Gemma4KVSourceLayer(model, layer_idx);
         attn.reads_shared_kv =
             model->arch_flags.is_gemma4 && attn.kv_source_layer >= 0 && attn.kv_source_layer != layer_idx;
@@ -241,7 +245,8 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
         attn.requires_k_norm = ShouldApplyKNorm(model, layer.Get(model_keys::kAttnKNorm), attn.reads_shared_kv);
         attn.requires_v_norm = ShouldApplyVNorm(model, layer.Get(model_keys::kAttnVWeight), attn.reads_shared_kv);
         attn.kv_head_count = ResolveLayerKVHeadCount(model, layer_idx);
-        attn.sliding_window = attn.is_sliding_window ? model->gemma4_sliding_window : -1;
+        attn.sliding_window = attn.is_sliding_window
+            ? (model->arch == ModelArch::GPT_OSS ? model->gpt_oss_sliding_window - 1 : model->gemma4_sliding_window) : -1;
         attn.attention_scale = model->hparams.f_attention_scale;
         attn.logit_softcap = model->arch_flags.is_gemma4 ? model->gemma4_attention_logit_softcapping : 0.0f;
         attn.rope_kind = ResolveRopeKind(model, layer_idx);
@@ -253,7 +258,8 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
         ffn.is_moe = layer.is_moe || is_gemma4_moe;
         ffn.num_experts = static_cast<int>(layer.NumExperts());
         ffn.top_k = static_cast<int>(model->hparams.n_experts_used);
-        ffn.activation = model->arch_flags.is_gemma4 ? DecoderActivation::GeluPytorchTanh : DecoderActivation::Silu;
+        ffn.activation = model->arch == ModelArch::GPT_OSS ? DecoderActivation::SwiGluOai
+            : (model->arch_flags.is_gemma4 ? DecoderActivation::GeluPytorchTanh : DecoderActivation::Silu);
         ffn.router = ResolveMoERouter(model, layer, is_gemma4_moe);
         ffn.has_shared_dense_branch = LayerHasSharedDenseBranch(model, layer, is_gemma4_moe);
         ffn.has_pre_moe_norm = layer.Get(kGemma4PreMoeNormKey) != nullptr;
@@ -267,6 +273,10 @@ DecoderModelSpec BuildDecoderModelSpec(const TransformerModel* model) {
             }
         }
         AppendLayerSemanticOps(&layer_spec);
+        if (model->arch == ModelArch::GPT_OSS) {
+            layer_spec.semantic_ops.push_back({DecoderSemanticOpKind::AttentionSink, layer_idx});
+            layer_spec.semantic_ops.push_back({DecoderSemanticOpKind::BiasedExpertProjection, layer_idx});
+        }
 
         spec.layers.push_back(layer_spec);
     }
@@ -339,6 +349,7 @@ bool ShouldUsePrefillLastLogitsOnly(const DecoderModelSpec* spec, int num_seqs, 
 
 const char* DecoderActivationName(DecoderActivation activation) {
     switch (activation) {
+    case DecoderActivation::SwiGluOai: return "swiglu_oai";
     case DecoderActivation::Silu: return "silu";
     case DecoderActivation::GeluPytorchTanh: return "gelu_pytorch_tanh";
     }
@@ -347,6 +358,7 @@ const char* DecoderActivationName(DecoderActivation activation) {
 
 const char* DecoderMoERouterName(DecoderMoERouter router) {
     switch (router) {
+    case DecoderMoERouter::SelectedLogitsSoftmax: return "selected_logits_softmax";
     case DecoderMoERouter::None: return "none";
     case DecoderMoERouter::SoftmaxTopK: return "softmax_top_k";
     case DecoderMoERouter::Gemma4SoftmaxTopK: return "gemma4_softmax_top_k";
@@ -389,6 +401,8 @@ const char* DecoderRuntimeTopologyName(DecoderRuntimeTopology topology) {
 
 const char* DecoderSemanticOpKindName(DecoderSemanticOpKind kind) {
     switch (kind) {
+    case DecoderSemanticOpKind::AttentionSink: return "attention_sink";
+    case DecoderSemanticOpKind::BiasedExpertProjection: return "biased_expert_projection";
     case DecoderSemanticOpKind::AttentionNorm: return "attention_norm";
     case DecoderSemanticOpKind::AttentionProjection: return "attention_projection";
     case DecoderSemanticOpKind::HybridSSMMixer: return "hybrid_ssm_mixer";

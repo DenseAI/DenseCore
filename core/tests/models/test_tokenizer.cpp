@@ -349,3 +349,34 @@ TEST(TokenizerTest, BertBpeHandlesXlmRobertaStyleMetaspaceVocab) {
                                        86039, 53498, 6620, 23, 96305, 3196, 1636, 5, 2};
     EXPECT_EQ(tokens, expected);
 }
+
+namespace {
+#include "fixtures/gpt_oss_tokenizer.inl"
+
+TEST(TokenizerTest, GptOssO200kMatchesPinnedVocabularyAndIndependentTokenIds) {
+    TransformerModel model{};
+    model.arch = ModelArch::GPT_OSS;
+    model.variant = ModelVariant::GPT_OSS;
+    model.tokenizer_type = "gpt-4o";
+    model.vocab_tokens.resize(200013);
+    for (const auto& [token, id] : kGptOssFixtureVocab) {
+        model.token_to_id[token] = id;
+        model.vocab_tokens[id] = token;
+    }
+    for (const auto& [pair, rank] : kGptOssFixtureMerges) model.bpe_merge_ranks[pair] = rank;
+    for (const auto& [text, expected] : kGptOssTokenizerCases) {
+        EXPECT_EQ(Tokenizer::Tokenize(&model, text, false, false), expected) << text;
+    }
+}
+
+TEST(TokenizerTest, GptOssStructuredOutputPreservesHarmonyProtocolBoundaries) {
+    TransformerModel model{};
+    model.arch = ModelArch::GPT_OSS;
+    model.vocab_tokens = {"<|start|>", "<|end|>", "<|channel|>", "<|message|>", "<|return|>", "<|call|>"};
+    model.token_types.assign(model.vocab_tokens.size(), 3);
+    for (size_t i = 0; i < model.vocab_tokens.size(); ++i) {
+        EXPECT_EQ(Tokenizer::DetokenizeStructured(&model, static_cast<int>(i)), model.vocab_tokens[i]);
+        EXPECT_EQ(Tokenizer::Detokenize(&model, static_cast<int>(i)), "");
+    }
+}
+}

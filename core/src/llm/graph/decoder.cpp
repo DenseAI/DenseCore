@@ -9,6 +9,7 @@
 #include "ggml-cpu.h"                                    // For ggml_get_type_traits_cpu (vec_dot)
 #include "ggml.h"                                        // Required for ggml_tensor definition
 #include "models/model_inference_policy.h"
+#include "llm/moe/exec.h"
 #include "runtime/batched_activation_pack_cache.h"
 #include "runtime/inference_types_internal.h"  // Shared internal types
 #include "runtime/qwen36_gateup_rowpair.h"
@@ -1423,7 +1424,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             }
 
             if (!skip_rope) {
-                const bool qwen3_neox_rope = model->arch == ModelArch::QWEN3;
+                const bool qwen3_neox_rope = model->arch == ModelArch::QWEN3 || model->arch == ModelArch::GPT_OSS;
                 const int rope_mode = (model->arch_flags.is_gemma4 || qwen3_neox_rope) ? GGML_ROPE_TYPE_NEOX
                                                                                    : GGML_ROPE_TYPE_NORMAL;
                 struct ggml_tensor* Q_rope_fast = nullptr;
@@ -1478,10 +1479,16 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     } else {
                         // Fallback to standard GGML RoPE when precomputed path is
                         // unavailable for this tensor/layout.
-                        Qcur = ggml_rope_ext(ctx_c, Qcur, pos, rope_freq_factors, rope_dim, rope_mode, n_ctx,
-                                             rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-                        Kcur = ggml_rope_ext(ctx_c, Kcur, pos, rope_freq_factors, rope_dim, rope_mode, n_ctx,
-                                             rope_freq_base, model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+                        const bool gpt_oss = model->arch == ModelArch::GPT_OSS;
+                        const int rope_context = gpt_oss && model->gpt_oss_rope_original_context > 0
+                            ? static_cast<int>(model->gpt_oss_rope_original_context) : n_ctx;
+                        const float ext = gpt_oss ? model->gpt_oss_yarn_ext_factor : 0.0f;
+                        const float beta_fast = gpt_oss ? model->gpt_oss_yarn_beta_fast : 0.0f;
+                        const float beta_slow = gpt_oss ? model->gpt_oss_yarn_beta_slow : 0.0f;
+                        Qcur = ggml_rope_ext(ctx_c, Qcur, pos, rope_freq_factors, rope_dim, rope_mode, rope_context,
+                                             rope_freq_base, model->hparams.rope_freq_scale, ext, 1.0f, beta_fast, beta_slow);
+                        Kcur = ggml_rope_ext(ctx_c, Kcur, pos, rope_freq_factors, rope_dim, rope_mode, rope_context,
+                                             rope_freq_base, model->hparams.rope_freq_scale, ext, 1.0f, beta_fast, beta_slow);
                     }
                 }
             }
@@ -1601,7 +1608,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     IsFlashAttentionIsaSupported(), true, densecore::OpsRegistry::IsInitialized(),
                     /*force_safe_gqa_decode=*/true, -1, ggml_is_contiguous(Qcur), ggml_is_contiguous(K_all),
                     ggml_is_contiguous(V_all), batch.num_seqs == 1 && !batch.seq_id.empty());
-                const bool use_paged_decode_attention = attention_dispatch.use_paged_decode_attention;
+                const bool use_paged_decode_attention = model->arch == ModelArch::GPT_OSS
+                    ? use_cache : attention_dispatch.use_paged_decode_attention;
                 if (force_batched_decode_path && !base_paged_decode.use_paged_decode_attention) {
                     static bool logged_force_batched_decode = false;
                     if (!logged_force_batched_decode) {
@@ -1851,7 +1859,11 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     }
                 }
 
-                if (use_paged_decode_attention) {
+                if (model->arch == ModelArch::GPT_OSS && !use_paged_decode_attention) {
+                    KQV = ExecuteStandardAttentionPath(ctx_c, model, Qcur, K, V, il, N, n_past_val, n_total_tokens,
+                                                       n_head, n_head_kv, head_dim_q, fast_attn_sliding_window,
+                                                       attn_query_base_pos, use_explicit_attention_scale);
+                } else if (use_paged_decode_attention) {
                     KQV = ExecutePagedDecodeAttentionPath(
                         ctx_c, model, cache, Qcur, Kcur, Vcur, il, kv_cache_layer, gemma4_shared_kv_layer,
                         gemma4_shared_kv_source_layer, head_dim_q, head_dim_v, n_head, n_head_kv, n_total_tokens,
@@ -2315,7 +2327,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             if (!native_moe_backend) {
                 native_moe_backend = &densecore::llm::runtime::ResolveCpuBackend(GetCurrentBatch());
             }
-            if (native_moe_backend) {
+            if (native_moe_backend && model->arch != ModelArch::GPT_OSS) {
                 const densecore::CpuBackend::ExpertWeights* registered_experts = nullptr;
                 int registered_count = 0;
                 if (!native_moe_backend->GetRegisteredExpertsView(&model->layers[il], &registered_experts,
@@ -2328,7 +2340,19 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 }
                 EnsureMoERebalanceThread(native_moe_backend);
             }
-            struct ggml_tensor* native_moe = TryBuildGemma4NativeMoEGraph(
+            struct ggml_tensor* native_moe = nullptr;
+            if (model->arch == ModelArch::GPT_OSS) {
+                MoEUserData* state = AllocateMoEUserData(ctx_c);
+                if (!state) throw std::runtime_error("gpt-oss MoE: userdata allocation failed");
+                state->model = model;
+                state->layer = &model->layers[il];
+                state->layer_idx = il;
+                state->k = moe_top_k;
+                native_moe = ggml_map_custom2(ctx_c, routed_input, gate_logits, cb_gpt_oss_moe,
+                                               std::max(1, std::min(N, ResolveTaskCount(&batch, N))), state);
+                ggml_set_name(native_moe, "gpt_oss_native_mxfp4_moe");
+            }
+            if (!native_moe) native_moe = TryBuildGemma4NativeMoEGraph(
                 ctx_c, gf, model, &model->layers[il], il, routed_input, gate_logits, moe_top_k, native_moe_backend);
             if (!native_moe) {
                 native_moe = TryBuildQwen35NativeMoEGraph(ctx_c, gf, model, &model->layers[il], il, routed_input,

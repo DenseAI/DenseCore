@@ -19,6 +19,8 @@ std::string AsciiLower(std::string_view input) {
 constexpr ModelDescriptor kUnknownDescriptor = {};
 
 constexpr ModelDescriptor kDescriptors[] = {
+    {ModelVariant::GPT_OSS, ModelArch::GPT_OSS, "gpt-oss", TokenizerFamily::O200K_BYTE_BPE,
+     PromptTemplateFamily::HARMONY, true, false, false, {}},
     {ModelVariant::LLAMA,
      ModelArch::LLAMA,
      "llama",
@@ -222,6 +224,7 @@ ModelVariant InferVariantFromModel(const TransformerModel* model) {
         return model->variant;
     }
     switch (model->arch) {
+    case ModelArch::GPT_OSS: return ModelVariant::GPT_OSS;
     case ModelArch::LLAMA: return ModelVariant::LLAMA;
     case ModelArch::QWEN2: return ModelVariant::QWEN2;
     case ModelArch::QWEN3: return ModelVariant::QWEN3;
@@ -263,6 +266,9 @@ ResolvedModelDescriptor ResolveModelDescriptorFromArchName(std::string_view arch
                                        true};
     };
 
+    if (lowered == "gpt-oss") {
+        return make_result(DescribeModelVariant(ModelVariant::GPT_OSS));
+    }
     if (MatchesAny(lowered, std::array<std::string_view, 1>{"llama"})) {
         return make_result(DescribeModelVariant(ModelVariant::LLAMA));
     }
@@ -376,6 +382,9 @@ TokenizerFamily ResolveTokenizerFamilyFromMetadata(std::string_view tokenizer_ty
     if (lowered.empty()) {
         return TokenizerFamily::UNKNOWN;
     }
+    if (lowered == "o200k_base" || lowered == "gpt-4o" || lowered == "gpt-oss") {
+        return TokenizerFamily::O200K_BYTE_BPE;
+    }
     if (lowered.find("qwen38") != std::string::npos || lowered.find("qwen3.8") != std::string::npos ||
         lowered.find("qwen36") != std::string::npos || lowered.find("qwen3.6") != std::string::npos) {
         return TokenizerFamily::QWEN35_UNICODE_BPE;
@@ -418,6 +427,10 @@ PromptTemplateFamily ResolvePromptTemplateFamilyFromMetadata(std::string_view to
     const std::string tokenizer_lower = AsciiLower(tokenizer_type);
     const std::string template_lower = AsciiLower(chat_template);
 
+    if (tokenizer_lower == "o200k_base" || tokenizer_lower == "gpt-4o" || tokenizer_lower == "gpt-oss" ||
+        template_lower.find("<|start|>") != std::string::npos) {
+        return PromptTemplateFamily::HARMONY;
+    }
     if (template_lower.find("<|im_start|>") != std::string::npos ||
         template_lower.find("<|im_end|>") != std::string::npos) {
         return PromptTemplateFamily::CHATML;
@@ -484,7 +497,8 @@ PromptTemplateFamily ResolvePromptTemplateFamily(const TransformerModel* model) 
 
 bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
     const std::string lowered = AsciiLower(tokenizer_name);
-    static constexpr std::array<std::string_view, 28> kKnown = {
+    static constexpr std::array<std::string_view, 31> kKnown = {
+        "o200k_base", "gpt-4o", "gpt-oss",
         "llama",
         "gpt2",
         "qwen2",
@@ -519,6 +533,7 @@ bool IsKnownTokenizerModel(std::string_view tokenizer_name) {
 
 const char* ModelVariantName(ModelVariant variant) {
     switch (variant) {
+    case ModelVariant::GPT_OSS: return "gpt-oss";
     case ModelVariant::LLAMA: return "llama";
     case ModelVariant::QWEN2: return "qwen2";
     case ModelVariant::QWEN3: return "qwen3";
@@ -548,6 +563,7 @@ const char* ModelVariantName(ModelVariant variant) {
 const char* TokenizerFamilyName(TokenizerFamily family) {
     switch (family) {
     case TokenizerFamily::LLAMA_SENTENCEPIECE: return "llama_sentencepiece";
+    case TokenizerFamily::O200K_BYTE_BPE: return "o200k_byte_bpe";
     case TokenizerFamily::GPT2_BYTE_BPE: return "gpt2_byte_bpe";
     case TokenizerFamily::QWEN_BYTE_BPE: return "qwen_byte_bpe";
     case TokenizerFamily::QWEN35_UNICODE_BPE: return "qwen35_unicode_bpe";
@@ -567,6 +583,7 @@ const char* PromptTemplateFamilyName(PromptTemplateFamily family) {
     case PromptTemplateFamily::CHATML: return "chatml";
     case PromptTemplateFamily::ROLE_TAGS: return "role_tags";
     case PromptTemplateFamily::TURN_TAGS: return "turn_tags";
+    case PromptTemplateFamily::HARMONY: return "harmony";
     default: return "plain";
     }
 }

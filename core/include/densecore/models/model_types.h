@@ -59,6 +59,7 @@ enum class ModelArch : uint8_t {
     // Multimodal Architectures
     LLAVA,    // LLaVA (LLM + Vision)
     QWEN_VL,  // Qwen-VL (LLM + Vision)
+    GPT_OSS,  // OpenAI MoE (gpt-oss); appended to preserve existing values
 };
 
 enum class ModelVariant : uint8_t {
@@ -84,6 +85,7 @@ enum class ModelVariant : uint8_t {
     WHISPER,
     LLAVA,
     QWEN_VL,
+    GPT_OSS,
 };
 
 // Architecture-specific feature flags
@@ -788,6 +790,13 @@ struct TransformerModel {
     // Delete copy operations (cannot copy unique_ptrs)
     TransformerModel(const TransformerModel&) = delete;
     TransformerModel& operator=(const TransformerModel&) = delete;
+
+    int gpt_oss_sliding_window = 0;
+    int gpt_oss_sliding_pattern = 2;
+    uint32_t gpt_oss_rope_original_context = 0;
+    float gpt_oss_yarn_ext_factor = 0.0f;
+    float gpt_oss_yarn_beta_fast = 32.0f;
+    float gpt_oss_yarn_beta_slow = 1.0f;
 
     ~TransformerModel();
 };
