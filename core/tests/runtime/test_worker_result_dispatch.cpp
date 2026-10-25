@@ -413,7 +413,7 @@ TEST(WorkerResultDispatchTest, GemmaAndLfmTargetsRejectTemporaryReferenceGgmlCom
     const auto gemma_plan = densecore::runtime::ResolveTargetFastPathPlan(&gemma);
     ASSERT_TRUE(gemma_plan.target_model);
     EXPECT_TRUE(gemma_plan.gemma4_target);
-    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(gemma_plan), "gemma4_26b_a4b");
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(gemma_plan), "gemma4_dense");
     EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
         gemma_plan, "temporary_reference_generic_matmul_fallback"));
     EXPECT_TRUE(densecore::runtime::ShouldRejectTargetGgmlCompute(
@@ -582,7 +582,7 @@ TEST(KernelResolutionPolicyTest, Gemma4DefaultResolutionIsFallbackFreeTarget) {
     EXPECT_EQ(resolution.fallback_policy, densecore::runtime::DenseCoreFallbackPolicyKind::FallbackFreeTarget);
     EXPECT_TRUE(resolution.matmul_plan.target_fallback_free_path);
     EXPECT_TRUE(resolution.matmul_plan.target.gemma4_target);
-    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(resolution.matmul_plan.target), "gemma4_26b_a4b");
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(resolution.matmul_plan.target), "gemma4_dense");
 }
 
 TEST(KernelResolutionPolicyTest, ContractRequirementOverridesKernelAndFallbackPolicy) {
@@ -1402,4 +1402,17 @@ TEST(WorkerResultDispatchTest, CompletionMetadataPrecedesTerminalForDirectAndQue
             EXPECT_EQ(capture.terminal_calls, 1);
         }
     }
+}
+
+TEST(WorkerResultDispatchTest, GemmaTargetLabelsDistinguishActualVariants) {
+    TransformerModel model{};
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    for (const auto& item : std::vector<std::pair<int, const char*>>{{35, "gemma4_e2b"}, {42, "gemma4_e4b"}, {60, "gemma4_31b"}}) {
+        model.hparams.n_layer = item.first;
+        EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(densecore::runtime::ResolveTargetFastPathPlan(&model)), item.second);
+    }
+    model.hparams.n_layer = 30;
+    model.hparams.n_experts = 128;
+    EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(densecore::runtime::ResolveTargetFastPathPlan(&model)), "gemma4_26b_a4b");
 }

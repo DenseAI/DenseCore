@@ -109,6 +109,7 @@ struct TargetFastPathPlan {
     bool qwen_target = false;
     bool qwen35_0_8b = false;
     bool gemma4_target = false;
+    uint32_t gemma4_layer_count = 0;
     bool lfm2_target = false;
     bool dense_lane = false;
     bool moe_lane = false;
@@ -244,6 +245,7 @@ inline TargetFastPathPlan ResolveTargetFastPathPlan(const TransformerModel* mode
         IsQwenTargetVariant(model->variant) || (model->arch == ModelArch::QWEN35 && model->arch_flags.is_hybrid_ssm);
     plan.qwen35_0_8b = IsQwen35Point8B(model);
     plan.gemma4_target = model->variant == ModelVariant::GEMMA4 || model->arch_flags.is_gemma4;
+    plan.gemma4_layer_count = plan.gemma4_target ? model->hparams.n_layer : 0;
     plan.lfm2_target = model->variant == ModelVariant::LFM2MOE || model->arch_flags.is_lfm2_shortconv;
     plan.target_model = IsDenseCoreFallbackFreeTargetVariant(model->variant) || plan.qwen_target ||
                         plan.gemma4_target || plan.lfm2_target;
@@ -289,7 +291,11 @@ inline const char* TargetFastPathLabel(const TargetFastPathPlan& plan) {
         return QwenHotPathTargetLabel(qwen);
     }
     if (plan.gemma4_target) {
-        return "gemma4_26b_a4b";
+        if (plan.gemma4_layer_count == 35 && plan.dense_lane) return "gemma4_e2b";
+        if (plan.gemma4_layer_count == 42 && plan.dense_lane) return "gemma4_e4b";
+        if (plan.gemma4_layer_count == 30 && plan.moe_lane) return "gemma4_26b_a4b";
+        if (plan.gemma4_layer_count == 60 && plan.dense_lane) return "gemma4_31b";
+        return plan.moe_lane ? "gemma4_moe" : "gemma4_dense";
     }
     if (plan.lfm2_target) {
         return "lfm2_8b_a1b";
