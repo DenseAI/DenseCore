@@ -903,6 +903,74 @@ TEST(SchedulerArchitecture, PrefixAdmissionRetainsExactValidatedSnapshotUntilWor
     scheduler.RemoveRequest(seq, false);
 }
 
+TEST(SchedulerArchitecture, CacheResidencyCanBeReclaimedForWaitingPrefill) {
+    BlockManager manager(4, BLOCK_SIZE);
+    const auto cached = manager.Allocate(4);
+    ASSERT_EQ(cached.size(), 4u);
+    for (int id : cached) manager.RegisterPrefixBlock(id, 100 + id);
+    manager.Free(cached);
+    ASSERT_EQ(manager.GetFreeBlockCount(), 0);
+    ASSERT_EQ(manager.GetAllocatableBlockCount(), 4);
+    // A concurrent admission/user reference must survive reclamation.
+    const int pinned = manager.FindCachedBlock(100 + cached.front());
+    ASSERT_EQ(pinned, cached.front());
+    ASSERT_EQ(manager.GetAllocatableBlockCount(), 3);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    const int seq = scheduler.AddRequest(9001, 2 * BLOCK_SIZE, 8);
+    const auto output = scheduler.Schedule();
+    ASSERT_EQ(output.prefill_seq_ids, std::vector<int>{seq});
+    ASSERT_EQ(output.new_block_allocations.size(), 1u);
+    EXPECT_EQ(output.new_block_allocations.front().second.size(), 2u);
+    EXPECT_EQ(manager.GetRefCount(pinned), 1);
+    EXPECT_EQ(manager.blocks[pinned].content_hash, static_cast<uint64_t>(100 + pinned));
+    scheduler.RemoveRequest(seq, false);
+    manager.Free(output.new_block_allocations.front().second);
+    manager.FreeSingle(pinned);
+}
+
+TEST(SchedulerArchitecture, IdleCachedBlocksDoNotPreemptRunningDecode) {
+    BlockManager manager(8, BLOCK_SIZE);
+    const auto cached = manager.Allocate(8);
+    ASSERT_EQ(cached.size(), 8u);
+    for (int id : cached) manager.RegisterPrefixBlock(id, 200 + id);
+    manager.Free(cached);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    const int seq = scheduler.AddRequest(9002, BLOCK_SIZE, 8);
+    const auto prefill = scheduler.Schedule();
+    ASSERT_EQ(prefill.prefill_seq_ids, std::vector<int>{seq});
+    scheduler.UpdateProgress(seq, BLOCK_SIZE);
+    const auto decode = scheduler.Schedule();
+    EXPECT_EQ(decode.decode_seq_ids, std::vector<int>{seq});
+    EXPECT_TRUE(decode.preempted_seq_ids.empty());
+    EXPECT_TRUE(decode.swap_in_seq_ids.empty());
+    // Physical residency diagnostics still include idle cached blocks.
+    EXPECT_FLOAT_EQ(scheduler.GetStats().memory_usage, 1.0f);
+    scheduler.RemoveRequest(seq, false);
+    manager.Free(prefill.new_block_allocations.front().second);
+}
+
+TEST(SchedulerArchitecture, CachePressureNeverReclaimsReferencedPrefixBlocks) {
+    BlockManager manager(4, BLOCK_SIZE);
+    const auto held = manager.Allocate(4);
+    ASSERT_EQ(held.size(), 4u);
+    for (int id : held) manager.RegisterPrefixBlock(id, 300 + id);
+    ASSERT_EQ(manager.GetAllocatableBlockCount(), 0);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    const int seq = scheduler.AddRequest(9003, BLOCK_SIZE, 8);
+    auto output = scheduler.Schedule();
+    EXPECT_TRUE(output.prefill_seq_ids.empty());
+    EXPECT_EQ(output.empty_reason, SchedulerEmptyReason::NoFreeBlocks);
+    for (int id : held) EXPECT_EQ(manager.GetRefCount(id), 1);
+    manager.FreeSingle(held.back());
+    EXPECT_EQ(manager.GetFreeBlockCount(), 0);
+    EXPECT_EQ(manager.GetAllocatableBlockCount(), 1);
+    output = scheduler.Schedule();
+    EXPECT_EQ(output.prefill_seq_ids, std::vector<int>{seq});
+    scheduler.RemoveRequest(seq, false);
+    manager.Free(output.new_block_allocations.front().second);
+    for (size_t i = 0; i + 1 < held.size(); ++i) manager.FreeSingle(held[i]);
+}
+
 TEST(SchedulerArchitecture, CancelWaitingPrefixAdmissionReleasesItsReferences) {
     BlockManager manager(64, BLOCK_SIZE);
     Scheduler scheduler(&manager, MakeTestConfig());

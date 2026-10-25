@@ -147,6 +147,10 @@ struct BlockManager {
     // Get number of free blocks
     int GetFreeBlockCount();
 
+    // Free blocks plus idle prefix residency that Allocate can reclaim.
+    // Referenced/admission-pinned prefix blocks are excluded.
+    int GetAllocatableBlockCount();
+
     // Get number of used blocks
     int GetUsedBlockCount();
 

@@ -379,9 +379,9 @@ void Scheduler::ScheduleWaiting(SchedulerOutput& output, int prefill_token_cap) 
 
         std::vector<int> new_blocks;
         if (blocks_to_allocate > 0) {
-            if (block_manager_->GetFreeBlockCount() < blocks_to_allocate) {
-                LOG_DEBUG("Scheduler: Not enough blocks for seq ", seq_id, " (needed ", blocks_to_allocate, ", free ",
-                          block_manager_->GetFreeBlockCount(), ")");
+            if (block_manager_->GetAllocatableBlockCount() < blocks_to_allocate) {
+                LOG_DEBUG("Scheduler: Not enough reclaimable blocks for seq ", seq_id, " (needed ", blocks_to_allocate,
+                          ", allocatable ", block_manager_->GetAllocatableBlockCount(), ")");
                 if (blocked_reason == SchedulerEmptyReason::None) {
                     blocked_reason = SchedulerEmptyReason::NoFreeBlocks;
                     diagnostic_seq_id = seq_id;
@@ -492,7 +492,7 @@ void Scheduler::ScheduleSwapped(SchedulerOutput& output) {
         }
 
         const int blocks_needed = SequenceBlockTable::BlocksNeeded(total_tokens);
-        if (block_manager_->GetFreeBlockCount() < blocks_needed) {
+        if (block_manager_->GetAllocatableBlockCount() < blocks_needed) {
             continue;
         }
 

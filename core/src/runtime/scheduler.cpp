@@ -182,7 +182,7 @@ SchedulerOutput Scheduler::Schedule() {
     last_unschedulable_reason_ = SchedulerUnschedulableReason::None;
 
     // 1. Check memory pressure
-    float memory_usage = GetMemoryUsage();
+    float memory_usage = GetMemoryPressure();
 
     if (memory_usage > config_.watermark_high) {
         // Need to preempt some sequences
@@ -417,8 +417,16 @@ float Scheduler::GetMemoryUsage() const {
     return (float)used / total;
 }
 
+float Scheduler::GetMemoryPressure() const {
+    if (block_manager_->num_blocks == 0) return 1.0f;
+    // Cached idle blocks occupy physical storage, but can be evicted without
+    // preempting any active sequence. Preserve physical residency in stats.
+    return static_cast<float>(block_manager_->num_blocks - block_manager_->GetAllocatableBlockCount()) /
+           block_manager_->num_blocks;
+}
+
 void Scheduler::PreemptSequences(SchedulerOutput& output) {
-    if (GetMemoryUsage() <= config_.watermark_low || running_seqs_.empty()) {
+    if (GetMemoryPressure() <= config_.watermark_low || running_seqs_.empty()) {
         return;
     }
 

@@ -273,6 +273,25 @@ int BlockManager::GetUsedBlockCount() {
     return num_blocks - GetFreeBlockCount();
 }
 
+int BlockManager::GetAllocatableBlockCount() {
+    // Match allocation's prefix -> shard lock order. Cache residency remains
+    // stable while reading ref counts, and each shard is visited only once.
+    std::lock_guard<std::mutex> prefix_lock(prefix_mu);
+    int count = 0;
+    for (int shard_index = 0; shard_index < NUM_SHARDS; ++shard_index) {
+        auto& shard = *shards[shard_index];
+        std::lock_guard<std::mutex> shard_lock(shard.mu);
+        count += static_cast<int>(shard.free_blocks.size());
+        for (int id = shard_index; id < num_blocks; id += NUM_SHARDS) {
+            const auto& block = blocks[id];
+            if (!block.cache_resident || block.ref_count != 0) continue;
+            const auto entry = prefix_cache.find(block.content_hash);
+            if (entry != prefix_cache.end() && entry->second == id) ++count;
+        }
+    }
+    return count;
+}
+
 int BlockManager::Fork(int block_id) {
     if (block_id < 0 || block_id >= num_blocks) return -1;
 

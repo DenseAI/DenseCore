@@ -301,6 +301,7 @@ public:
 private:
     std::unordered_map<int, std::shared_ptr<PrefixCacheLease>> prefix_leases_;
     float GetMemoryUsage() const;
+    float GetMemoryPressure() const;
 
     void PreemptSequences(SchedulerOutput& output);
 
