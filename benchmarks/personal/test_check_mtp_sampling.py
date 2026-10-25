@@ -142,5 +142,21 @@ class StreamAndProvenanceTest(unittest.TestCase):
             self.assertEqual(decoded['content'], '\ud800')
 
 
+class PromptRequirementConsistencyTest(unittest.TestCase):
+    def test_word_minimum_is_explicit_in_each_sentence_prompt(self):
+        from pathlib import Path
+        cases = json.loads(Path(smoke.__file__).with_name('mtp_sampling_cases.json').read_text())
+        for case in cases:
+            if case.get('min_words'):
+                self.assertIn(f"at least {case['min_words']} words", case['prompt'])
+
+    def test_semantic_success_does_not_claim_strict_instruction_format(self):
+        case = dict(CAPITAL, strict_format_pattern='Paris')
+        self.assertEqual(smoke.validate_final('Paris, France.', case), 'Paris, France.')
+        self.assertFalse(smoke.strict_format('Paris, France.', case)['passed'])
+        self.assertTrue(smoke.strict_format('Paris', case)['passed'])
+        self.assertFalse(smoke.strict_format('42.', {'strict_format_pattern': '42'})['passed'])
+
+
 if __name__ == '__main__':
     unittest.main()

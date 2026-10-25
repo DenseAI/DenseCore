@@ -34,7 +34,10 @@ Min-p is0.0, the current native `SamplingParams` default: public C and HTTP do n
 expose this parameter. The tool does not send an ignored `min_p` field or add a
 seed API. Frequency/presence penalties remain native defaults0.0.
 
-Capital and arithmetic cases require the correct complete final answer.
+Capital and arithmetic cases require the correct complete final answer. Their
+city-only/integer-only formatting is additionally recorded in a separate
+`strict_instruction_format` result. Semantic/protocol PASS does not imply strict
+instruction-format PASS. Sentence prompts explicitly request their word minimum.
 English/French sentence cases require multiple words, final punctuation and valid
 UTF-8. Native length completion, empty/reasoning-only answers, duplicate terminal
 or completion metadata, and missing token accounting fail. HTTP checks positive

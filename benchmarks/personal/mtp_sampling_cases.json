@@ -1,6 +1,28 @@
 [
-  {"id":"capital","prompt":"What is the capital of France? Reply with only the city name.","expected":"\\bParis\\b"},
-  {"id":"arithmetic","prompt":"What is 17 plus 25? Reply with only the integer.","expected":"\\b42\\b"},
-  {"id":"water","prompt":"Write one short complete sentence explaining why clean drinking water matters. End with a period.","expected":"\\bwater\\b","min_words":8,"sentence":true},
-  {"id":"french","prompt":"Write one short complete French sentence about a café. End with a period.","expected":"caf[éèe]","min_words":5,"sentence":true}
+  {
+    "id": "capital",
+    "prompt": "What is the capital of France? Reply with only the city name.",
+    "expected": "\\bParis\\b",
+    "strict_format_pattern": "Paris"
+  },
+  {
+    "id": "arithmetic",
+    "prompt": "What is 17 plus 25? Reply with only the integer.",
+    "expected": "\\b42\\b",
+    "strict_format_pattern": "42"
+  },
+  {
+    "id": "water",
+    "prompt": "Write one short complete sentence explaining why clean drinking water matters. Use at least 8 words. End with a period.",
+    "expected": "\\bwater\\b",
+    "min_words": 8,
+    "sentence": true
+  },
+  {
+    "id": "french",
+    "prompt": "Write one short complete French sentence about a café. Use at least 5 words. End with a period.",
+    "expected": "caf[éèe]",
+    "min_words": 5,
+    "sentence": true
+  }
 ]

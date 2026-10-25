@@ -39,6 +39,14 @@ def validate_final(text, case):
     return final
 
 
+def strict_format(final, case):
+    pattern = case.get('strict_format_pattern')
+    if pattern is None:
+        return None
+    return {'requested_pattern': pattern, 'passed': re.fullmatch(pattern, final, re.I) is not None,
+            'scope': 'Side metric for requested output format; separate from semantic/protocol pass.'}
+
+
 def sampling(args):
     return {'temperature': args.temperature, 'top_p': args.top_p, 'top_k': args.top_k,
             'repetition_penalty': args.repetition_penalty}
@@ -51,6 +59,7 @@ def validate_native(row, case):
     if row.get('completion_events') != 1 or row.get('utf8_errors'):
         raise ValueError('duplicate/missing completion metadata or invalid UTF-8')
     row['final_answer'] = validate_final(''.join(row['pieces']), case)
+    row['strict_format'] = strict_format(row['final_answer'], case)
     row['termination_contract'] = 'native finish1 stop/EOS; IDs include committed stop token when callback exposes it'
 
 
@@ -160,6 +169,7 @@ def http_request(base, case, stream, max_tokens, timeout, probability):
         try:
             row.get('reasoning', '').encode('utf-8', 'strict')
             row['final_answer'] = validate_final(row['content'], case)
+            row['strict_format'] = strict_format(row['final_answer'], case)
             if case.get('stop'):
                 if any(stop in row['content'] for stop in case['stop']):
                     raise ValueError('requested stop text leaked')
@@ -281,6 +291,14 @@ def parent(args, cases):
         manifest['failures'].append('canonical artifact manifest changed')
     if args.server and protocol.digest(args.server) != manifest['server_sha256']:
         manifest['failures'].append('server changed')
+    format_rows = [request['strict_format'] for row in manifest['native'] for request in row.get('requests', [])
+                   if request.get('strict_format') is not None]
+    format_rows += [request['strict_format'] for mode in manifest['http'] for group in mode['groups']
+                    for request in group['requests'] if request.get('strict_format') is not None]
+    manifest['strict_instruction_format'] = {'checked': len(format_rows),
+        'passed': bool(format_rows) and all(row['passed'] for row in format_rows),
+        'failures': sum(not row['passed'] for row in format_rows),
+        'scope': 'Separate side metric; passed below covers semantic/protocol/branch integration only.'}
     manifest.update(passed=not manifest['failures'], http_verified=bool(args.server),
                     population_distribution_equivalence='not tested; see separate formal native fixtures',
                     greedy128_control='not part of this complete-answer stochastic smoke')
