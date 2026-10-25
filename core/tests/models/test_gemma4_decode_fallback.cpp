@@ -1138,7 +1138,12 @@ TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsFor
                 for (int row = 0; row < n; ++row) {
                     char* data = static_cast<char*>(weight->data) + row * weight->nb[1];
                     for (int col = 0; col < k; ++col) {
-                        const float value = std::sin(static_cast<float>(row * k + col) * 0.071f) * 0.3f;
+                        // The preserved F32 small-batch route sums in scalar
+                        // float order. Binary fractions keep that shape/stride
+                        // oracle exact at long K without widening tolerances.
+                        const float value = type == GGML_TYPE_F32 && m == 4
+                                                ? static_cast<float>((row * k + col) % 31 - 15) / 64.0f
+                                                : std::sin(static_cast<float>(row * k + col) * 0.071f) * 0.3f;
                         float rounded = value;
                         if (type == GGML_TYPE_F16) {
                             const auto half = ggml_fp32_to_fp16(value);
@@ -1156,7 +1161,11 @@ TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsFor
                 }
                 for (int col = 0; col < m; ++col) {
                     float* values = reinterpret_cast<float*>(static_cast<char*>(input->data) + col * input->nb[1]);
-                    for (int j = 0; j < k; ++j) values[j] = std::cos(static_cast<float>(col + j) * 0.17f);
+                    for (int j = 0; j < k; ++j) {
+                        values[j] = type == GGML_TYPE_F32 && m == 4
+                                        ? static_cast<float>((col * 3 + j) % 31 - 15) / 32.0f
+                                        : std::cos(static_cast<float>(col + j) * 0.17f);
+                    }
                 }
                 TransformerModel model{};
                 model.variant = ModelVariant::GEMMA4;
