@@ -2,6 +2,7 @@ import http.server
 import importlib.util
 import json
 import tempfile
+from unittest.mock import patch
 import threading
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ class QualityHandler(http.server.BaseHTTPRequestHandler):
         ]
         for event in events:
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+        self.wfile.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
         self.wfile.write(b"data: [DONE]\n\n")
 
     def log_message(self, format, *args):
@@ -95,10 +97,39 @@ class QualityEvaluationTest(unittest.TestCase):
                 f"http://127.0.0.1:{server.server_port}/v1/chat/completions", case, 5, enable_thinking=True
             )
             self.assertTrue(result["passed"])
-            self.assertEqual(result["evaluation_channel"], "reasoning_content+content")
+            self.assertEqual(result["evaluation_channel"], "final_content")
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_reasoning_only_correct_word_cannot_pass_with_thinking_enabled(self):
+        case = {"id": "reasoning-only", "expected_all": ["Paris"]}
+        for visible, reasoning in [("", "Paris"), ("<think>Paris</think>London", ""), ("<think>Paris", "")]:
+            with self.subTest(visible=visible):
+                with patch.object(quality, "request_visible_content", return_value=(200, visible, reasoning, None)):
+                    result = quality.evaluate_case("unused", case, 1, enable_thinking=True)
+                self.assertFalse(result["passed"])
+
+    def test_final_answer_can_pass_after_embedded_thinking(self):
+        with patch.object(quality, "request_visible_content", return_value=(200, "<think>London?</think>Paris", "", None)):
+            result = quality.evaluate_case("unused", {"expected_all": ["Paris"], "forbidden_any": ["London"]}, 1)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["final_content"], "Paris")
+
+    def test_truncated_or_unterminated_stream_never_qualifies(self):
+        import io
+        for reason, done in [("length", True), ("stop", False), (None, True)]:
+            class Response(io.BytesIO):
+                status = 200
+            events = [{"choices": [{"delta": {"content": "Paris"}, "finish_reason": reason}]}]
+            raw = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+            if done:
+                raw += "data: [DONE]\n\n"
+            with self.subTest(reason=reason, done=done):
+                with patch.object(quality.urllib.request, "urlopen", return_value=Response(raw.encode())):
+                    result = quality.evaluate_case("http://localhost/unused", {"messages": [], "expected_all": ["Paris"]}, 1)
+                self.assertFalse(result["passed"])
+                self.assertIn("incomplete final answer", result["error"])
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-EVALUATOR_VERSION = "qwen36-channel-aware-v3"
+EVALUATOR_VERSION = "final-answer-complete-v4"
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -28,28 +28,33 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def assistant_stream(response: Any) -> tuple[str, str]:
+def assistant_stream(response: Any) -> tuple[str, str, str | None, bool]:
     visible_parts: list[str] = []
     reasoning_parts: list[str] = []
+    finish_reason = None
+    done = False
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line.startswith("data:"):
             continue
         data = line[5:].strip()
         if data == "[DONE]":
-            continue
+            done = True
+            break
         try:
             event = json.loads(data)
         except json.JSONDecodeError:
             continue
         for choice in event.get("choices") or []:
+            if choice.get("finish_reason") is not None:
+                finish_reason = str(choice["finish_reason"])
             content = (choice.get("delta") or {}).get("content")
             if isinstance(content, str):
                 visible_parts.append(content)
             reasoning = (choice.get("delta") or {}).get("reasoning_content")
             if isinstance(reasoning, str):
                 reasoning_parts.append(reasoning)
-    return "".join(visible_parts), "".join(reasoning_parts)
+    return "".join(visible_parts), "".join(reasoning_parts), finish_reason, done
 
 
 def request_visible_content(
@@ -77,8 +82,11 @@ def request_visible_content(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            visible, reasoning = assistant_stream(response)
-            return response.status, visible, reasoning, None
+            visible, reasoning, finish_reason, done = assistant_stream(response)
+            error = None
+            if not done or finish_reason != "stop":
+                error = f"incomplete final answer: finish_reason={finish_reason!r}, done={done}"
+            return response.status, visible, reasoning, error
     except urllib.error.HTTPError as exc:
         return exc.code, "", "", exc.read().decode("utf-8", errors="replace")[:1000]
     except Exception as exc:
@@ -87,7 +95,15 @@ def request_visible_content(
 
 def evaluate_case(url: str, case: dict[str, Any], timeout_s: float, enable_thinking: bool = False) -> dict[str, Any]:
     status, visible_content, reasoning_content, error = request_visible_content(url, case, timeout_s, enable_thinking)
-    evaluation_content = reasoning_content + "\n" + visible_content if enable_thinking else visible_content
+    # Some endpoints put Qwen thinking tags in content instead of a separate
+    # channel. A correct word inside reasoning cannot qualify the final answer.
+    evaluation_content = visible_content
+    while "<think>" in evaluation_content:
+        before, _, tail = evaluation_content.partition("<think>")
+        _, closing, after = tail.partition("</think>")
+        evaluation_content = before + after if closing else before
+    if "</think>" in evaluation_content:
+        evaluation_content = evaluation_content.rsplit("</think>", 1)[1]
     normalized = evaluation_content.casefold()
     expected = [str(value) for value in case["expected_all"]]
     missing = [value for value in expected if value.casefold() not in normalized]
@@ -113,7 +129,8 @@ def evaluate_case(url: str, case: dict[str, Any], timeout_s: float, enable_think
         "http_status": status,
         "visible_content": visible_content,
         "reasoning_content": reasoning_content,
-        "evaluation_channel": "reasoning_content+content" if enable_thinking else "content",
+        "evaluation_channel": "final_content",
+        "final_content": evaluation_content,
         "missing_expected": missing,
         "forbidden_found": forbidden,
         "error": error,
