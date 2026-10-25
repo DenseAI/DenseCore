@@ -57,3 +57,30 @@ cached while other entries are reclaimed; its hit/miss is recorded separately.
 Old binaries without these counters cannot pass this gate. Increase `--churn`
 as needed for the configured KV capacity. Every request, raw native log and HTTP response is preserved in the
 output directory. This tool does not enable model defaults or establish speed.
+
+For candidate qualification, use `qualify_prefix.py` once per pinned model. It
+holds the shared lock for that model and verifies every file hash in the
+candidate artifact before and after both phases. Existing output directories
+must be empty, so earlier failed evidence is preserved.
+
+```bash
+python3 benchmarks/personal/qualify_prefix.py \
+  --artifact /path/to/candidate-artifact.json \
+  --library build/libdensecore.so --server bin/densecore-server \
+  --model /path/to/pinned-model.gguf --expected-model-sha256 MODEL_SHA256 \
+  --build-lock /path/to/shared-build.lock --out /tmp/candidate-prefix
+```
+
+The combined gate requires both:
+
+- Main: submitted c1/2/4, request #1/#4, fixed five-turn histories, cancellation
+  and recovery, eight cold churn requests, and complete HTTP five-turn final
+  answers with prefix OFF/ON.
+- Pressure: a separate c1 run with eight churn requests and a native-sized
+  near-full cold context, exact OFF/ON token parity, and positive actual KV
+  reclamation, snapshot-entry removal, and logical snapshot-byte counters.
+
+A passing main phase alone cannot pass `combined.json`. The targeted pressure
+phase replaces blind churn expansion, and does not replace the c1/2/4 or HTTP
+checks. Results remain tied to the candidate/model bytes and do not promote
+support, defaults, or performance claims.
