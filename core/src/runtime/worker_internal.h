@@ -137,6 +137,8 @@ void SuppressTaggedBlock(std::string* token_text, bool* in_block, std::string* p
                          const char* close_tag);
 void SuppressQwenVisibleControlMarkers(std::string* token_text);
 bool IsStopTokenId(const TransformerModel* model, int token_id);
+// Select a terminal cause after normal token publication; caller owns finalization.
+bool ResolveCommittedTokenFinish(Request* req, bool stop_token, bool json_complete);
 bool ShouldTerminateRepetitiveLoop(const TransformerModel* model, const Request* req);
 size_t Utf8ValidPrefixLength(const std::string& s);
 int DecodeVisibleProgressTimeoutMs();

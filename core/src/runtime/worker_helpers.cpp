@@ -1705,10 +1705,21 @@ int DecodeVisibleProgressMaxSilentSteps() {
     return kDecodeVisibleProgressMaxSilentSteps;
 }
 
+bool ResolveCommittedTokenFinish(Request* req, bool stop_token, bool json_complete) {
+    if (!req) return false;
+    if (req->finished) return true; // Preserve cancellation/error/configured-stop causes.
+    if (stop_token) req->decode_finish_cause = DecodeFinishCause::StopToken;
+    else if (json_complete) req->decode_finish_cause = DecodeFinishCause::GrammarComplete;
+    else if (req->generated_count >= req->max_tokens) req->decode_finish_cause = DecodeFinishCause::MaxTokens;
+    else return false;
+    return true;
+}
+
 const char* DecodeFinishCauseName(DecodeFinishCause cause) {
     switch (cause) {
     case DecodeFinishCause::StopToken: return "stop_token";
     case DecodeFinishCause::StopSequence: return "stop_sequence";
+    case DecodeFinishCause::GrammarComplete: return "grammar_complete";
     case DecodeFinishCause::MaxTokens: return "max_tokens";
     case DecodeFinishCause::LoopGuard: return "loop_guard";
     case DecodeFinishCause::DecodeVisibleProgressTimeout: return "decode_visible_progress_timeout";

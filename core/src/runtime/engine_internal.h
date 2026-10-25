@@ -82,6 +82,7 @@ enum class DecodeFinishCause : uint8_t {
     MissingTokens,
     SchedulerRejected,
     GraphBuildFailed,
+    GrammarComplete, // Appended: preserve all existing diagnostic enum values.
 };
 
 enum class DecodeSilentFinishReason : uint8_t {
