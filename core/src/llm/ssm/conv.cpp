@@ -17,6 +17,7 @@
 #include "llm/runtime/profile_types.h"
 #include "llm/runtime/work_context.h"
 #include "llm/ssm/internal.h"
+#include "llm/speculative/ssm_checkpoints.h"
 #include "runtime/inference_types_internal.h"
 #include "runtime/runtime_env.h"
 #include <algorithm>
@@ -85,6 +86,10 @@ void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src, int i
     const ptrdiff_t output_stride = static_cast<ptrdiff_t>(dst->nb[1] / sizeof(float));
     const size_t conv_state_elems =
         static_cast<size_t>(ud->channels) * static_cast<size_t>(std::max(0, ud->kernel_size - 1));
+    if (ud->checkpoints && (ud->checkpoints->channels != static_cast<size_t>(ud->channels) ||
+                            ud->checkpoints->history != static_cast<size_t>(std::max(0, ud->kernel_size - 1)))) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM conv checkpoint shape mismatch");
+    }
     const int channel_begin = (ud->channels * effective_task_idx) / effective_task_count;
     const int channel_end = (ud->channels * (effective_task_idx + 1)) / effective_task_count;
     if (channel_begin >= channel_end) {
@@ -137,6 +142,11 @@ void cb_ssm_conv1d(struct ggml_tensor* dst, const struct ggml_tensor* src, int i
             ud->weight + static_cast<size_t>(channel_begin) * static_cast<size_t>(ud->kernel_size),
             output + static_cast<ptrdiff_t>(t) * output_stride + channel_begin, channel_end - channel_begin,
             ud->kernel_size);
+        if (ud->checkpoints && !ud->checkpoints->RecordConv(t, N, ud->token_seq_ids ? ud->token_seq_ids[t] : -1,
+                                                           channel_begin, channel_end, conv_state)) {
+            FatalQwen35SSMRuntimeError(ud->layer_idx, t, ud->token_seq_ids ? ud->token_seq_ids[t] : -1, -1,
+                                       "SSM conv checkpoint binding does not match execution");
+        }
         if (ud->apply_silu) {
             float* out_t = output + static_cast<ptrdiff_t>(t) * output_stride;
             const auto silu = [](float x) -> float {

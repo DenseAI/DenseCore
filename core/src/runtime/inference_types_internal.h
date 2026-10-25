@@ -16,6 +16,7 @@
 #include "densecore/runtime/scheduler.h"
 
 // Forward declarations
+namespace densecore::llm::speculative { struct SSMCheckpointView; }
 struct ggml_context;
 struct ggml_tensor;
 struct BatchSpec;
@@ -128,6 +129,7 @@ struct SSMQwen35DeltaUserData {
     const ggml_tensor* alpha_beta_tensor = nullptr;
     Qwen36ProfileCounters* profile = nullptr;
     bool fast_silu_gate = false;
+    densecore::llm::speculative::SSMCheckpointView* checkpoints = nullptr;
 };
 
 // SSM delta recurrent callback

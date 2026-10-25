@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+namespace densecore::llm::speculative { struct SSMCheckpointView; }
 struct InferenceWorkContext;
 struct Qwen36ProfileCounters;
 namespace densecore::kernels {
@@ -25,6 +26,7 @@ struct SSMConv1DUserData {
     const int* token_seq_ids = nullptr;
     const std::vector<std::vector<TransformerModel::SSMSequenceRuntimeState>*>* runtime_states = nullptr;
     Qwen36ProfileCounters* profile = nullptr;
+    densecore::llm::speculative::SSMCheckpointView* checkpoints = nullptr;
 };
 
 struct LFM2ShortConvUserData {

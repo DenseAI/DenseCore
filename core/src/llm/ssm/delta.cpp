@@ -16,6 +16,7 @@
 #include "llm/runtime/profile_types.h"
 #include "llm/runtime/work_context.h"
 #include "llm/ssm/internal.h"
+#include "llm/speculative/ssm_checkpoints.h"
 #include "runtime/inference_types_internal.h"
 #include "runtime/runtime_env.h"
 #include <algorithm>
@@ -728,6 +729,10 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
     const int head_v_dim = ud->head_dim_v;
     const int qk_total = head_k_dim * num_k_heads;
     const int state_stride = head_k_dim * head_v_dim;
+    if (ud->checkpoints && (ud->checkpoints->heads != static_cast<size_t>(num_v_heads) ||
+                            ud->checkpoints->head_elements != static_cast<size_t>(state_stride))) {
+        FatalQwen35SSMRuntimeError(ud->layer_idx, 0, -1, -1, "SSM recurrent checkpoint shape mismatch");
+    }
     const int heads_per_group = (num_k_heads > 0) ? std::max(1, num_v_heads / num_k_heads) : 1;
     // The per-layer aggregate contract trace hashes every head of a token, so it
     // only means anything when one task owns all heads. Collapse to a single task
@@ -1078,6 +1083,10 @@ void cb_ssm_qwen35_delta(struct ggml_tensor* dst, const struct ggml_tensor* a, c
             if (!step_ok) {
                 FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
                                            "Qwen35RunGatedDeltaHeadStep rejected runtime inputs");
+            }
+            if (ud->checkpoints && !ud->checkpoints->RecordHead(t, N, seq_idx, h, state)) {
+                FatalQwen35SSMRuntimeError(ud->layer_idx, t, seq_idx, h,
+                                           "SSM recurrent checkpoint binding does not match execution");
             }
             if (trace_this_head) {
                 LogQwen35SSMRuntimeContract("normal", ud->layer_idx, t, seq_idx, h, src_k_head, heads_per_group,
