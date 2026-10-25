@@ -263,14 +263,23 @@ def http_mode(args, mode, out, environment):
                      'stream': True, 'max_tokens': args.http_max_tokens, 'temperature': 0}
             connection.request('POST', '/v1/chat/completions', json.dumps(probe), {'Content-Type': 'application/json'})
             response = connection.getresponse()
-            saw_event = False
+            saw_event, probe_events = False, []
             while line := response.readline():
-                if line.startswith(b'data:') and line[5:].strip() != b'[DONE]':
+                if not line.startswith(b'data:'): continue
+                payload = line[5:].strip()
+                if payload == b'[DONE]': break
+                event = json.loads(payload)
+                probe_events.append(event)
+                if any((choice.get('delta', {}).get('content') or choice.get('delta', {}).get('reasoning_content'))
+                       for choice in event.get('choices', [])):
                     saw_event = True; break
             response.close(); connection.close()
+            with urllib.request.urlopen(base + '/health/ready', timeout=5) as ready:
+                ready_status = ready.status
             followup = http_request(base, CASES[0], True, args.http_max_tokens, args.timeout)
-            result = {'groups': rows, 'disconnect_probe': {'saw_event': saw_event, 'followup': followup,
-                'scope': 'disconnect/recovery only; authoritative native cancellation checked separately'}}
+            result = {'groups': rows, 'disconnect_probe': {'saw_event': saw_event, 'events': probe_events,
+                'ready_after_disconnect': ready_status, 'followup': followup,
+                'scope': 'disconnect after visible/reasoning token and recovery only; native cancellation checked separately'}}
             write(out / f'http-{mode}.json', result)
             return result
         finally:
@@ -331,7 +340,8 @@ def parent(args):
                 if row.get('error'): failures.append(f"HTTP {group['mode']}/c{group['concurrency']}: {row['error']}")
                 elif finals.setdefault(row['case'], row['final_answer']) != row['final_answer']:
                     failures.append(f"HTTP final answer differs across mode/stream/concurrency for {row['case']}")
-        if mode_result['disconnect_probe']['followup'].get('error') or not mode_result['disconnect_probe']['saw_event']:
+        if (mode_result['disconnect_probe']['followup'].get('error') or not mode_result['disconnect_probe']['saw_event']
+                or mode_result['disconnect_probe']['ready_after_disconnect'] != 200):
             failures.append('HTTP disconnect/recovery probe failed')
     if digest(library) != manifest['library_sha256'] or digest(model) != manifest['model_sha256']:
         failures.append('model/library bytes changed during verification')
