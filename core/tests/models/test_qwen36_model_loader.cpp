@@ -5,6 +5,9 @@
 
 #include <array>
 #include <cstdio>
+#include <filesystem>
+#include "densecore/exceptions.h"
+#include "densecore/runtime/resource_budget.h"
 #include <limits>
 #include <memory>
 #include <string>
@@ -756,3 +759,15 @@ TEST(Qwen38ModelLoaderTest, RejectsUnexpectedLayerAfterTrailingMtp) {
     std::unique_ptr<TransformerModel> model(LoadGGUFModel(tmp.path().c_str()));
     EXPECT_EQ(model, nullptr);
 }
+
+#if defined(__linux__)
+TEST(Qwen36ModelLoaderTest, RejectsInsufficientModelMemoryBeforeParsingOrAllocatingWeights) {
+    const auto budget = densecore::runtime::DetectResourceBudget();
+    ASSERT_EQ(budget.memory.state,densecore::runtime::ResourceState::Finite);
+    TempPath tmp;
+    std::error_code ec;
+    std::filesystem::resize_file(tmp.path(),budget.memory.bytes + 64ULL*1024*1024,ec);
+    ASSERT_FALSE(ec) << ec.message();
+    EXPECT_THROW(LoadGGUFModel(tmp.path().c_str()),densecore::OutOfMemoryException);
+}
+#endif

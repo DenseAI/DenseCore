@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_ledger.h"
 #include "densecore/runtime/resource_budget.h"
 #include "densecore/models/model_loader.h"
 
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -395,6 +397,32 @@ bool ResolveStackedInt4ViewBinding(ggml_context* vctx, const ggml_tensor* root_t
 }
 
 constexpr size_t kGemma4RequantSafetyHeadroomBytes = size_t{8} * 1024 * 1024 * 1024;
+
+void CheckModelLoadResourceBudget(const char* path) {
+#if defined(__linux__)
+    const auto budget = densecore::runtime::DetectResourceBudget();
+    if (budget.memory.state != densecore::runtime::ResourceState::Finite)
+        throw densecore::OutOfMemoryException("model load resource memory availability unknown");
+    const uint64_t reserved = densecore::runtime::ProcessPlannedMemoryBytes();
+    const uint64_t available = reserved >= budget.memory.bytes ? 0 : budget.memory.bytes-reserved;
+    if (available == 0)
+        throw densecore::OutOfMemoryException("model load required_bytes=1 available_bytes=0");
+    // GGUF no_alloc=false creates anonymous resident weights. Reject a file
+    // larger than headroom before parsing its potentially large tokenizer or
+    // allocating its tensor arena. Each split shard is checked before loading.
+    std::error_code ec;
+    const auto file_bytes = path ? std::filesystem::file_size(path,ec) : 0;
+    if (!ec && file_bytes > 0) {
+        constexpr uint64_t metadata_slack = 64ULL*1024*1024;
+        const uint64_t required = densecore::runtime::resource_detail::Add(file_bytes,metadata_slack);
+        if (required > available)
+            throw densecore::OutOfMemoryException("model load required_bytes=" + std::to_string(required) +
+                                                  " available_bytes=" + std::to_string(available));
+    }
+#else
+    (void)path;
+#endif
+}
 
 size_t ReadMemAvailableBytes() {
     const auto memory = densecore::runtime::DetectResourceBudget().memory;
@@ -2047,6 +2075,7 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 #endif
 
+    CheckModelLoadResourceBudget(path);
     struct gguf_context* ctx_gguf = gguf_init_from_file(path, params);
     if (!ctx_gguf) {
         std::cerr << "[DenseCore] Error: Failed to load GGUF file" << std::endl;
@@ -2090,6 +2119,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
                 /*.no_alloc=*/false,
                 /*.ctx=*/&shard_ctx_w,
             };
+            try { CheckModelLoadResourceBudget(shard_paths[shard].c_str()); }
+            catch (...) { delete model; throw; }
             gguf_context* shard_ctx_gguf = gguf_init_from_file(shard_paths[shard].c_str(), shard_params);
             if (!shard_ctx_gguf || !shard_ctx_w) {
                 if (shard_ctx_w) ggml_free(shard_ctx_w);

@@ -532,3 +532,25 @@ TEST(RequestTerminalPublicationTest, EmbeddingQueueFailurePreservesSuccessPayloa
     EXPECT_FALSE(FinalizeEmbeddingRequestOnce(&state, &req, {}, DENSECORE_STATUS_INTERNAL_ERROR, false));
     EXPECT_EQ(callback.callback_count, 1);
 }
+
+TEST_F(RequestLifecycleTest, AutoEmbeddingRejectsUnsupportedMetadataBeforeAdmissionAndKeepsExplicitLast) {
+    auto* state = static_cast<EngineState*>(engine_);
+    {
+        std::lock_guard<std::mutex> lock(state->construction_mu);
+        auto* entry = state->GetDefaultModel();
+        ASSERT_TRUE(entry && entry->model);
+        entry->model->has_pooling_metadata = true;
+        entry->model->gguf_pooling_type = 4; // GGUF rank pooling is not a sentence vector.
+    }
+    EmbeddingCallbackState rejected;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    EXPECT_EQ(SubmitEmbeddingRequestEx(engine_, "unsupported-auto", -1, 1, EmbeddingLifecycleCallback, &rejected),
+              DENSECORE_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(std::string(DenseCoreGetLastError()).find("pooling metadata"), std::string::npos);
+    EXPECT_EQ(rejected.callback_count, 0);
+    EmbeddingCallbackState explicit_last;
+    ASSERT_GT(SubmitEmbeddingRequestEx(engine_, "explicit-last", 2, 1, EmbeddingLifecycleCallback, &explicit_last), 0);
+    ASSERT_TRUE(explicit_last.Wait(15s));
+    EXPECT_EQ(explicit_last.callback_count, 1);
+    EXPECT_GT(explicit_last.terminal_size, 0);
+}
