@@ -1677,7 +1677,10 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     // So we act always if use_cache is true.
                     struct ggml_tensor* cache_k_src = Kcur;
                     struct ggml_tensor* cache_v_src = Vcur;
-                    if (model->arch_flags.is_gemma4 && N == 1) {
+                    if (model->arch_flags.is_gemma4 && N == 1 && !gemma4_shared_kv_layer) {
+                        // Only writer layers need a materialized current-token slice.
+                        // Shared readers borrow the already gathered source history;
+                        // copying it here allocates unused full-history tensors.
                         // Single-token Gemma4 decode can reach this path with
                         // non-dense 3D views. Materialize the current K/V slice
                         // before cache write/gather so the source-layer publish

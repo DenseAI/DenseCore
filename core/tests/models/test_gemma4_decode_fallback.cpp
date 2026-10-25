@@ -1391,6 +1391,48 @@ TEST(Gemma4FallbackDecodeTest, E4BSharedLayersNeedOnlyQAndMatchLocalSourceLogits
         };
         check(MakeSingleSequencePrefillBatch({1, 0, 1}));
         if (use_cache) {
+            // Inspect all allocated tensors, including dead graph nodes. With
+            // no_alloc=false, unused CONT nodes still consume context storage.
+            // Reader layers must not copy the full published source history.
+            {
+                std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
+                    CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+                ASSERT_NE(work, nullptr);
+                struct RestoreWorkContext {
+                    InferenceWorkContext* previous = GetCurrentWorkContext();
+                    ~RestoreWorkContext() { SetCurrentWorkContext(previous); }
+                } restore;
+                SetCurrentWorkContext(work.get());
+                ResetInferenceWorkContext(work.get());
+                const auto batch = MakeSingleTokenDecodeBatch(0, 3, 0);
+                SetCurrentBatch(&batch);
+                SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+                ggml_init_params params{32ull * 1024 * 1024, nullptr, false};
+                std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+                ASSERT_NE(ctx, nullptr);
+                auto* graph = ggml_new_graph_custom(ctx.get(), 32768, false);
+                ASSERT_NE(BuildTransformerGraph(missing.get(), missing_cache.get(), ctx.get(), batch,
+                                               false, graph), nullptr);
+                ASSERT_GT(work->gemma4_shared_kv_states.size(), 23u);
+                const auto& sliding_source = work->gemma4_shared_kv_states[22];
+                const auto& full_source = work->gemma4_shared_kv_states[23];
+                ASSERT_NE(sliding_source.k, nullptr);
+                ASSERT_NE(full_source.k, nullptr);
+                ASSERT_EQ(sliding_source.k->ne[2], 4);
+                ASSERT_EQ(full_source.k->ne[2], 4);
+                size_t copied_history_bytes = 0;
+                for (auto* tensor = ggml_get_first_tensor(ctx.get()); tensor;
+                     tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                    if (tensor->op != GGML_OP_CONT || tensor->ne[2] <= 1) continue;
+                    const auto* source = tensor->src[0];
+                    if (source == sliding_source.k || source == sliding_source.v ||
+                        source == full_source.k || source == full_source.v) {
+                        ASSERT_NE(tensor->data, nullptr);
+                        copied_history_bytes += ggml_nbytes(tensor);
+                    }
+                }
+                EXPECT_EQ(copied_history_bytes, 0u);
+            }
             check(MakeSingleTokenDecodeBatch(0, 3, 0));
             check(MakeSingleTokenDecodeBatch(1, 4, 0));
             for (int layer = 24; layer < 42; ++layer) {
