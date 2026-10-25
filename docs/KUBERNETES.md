@@ -33,7 +33,13 @@ request bound, first-token/signal times, the native active-request gauge before
 SIGTERM and exactly one terminal event. Signal delivery, readiness/admission probes
 and stream completion share one absolute deadline starting at the signal command.
 Probe records preserve response status or transport error; a timeout or DNS error
-does not prove shutdown. The artifact labels the legacy five-second regression
+does not prove shutdown. Readiness removal and new admission blocking must both
+be observed in the same concurrent probe round before the accepted stream
+completes, alongside a positive native active-request gauge. Closure after
+completion does not pass the active-drain gate. Each round probes readiness,
+admission and metrics concurrently and preserves individual start/end times.
+The admission probe has a separate one-token bound so an unexpected admission
+is recorded without requesting another full workload. The artifact labels the legacy five-second regression
 window as exercised only when the observed stream continues more than five seconds
 after the signal command completes. A faster successful drain leaves that specific
 regression unexercised; token count never substitutes for observed duration. An unfinished buffered HTTP stream alone

@@ -2,6 +2,7 @@
 """Verify a real accepted stream survives SIGTERM while new admission stops."""
 import argparse
 import errno
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import re
@@ -32,7 +33,9 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
     completed = threading.Event()
     result = {"events": [], "ready_removed": False, "admission_blocked": False,
         "probe_events": [], "shutdown_timeout_seconds": timeout,
-        "legacy_5s_regression": "not_exercised", "request_max_tokens": max_tokens, "done_count": 0, "finish_count": 0}
+        "legacy_5s_regression": "not_exercised", "active_probe_rounds": [],
+        "ready_removed_while_stream_active": False, "admission_blocked_while_stream_active": False,
+        "native_active_during_shutdown_probes": False, "request_max_tokens": max_tokens, "done_count": 0, "finish_count": 0}
     payload = json.dumps({"model": "densecore", "messages": [{"role": "user", "content":
         "List the integers from 1 to 200, one at a time, without skipping any."}],
         "max_tokens": max_tokens, "temperature": 0, "stream": True,
@@ -104,7 +107,7 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
                 raise RuntimeError("accepted request exceeded drain deadline")
             return budget
 
-        def probe_unavailable(path, data=None):
+        def probe(path, data=None):
             event = {"path": path, "started_seconds": time.monotonic() - began}
             unavailable = False
             try:
@@ -113,6 +116,10 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
                 with urllib.request.urlopen(request, timeout=min(1, remaining())) as response:
                     event["status"] = response.status
                     unavailable = response.status == 503
+                    if path == "/metrics":
+                        event["body"] = response.read(1048576).decode(errors="replace")
+                        values = re.findall(pattern, event["body"], re.MULTILINE)
+                        event["active_requests"] = sum(float(value) for value in values) if values else None
             except urllib.error.HTTPError as error:
                 event.update(status=error.code, body=error.read(2048).decode(errors="replace"))
                 unavailable = error.code == 503
@@ -121,18 +128,48 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
                 unavailable = connection_closed(error)
             finally:
                 event.update(completed_seconds=time.monotonic() - began, unavailable=unavailable)
+                event["accepted_stream_incomplete"] = not completed.is_set()
                 result["probe_events"].append(event)
-            return unavailable
+            return event
 
         subprocess.run(signal_command, check=True, timeout=min(10, remaining()))
         result["signal_command_completed_seconds"] = time.monotonic() - began
-        readiness_deadline = min(deadline, started + 10)
-        while time.monotonic() < readiness_deadline:
-            result["ready_removed"] = probe_unavailable("/health/ready")
-            if result["ready_removed"]:
-                break
-            time.sleep(min(0.05, remaining()))
-        result["admission_blocked"] = probe_unavailable("/v1/chat/completions", payload)
+        admission_payload = json.dumps({**json.loads(payload), "max_tokens": 1}).encode()
+        result["admission_probe_max_tokens"] = 1
+        # Readiness and admission can change independently. Probe both alongside
+        # the native gauge rather than waiting for one before observing the other.
+        with ThreadPoolExecutor(max_workers=3) as probes:
+            while not completed.is_set():
+                remaining()
+                round_started = time.monotonic() - began
+                ready_future = probes.submit(probe, "/health/ready")
+                admission_future = probes.submit(probe, "/v1/chat/completions", admission_payload)
+                metric_future = probes.submit(probe, "/metrics")
+                ready, admission, metric = (future.result() for future in
+                    (ready_future, admission_future, metric_future))
+                ready_active = ready["unavailable"] and ready["accepted_stream_incomplete"]
+                admission_active = admission["unavailable"] and admission["accepted_stream_incomplete"]
+                native_active = metric.get("active_requests") is not None and metric["active_requests"] > 0 and metric["accepted_stream_incomplete"]
+                qualified = ready_active and admission_active and native_active
+                result["active_probe_rounds"].append({"started_seconds": round_started,
+                    "completed_seconds": time.monotonic() - began,
+                    "ready_unavailable": ready["unavailable"],
+                    "admission_unavailable": admission["unavailable"],
+                    "native_active_requests": metric.get("active_requests"),
+                    "ready_stream_incomplete": ready["accepted_stream_incomplete"],
+                    "admission_stream_incomplete": admission["accepted_stream_incomplete"],
+                    "metrics_stream_incomplete": metric["accepted_stream_incomplete"],
+                    "qualified": qualified})
+                result["ready_removed"] |= ready["unavailable"]
+                result["admission_blocked"] |= admission["unavailable"]
+                result["ready_removed_while_stream_active"] |= ready_active
+                result["admission_blocked_while_stream_active"] |= admission_active
+                result["native_active_during_shutdown_probes"] |= native_active
+                if qualified:
+                    result["qualified_active_probe_round"] = len(result["active_probe_rounds"]) - 1
+                    break
+                if completed.wait(min(0.05, remaining())):
+                    break
         if not completed.wait(remaining()):
             raise RuntimeError("accepted request exceeded drain deadline")
         remaining()  # Probes and signal delivery consume the same overall budget.
@@ -145,8 +182,8 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
             result["legacy_5s_regression"] = "exercised_client_stream_window"
         if result["done_count"] != 1 or result["finish_count"] != 1 or result.get("finish_reason") not in ("stop", "length") or result.get("error"):
             raise RuntimeError("accepted request did not finish successfully during drain")
-        if not result["ready_removed"] or not result["admission_blocked"]:
-            raise RuntimeError("readiness or new admission stayed available during drain")
+        if "qualified_active_probe_round" not in result:
+            raise RuntimeError("readiness removal and new admission blocking with native active work were not proven while accepted stream remained active")
     except Exception as error:
         result["failure"] = str(error)
         raise
