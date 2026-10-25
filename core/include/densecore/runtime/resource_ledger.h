@@ -116,6 +116,17 @@ public:
         result->charged_ = true;
         return result;
     }
+    static uint64_t AvailableBytes(AllocationCategory category) {
+        auto& ledger = resource_detail::ProcessLedger();
+        std::lock_guard<std::mutex> lock(ledger.mutex);
+        if (ledger.plans.empty()) return UINT64_MAX;
+        uint64_t capacity = 0;
+        for (const auto& entry : ledger.plans)
+            capacity = resource_detail::Add(capacity,category == AllocationCategory::Graph
+                                                       ? entry.second.graph_bytes : entry.second.repack_bytes);
+        const uint64_t used = category == AllocationCategory::Graph ? ledger.graph_used : ledger.repack_used;
+        return used >= capacity ? 0 : capacity-used;
+    }
     ~ResourceAllocationLease() {
         if (!charged_) return;
         auto& ledger = resource_detail::ProcessLedger();

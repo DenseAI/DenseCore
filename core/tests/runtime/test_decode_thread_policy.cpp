@@ -1098,3 +1098,25 @@ TEST(DecodeThreadPolicy, ExhaustedMemoryDoesNotAdmitGraphPoolGrowth) {
     EXPECT_FALSE(GraphPoolReplacementFitsForTest(0, 1, 0));
     EXPECT_TRUE(GraphPoolReplacementFitsForTest(0, 0, 0));
 }
+
+TEST(DecodeThreadPolicy, CommittedGraphBudgetLimitsOptionalGrowthButKeepsRequiredFloor) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_ctx = 262144;
+    model.hparams.n_embd = 1024;
+    model.hparams.n_layer = 24;
+    model.hparams.n_head = 8;
+    model.hparams.n_head_kv = 2;
+    model.hparams.n_embd_head_k = 256;
+    model.hparams.n_embd_head_v = 256;
+    model.ssm_inner_size = 2048;
+    constexpr size_t budget = 1024ULL*1024*1024;
+    const auto estimate = EngineState::EstimateGraphContextSize(&model,26,1,26,26);
+    const size_t required_floor = IncludeGgmlGraphObjectMetadataForTest(estimate.total_bytes);
+    const size_t pool = PlanRuntimeGraphPoolBytes(&model,26,1,26,26,budget);
+    EXPECT_GE(pool,required_floor);
+    EXPECT_LE(pool,budget);
+    EXPECT_GT(PlanRuntimeGraphPoolBytes(&model,26,1,26,26,required_floor/2),required_floor/2);
+}

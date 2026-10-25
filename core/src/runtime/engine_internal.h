@@ -91,6 +91,7 @@ enum class DecodeSilentFinishReason : uint8_t {
 struct KVCacheConfig {
     int max_num_seqs = 4;
     int max_seq_len = 4096;
+    int max_prefill_chunk_tokens = 0; // Committed resource policy; context stays unchanged.
     size_t target_kv_memory = 512ULL * 1024ULL * 1024ULL;
     size_t bytes_per_token = 0;
     densecore::runtime::RuntimeMemoryPlan memory_plan{};
@@ -1838,7 +1839,8 @@ struct EngineState {
     };
 
     static GraphContextEstimate EstimateGraphContextSize(const TransformerModel* model, size_t seq_len_hint = 0,
-                                                         size_t num_seqs_hint = 0, size_t chunk_token_hint = 0) {
+                                                         size_t num_seqs_hint = 0, size_t chunk_token_hint = 0,
+                                                         size_t total_query_tokens_hint = 0) {
         auto parse_env_mb = [](const char* name, size_t default_mb, size_t min_mb, size_t max_mb) -> size_t {
             const size_t effective_max_mb = std::max<size_t>(1, max_mb);
             const size_t effective_min_mb = std::min(min_mb, effective_max_mb);
@@ -1982,7 +1984,9 @@ struct EngineState {
             model->arch_flags.is_hybrid_ssm && model_has_moe_layers && has_request_shape_hint && chunk_token_hint > 1 &&
             effective_query_len > 1 && effective_seq_len > effective_query_len;
         const size_t graph_key_len = qwen_hybrid_moe_chunked_prefill_graph ? effective_query_len : effective_seq_len;
-        const size_t query_token_working_set = saturating_mul(effective_num_seqs, effective_query_len);
+        const size_t query_token_working_set = total_query_tokens_hint > 0
+                                                  ? total_query_tokens_hint
+                                                  : saturating_mul(effective_num_seqs,effective_query_len);
         const size_t key_token_working_set = saturating_mul(effective_num_seqs, graph_key_len);
         const int n_head = std::max<int32_t>(1, hp.n_head);
         const int n_head_kv = std::max<int32_t>(1, hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
@@ -1997,7 +2001,7 @@ struct EngineState {
         const size_t kv_history_bytes = saturating_mul(kv_history_working_set, sizeof(float));
 
         const size_t attention_score_elems = saturating_mul(
-            saturating_mul(saturating_mul(static_cast<size_t>(n_head), effective_num_seqs), effective_query_len),
+            saturating_mul(static_cast<size_t>(n_head),query_token_working_set),
             graph_key_len);
         const size_t attention_score_bytes = saturating_mul(attention_score_elems, sizeof(float));
         const size_t attention_score_buffer_count =
@@ -2083,8 +2087,10 @@ struct EngineState {
                 const size_t num_seqs_for_objects = std::max<size_t>(1, effective_num_seqs);
                 if (effective_seq_len <= std::numeric_limits<size_t>::max() / effective_query_len) {
                     size_t object_pairs = effective_seq_len * effective_query_len;
-                    if (object_pairs <= std::numeric_limits<size_t>::max() / num_seqs_for_objects) {
-                        object_pairs *= num_seqs_for_objects;
+                    const size_t object_queries = total_query_tokens_hint > 0 ? total_query_tokens_hint
+                                                                                 : effective_query_len*num_seqs_for_objects;
+                    if (effective_seq_len <= std::numeric_limits<size_t>::max() / std::max<size_t>(1,object_queries)) {
+                        object_pairs = effective_seq_len*object_queries;
                         if (object_pairs <= std::numeric_limits<size_t>::max() / 64ULL) {
                             saturating_add_inplace(estimate.long_context_safety_pad_bytes, object_pairs * 64ULL);
                         }

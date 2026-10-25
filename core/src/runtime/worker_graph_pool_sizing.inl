@@ -10,7 +10,10 @@ size_t ReadAvailableMemoryBytesForRuntimePools() {
         if (densecore::runtime::ResourceUnsigned(hint, mb) && mb <= SIZE_MAX / (1024*1024)) return mb * (1024*1024);
     }
     const auto memory = densecore::runtime::DetectResourceBudget().memory;
-    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes) : 0;
+    const uint64_t graph_available = densecore::runtime::ResourceAllocationLease::AvailableBytes(
+        densecore::runtime::AllocationCategory::Graph);
+    return memory.state == densecore::runtime::ResourceState::Finite
+               ? static_cast<size_t>(std::min(memory.bytes,graph_available)) : 0;
 }
 
 void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
@@ -354,14 +357,15 @@ FlexibleGraphPoolSizing MeasureFlexibleGraphPoolSize(TransformerModel* model, Pa
 }
 
 FlexibleGraphPoolSizing EstimateFlexibleGraphPoolSizeWithoutDryRun(
-    TransformerModel* model, const EngineState::GraphContextEstimate& fallback_estimate) {
+    TransformerModel* model, const EngineState::GraphContextEstimate& fallback_estimate,
+    size_t available_override = SIZE_MAX) {
     FlexibleGraphPoolSizing result{};
     if (!model || !IsFlexibleGraphPoolSizingEnabled(model) || fallback_estimate.total_bytes == 0) {
         return result;
     }
 
     constexpr size_t MB = 1024ULL * 1024ULL;
-    const size_t available_bytes = ReadAvailableMemoryBytesForRuntimePools();
+    const size_t available_bytes = available_override == SIZE_MAX ? ReadAvailableMemoryBytesForRuntimePools() : available_override;
     size_t target_bytes = fallback_estimate.total_bytes;
     const bool x86_qwen_chunked = IsX86QwenHybridMoEChunkedPrefillEstimate(model, fallback_estimate);
     if (fallback_estimate.effective_query_len > 1) {

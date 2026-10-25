@@ -587,6 +587,20 @@ int GetDebugFirstTokenSamplingLogitsOffset() {
     return value;
 }
 
+size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, size_t sequences,
+                                 size_t query_per_sequence, size_t total_queries, size_t available_bytes) {
+    const auto estimate = EngineState::EstimateGraphContextSize(model,context,sequences,query_per_sequence,total_queries);
+    const size_t floor = IncludeGgmlGraphObjectMetadata(estimate.total_bytes);
+    const size_t metadata = IncludeGgmlGraphObjectMetadata(1) - 64ULL*1024*1024;
+    if (!model || floor > available_bytes || available_bytes <= metadata) return floor;
+    const bool content_dependent = model->arch_flags.is_hybrid_ssm || model->arch_flags.is_gemma4 || ModelHasMoEGraphLayers(model);
+    if (!content_dependent) return std::max(floor,std::min(estimate.total_bytes*2,available_bytes));
+    const auto sizing = EstimateFlexibleGraphPoolSizeWithoutDryRun(const_cast<TransformerModel*>(model),estimate,
+                                                                 available_bytes-metadata);
+    const size_t requested = IncludeGgmlGraphObjectMetadata(sizing.reserved_bytes);
+    return std::max(floor,std::min(requested,available_bytes));
+}
+
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req) {
     return ResolveQwen36PrefillChunkTokensImpl(model, req);
 }
@@ -2751,7 +2765,8 @@ void EngineLoop(EngineState* state) {
                     chunk_token_hint = std::max(chunk_token_hint, static_cast<size_t>(token_count));
                 }
                 return EngineState::EstimateGraphContextSize(
-                    current_model, seq_len_hint, static_cast<size_t>(std::max(1, batch.num_seqs)), chunk_token_hint);
+                    current_model, seq_len_hint, static_cast<size_t>(std::max(1, batch.num_seqs)), chunk_token_hint,
+                    batch.tokens.size());
             };
             const EngineState::GraphContextEstimate graph_ctx_estimate = compute_graph_context_estimate();
             size_t prefill_graph_ctx_bytes = prefill_graph_cache_active_effective ? graph_ctx_estimate.total_bytes : 0;
@@ -3395,6 +3410,24 @@ void EngineLoop(EngineState* state) {
                             allow_growth_reserve);
                         ctx_size = ClampGraphPoolToExplicitMax(
                             ctx_size, used_flexible_sizing ? flexible_sizing.required_bytes : 0);
+                        // Optional growth cannot independently spend memory reserved
+                        // for KV/repack/state. Keep the conservative graph/metadata
+                        // floor, and reclaim idle cached graphs before a pool grow.
+                        const size_t minimum_pool_bytes = IncludeGgmlGraphObjectMetadata(graph_ctx_estimate.total_bytes);
+                        ctx_size = std::max(ctx_size,minimum_pool_bytes);
+                        uint64_t available_pool_bytes = densecore::runtime::ResourceAllocationLease::AvailableBytes(
+                            densecore::runtime::AllocationCategory::Graph);
+                        if (available_pool_bytes != UINT64_MAX && state->inference_ctx.IsInitialized())
+                            available_pool_bytes = densecore::runtime::resource_detail::Add(available_pool_bytes,state->inference_ctx.compute_buffer_size);
+                        if (available_pool_bytes != UINT64_MAX && ctx_size > available_pool_bytes) {
+                            graph_cache.Clear();
+                            available_pool_bytes = densecore::runtime::ResourceAllocationLease::AvailableBytes(
+                                densecore::runtime::AllocationCategory::Graph);
+                            if (state->inference_ctx.IsInitialized())
+                                available_pool_bytes = densecore::runtime::resource_detail::Add(available_pool_bytes,state->inference_ctx.compute_buffer_size);
+                            if (minimum_pool_bytes <= available_pool_bytes)
+                                ctx_size = std::min<uint64_t>(ctx_size,available_pool_bytes);
+                        }
                         const bool graph_pool_shrink_allowed =
                             IsFlexibleGraphPoolSizingEnabled(current_model) && is_decode_batch && used_flexible_sizing;
                         const bool graph_pool_oversized =

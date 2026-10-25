@@ -4,6 +4,7 @@
 #include <string>
 
 #include "runtime/engine_internal.h"
+#include "runtime/worker_internal.h"
 
 namespace {
 
@@ -745,5 +746,38 @@ TEST(EngineKVCacheConfig, SafeBudgetRejectsWhenEvenOneSequenceCannotFit) {
     } catch (const std::exception& error) {
         EXPECT_NE(std::string(error.what()).find("context=4096"),std::string::npos);
         EXPECT_NE(std::string(error.what()).find("available_bytes="),std::string::npos);
+    }
+}
+
+TEST(EngineKVCacheConfig, Qwen35TwoThousandTokenContextUsesScheduledPrefillShape) {
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "2048");
+    ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "64");
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "8192");
+    TransformerModel model = MakeModel(256,2,24);
+    model.arch = ModelArch::QWEN35;
+    model.variant = ModelVariant::QWEN35;
+    model.arch_flags.is_hybrid_ssm = true;
+    model.hparams.n_embd = 1024;
+    model.hparams.n_head = 8;
+    model.hparams.n_ctx = 262144;
+    model.ssm_inner_size = 2048;
+    model.ssm_time_step_rank = 16;
+    model.ssm_state_size = 128;
+    model.ssm_group_count = 16;
+    model.ssm_conv_kernel = 4;
+    model.ssm_layer_states.resize(18);
+    for (const char* concurrent : {"1","4"}) {
+        ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS",concurrent);
+        const auto config = ComputeSafeKVCacheConfig(&model,GGML_TYPE_F16);
+        EXPECT_EQ(config.max_seq_len,2048);
+        EXPECT_EQ(config.max_num_seqs,std::atoi(concurrent));
+        EXPECT_GT(config.max_prefill_chunk_tokens,0);
+        EXPECT_LE(config.max_prefill_chunk_tokens,768);
+        EXPECT_TRUE(config.memory_plan.Fits());
+        EXPECT_LT(config.memory_plan.RequiredBytes(),8192ULL*1024*1024)
+            << "serial bounded prefill must not charge c*2048 query tokens or two full arenas";
+        const auto scheduler = BuildRuntimeSchedulerConfig(config,&model);
+        EXPECT_EQ(scheduler.max_prefill_seqs,1);
+        EXPECT_EQ(scheduler.max_prefill_tokens,config.max_prefill_chunk_tokens);
     }
 }

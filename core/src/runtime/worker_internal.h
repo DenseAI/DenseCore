@@ -150,6 +150,8 @@ void FinalizeDecodeSilentFinishReason(Request* req);
 void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
                              const densecore::TransformerGraphExecutionPlan* graph_plan = nullptr);
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now);
+size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, size_t sequences,
+                                 size_t query_per_sequence, size_t total_queries, size_t available_bytes);
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req);
 int ResolveGemma4PrefillChunkTokens(const TransformerModel* model, const Request* req);
 

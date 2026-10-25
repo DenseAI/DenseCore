@@ -254,6 +254,8 @@ densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_c
     config.max_model_len = std::max(1, kv_config.max_seq_len);
     config.max_num_batched_tokens = std::max(1, config.max_num_batched_tokens);
     config.max_prefill_tokens = std::min(std::max(1, config.max_prefill_tokens), config.max_num_batched_tokens);
+    if (kv_config.max_prefill_chunk_tokens > 0)
+        config.max_prefill_tokens = std::min(config.max_prefill_tokens,kv_config.max_prefill_chunk_tokens);
     config.max_parallel_prefill_chunk_tokens = 256;
     config.max_parallel_prefill_chunk_tokens =
         std::min(std::max(1, config.max_parallel_prefill_chunk_tokens), config.max_prefill_tokens);
@@ -457,18 +459,23 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
     const uint64_t physical_available = resources.memory.bytes;
     const uint64_t other_reserved = densecore::runtime::ProcessPlannedMemoryBytes();
     resources.memory.bytes = other_reserved >= physical_available ? 0 : physical_available-other_reserved;
-    auto plan_for = [&](int sequences) {
+    auto base_scheduler = BuildRuntimeSchedulerConfig(config,model);
+    Request prompt_shape;
+    prompt_shape.prompt_token_count = config.max_seq_len;
+    int model_chunk = ResolveQwen36PrefillChunkTokens(model,&prompt_shape);
+    if (model_chunk <= 0) model_chunk = ResolveGemma4PrefillChunkTokens(model,&prompt_shape);
+    int largest_chunk = std::min(config.max_seq_len,base_scheduler.max_prefill_tokens);
+    if (model_chunk > 0) largest_chunk = std::min(largest_chunk,model_chunk);
+    largest_chunk = std::max(1,largest_chunk);
+    const bool unchunked_embedding = model && (model->arch == ModelArch::BERT ||
+        (model->has_pooling_metadata && model->gguf_pooling_type >= 1 && model->gguf_pooling_type <= 3));
+    auto plan_for = [&](int sequences, int prefill_chunk) {
         densecore::runtime::RuntimeMemoryPlan plan;
         constexpr uint64_t MB = 1024*1024;
         plan.resource_capacity_bytes = physical_available;
         plan.available_bytes = resources.memory.bytes;
         const size_t rounded_context = (static_cast<size_t>(config.max_seq_len) + BLOCK_SIZE-1) / BLOCK_SIZE * BLOCK_SIZE;
         plan.kv_bytes = SaturatingMulSize(SaturatingMulSize(config.bytes_per_token,rounded_context),sequences);
-        const size_t graph_seq = std::max(1,std::min(config.max_seq_len,2048));
-        const auto graph = EngineState::EstimateGraphContextSize(model,graph_seq,sequences,
-                                  model && model->arch_flags.is_hybrid_ssm ? graph_seq : std::min<size_t>(graph_seq,192));
-        // One persistent/cached graph plus a replacement or calibration graph.
-        plan.graph_bytes = SaturatingMulSize(graph.total_bytes,2);
         plan.repack_bytes = std::min<uint64_t>(plan.available_bytes/8,4ULL*1024*MB);
         if (model && model->arch_flags.is_hybrid_ssm && model->ssm_time_step_rank > 0) {
             const size_t channels = static_cast<size_t>(std::max(0,model->ssm_inner_size)) +
@@ -484,25 +491,50 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         // K+1 request-state cost must replace zero when a profile is enabled.
         plan.mtp_checkpoint_bytes = 0;
         plan.allocator_bytes = std::max<uint64_t>(256*MB,plan.available_bytes/16);
+        const uint64_t fixed = plan.RequiredBytes();
+        const size_t cache_reserve = DecodeGraphCacheCtxBytes();
+        const uint64_t graph_available = fixed >= plan.available_bytes ? 0 : plan.available_bytes-fixed;
+        const size_t pool_available = graph_available > cache_reserve ? graph_available-cache_reserve : 0;
+        const size_t key_context = static_cast<size_t>(config.max_seq_len);
+        const size_t prefill_pool = PlanRuntimeGraphPoolBytes(model,key_context,1,prefill_chunk,prefill_chunk,pool_available);
+        const size_t decode_pool = PlanRuntimeGraphPoolBytes(model,key_context,sequences,1,sequences,pool_available);
+        size_t peak_pool = std::max(prefill_pool,decode_pool);
+        auto candidate_config = config;
+        candidate_config.max_num_seqs = sequences;
+        candidate_config.max_prefill_chunk_tokens = prefill_chunk;
+        const auto scheduler = BuildRuntimeSchedulerConfig(candidate_config,model);
+        if (scheduler.enable_mixed_prefill_decode && sequences > 1) {
+            const size_t mixed_chunk = std::min(prefill_chunk,scheduler.max_mixed_prefill_tokens);
+            const size_t mixed_queries = mixed_chunk + static_cast<size_t>(sequences-1);
+            peak_pool = std::max(peak_pool,PlanRuntimeGraphPoolBytes(model,key_context,sequences,mixed_chunk,
+                                                                   mixed_queries,pool_available));
+        }
+        plan.graph_bytes = densecore::runtime::resource_detail::Add(peak_pool,cache_reserve);
         return plan;
     };
     const int maximum = explicit_concurrency ? concurrency : 8;
+    auto minimum = plan_for(explicit_concurrency ? concurrency : 1,1);
     for (int sequences = maximum; sequences >= 1; --sequences) {
-        const auto plan = plan_for(sequences);
-        if (plan.Fits()) {
-            config.max_num_seqs = sequences;
-            config.memory_plan = plan;
-            std::cout << "[DenseCore] Resource plan: threads=" << resources.effective_threads
-                      << " context=" << config.max_seq_len << " concurrency=" << sequences
-                      << " required_bytes=" << plan.RequiredBytes() << " available_bytes=" << plan.available_bytes
-                      << " kv=" << plan.kv_bytes << " graph=" << plan.graph_bytes << " repack=" << plan.repack_bytes
-                      << " recurrent=" << plan.recurrent_bytes << " prefix_snapshot=" << plan.prefix_snapshot_bytes
-                      << " mtp_checkpoint=" << plan.mtp_checkpoint_bytes << " allocator=" << plan.allocator_bytes << std::endl;
-            return config;
+        for (int chunk = largest_chunk;; chunk = std::max(1,chunk/2)) {
+            const auto plan = plan_for(sequences,chunk);
+            minimum = plan;
+            if (plan.Fits()) {
+                config.max_num_seqs = sequences;
+                config.max_prefill_chunk_tokens = chunk;
+                config.memory_plan = plan;
+                std::cout << "[DenseCore] Resource plan: threads=" << resources.effective_threads
+                          << " context=" << config.max_seq_len << " concurrency=" << sequences
+                          << " prefill_chunk=" << chunk
+                          << " required_bytes=" << plan.RequiredBytes() << " available_bytes=" << plan.available_bytes
+                          << " kv=" << plan.kv_bytes << " graph=" << plan.graph_bytes << " repack=" << plan.repack_bytes
+                          << " recurrent=" << plan.recurrent_bytes << " prefix_snapshot=" << plan.prefix_snapshot_bytes
+                          << " mtp_checkpoint=" << plan.mtp_checkpoint_bytes << " allocator=" << plan.allocator_bytes << std::endl;
+                return config;
+            }
+            if (chunk == 1 || unchunked_embedding) break;
         }
         if (explicit_concurrency) break;
     }
-    const auto minimum = plan_for(explicit_concurrency ? concurrency : 1);
     throw densecore::OutOfMemoryException("resource plan required_bytes=" + std::to_string(minimum.RequiredBytes()) +
                " available_bytes=" + std::to_string(minimum.available_bytes) + " context=" + std::to_string(config.max_seq_len) +
                " concurrency=" + std::to_string(explicit_concurrency ? concurrency : 1));
