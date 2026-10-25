@@ -14,7 +14,7 @@ public:
         if (static_cast<uint64_t>(model.hparams.n_layer) > static_cast<uint64_t>(std::numeric_limits<int>::max()))
             throw std::invalid_argument("MTP checkpoint layer count out of range");
         size_t count = 0;
-        for (int layer = 0; layer < model.hparams.n_layer; ++layer) if (model.IsSSMLayer(layer)) ++count;
+        for (int layer = 0; layer < model.hparams.n_layer; ++layer) if (model.IsHybridSSMLayer(layer)) ++count;
         return count;
     }
     static size_t RequiredBytes(const TransformerModel& model, size_t draft_max) {
