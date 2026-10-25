@@ -47,7 +47,7 @@ RUN mkdir -p core/src core/tests && \
              /^[[:space:]]*set\(TEST_SOURCES$/ { in_tests=1; next } \
              in_tests && /^[[:space:]]*\)/ { in_tests=0; next } \
              in_sources || in_tests { print $1 }' core/CMakeLists.txt; \
-        printf '%s\n' src/tools/quantize.cpp; \
+        printf '%s\n' src/tools/quantize.cpp src/decision/laya.cpp; \
     } | \
     sed -e 's/#.*$//' \
         -e 's/^[[:space:]]*//' \
