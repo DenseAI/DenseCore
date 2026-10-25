@@ -1726,3 +1726,77 @@ TEST(SamplingRawGreedyDiagnostic, WatchOnlyKeepsTieAndAllNonfiniteFallbackIdenti
         EXPECT_NE(RawGreedyWatchLine(text, 0).find(nonfinite ? "effective=0" : "effective=1"), std::string::npos);
     }
 }
+
+
+namespace {
+std::vector<double> AnalyticSamplerDistribution(const std::vector<float>& values, const SamplingParams& params) {
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    if (!ctx) throw std::runtime_error("analytic sampler fixture allocation failed");
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, static_cast<int64_t>(values.size()), 1);
+    std::copy(values.begin(), values.end(), static_cast<float*>(logits->data));
+    return BuildSamplingDistribution(logits, 0, params);
+}
+void ExpectAnalyticDistribution(const std::vector<double>& actual, const std::vector<double>& expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 1e-7) << "token=" << i;
+}
+std::vector<float> FourProbabilityLogits() {
+    return {std::log(.4f), std::log(.3f), std::log(.2f), std::log(.1f)};
+}
+}
+
+TEST(SamplingComposedFilters, TopKConditionsNucleusOnSurvivingMass) {
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_k = 2;
+    params.top_p = .5f;
+    // Top-k leaves .4+.3=.7; nucleus cutoff is .35, so .4 alone suffices.
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {1,0,0,0});
+}
+
+TEST(SamplingComposedFilters, MinPConditionsNucleusOnSurvivingMass) {
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_k = 4;
+    params.min_p = .6f;
+    params.top_p = .5f;
+    // Min-p threshold .24 removes .2/.1; nucleus uses the remaining .7.
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {1,0,0,0});
+}
+
+TEST(SamplingComposedFilters, FiltersComposeAfterMaskPenaltyRangeAndNonfiniteExclusion) {
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_k = 3;
+    params.min_p = .6f;
+    params.top_p = .5f;
+    params.action_token_start = 1;
+    params.action_token_count = 6;
+    params.frequency_penalty = std::log(2.f);
+    std::vector<int> history{1}, allowed{1,2,3,4,5,6}, blocked{5};
+    params.token_history = &history;
+    params.allowed_token_ids = &allowed;
+    params.disallowed_token_ids = &blocked;
+    // Penalty changes .8 to .4. Valid masses then .4/.3/.2/.1, top-k
+    // leaves .9, min-p leaves .7, and nucleus .5 leaves only token1.
+    const std::vector<float> logits = {100, std::log(.8f), std::log(.3f), std::log(.2f), std::log(.1f),
+                                       20, NAN, INFINITY};
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(logits, params), {0,1,0,0,0,0,0,0});
+}
+
+TEST(SamplingComposedFilters, SingletonFiltersKeepTheirAnalyticDistributions) {
+    SamplingParams params;
+    params.temperature = 1;
+    params.top_k = 4;
+    params.top_p = 1;
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {.4,.3,.2,.1});
+    params.top_k = 2;
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {4./7,3./7,0,0});
+    params.top_k = 4;
+    params.top_p = .5f;
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {4./7,3./7,0,0});
+    params.top_p = 1;
+    params.min_p = .6f;
+    ExpectAnalyticDistribution(AnalyticSamplerDistribution(FourProbabilityLogits(), params), {4./7,3./7,0,0});
+}
