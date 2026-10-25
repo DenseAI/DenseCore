@@ -1447,6 +1447,13 @@ void CallbackLoop(EngineState* state) {
                           << " (finished=" << event.finished << ")" << std::endl;
             }
 
+            if (event.prefix_before_terminal) {
+                DispatchStopTerminalBundle(event.token_str, event.callback, event.callback_ex,
+                    event.token_result_callback, event.user_data, event.completion_callback,
+                    event.generated_tokens, event.finish_reason);
+                continue;
+            }
+
             // Execute callback OUTSIDE the lock (GIL acquisition happens here)
             // This is the ONLY place callbacks should be invoked!
             try {

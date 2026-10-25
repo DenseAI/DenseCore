@@ -12,6 +12,7 @@
 #include "llm/speculative/reference_session.h"
 #include "runtime/speculation_config.h"
 #include "runtime/engine_internal.h"
+#include "runtime/worker_internal.h"
 #include "ggml-cpu.h"
 #include <random>
 #include <stdexcept>
@@ -783,3 +784,69 @@ TEST(MtpFairSchedule, ContinuousOneTokenPrefillsStillAllowBoundedLongDecodeProgr
     EXPECT_EQ(manager.GetFreeBlockCount(),32);
 }
 }  // namespace
+
+TEST(StopOutputIntegration, AcceptedMtpStopTrimsTargetStateBeforeUncommittedBonus) {
+    using namespace densecore::llm::speculative;
+    BlockManager manager(32, BLOCK_SIZE);
+    densecore::SchedulerConfig config;
+    config.max_num_seqs = config.max_prefill_seqs = 1;
+    config.max_num_batched_tokens = 64;
+    densecore::Scheduler scheduler(&manager, config);
+    const int sequence = scheduler.AddRequest(77, 15, 64);
+    const auto prompt = scheduler.Schedule();
+    auto blocks = prompt.new_block_allocations.at(0).second;
+    scheduler.OnPrefillChunkComplete(sequence, 15, true);
+    ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(sequence, 18, &blocks));
+    scheduler.OnDecodeStepComplete(sequence, 3);
+    int n_past = 18;
+    manager.SetFilledSlots(blocks.front(), BLOCK_SIZE);
+    manager.SetFilledSlots(blocks.back(), 2);
+    RecurrentCheckpoints::States states(1);
+    RecurrentCheckpoints checkpoints(2);
+    for (size_t position = 0; position < 3; ++position) {
+        states[0].conv_state = {static_cast<float>(10 + position)};
+        states[0].ssm_state = {static_cast<float>(20 + position)};
+        checkpoints.Capture(position, states);
+    }
+    std::mt19937 accept_rng(1), target_rng(2);
+    const auto verified = Verify({0, 1}, {{1, 0, 0}, {0, 1, 0}},
+                                {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, true, accept_rng, target_rng);
+    ASSERT_EQ(verified.accepted_draft_tokens, 2u);
+    ASSERT_EQ(verified.tokens, (std::vector<int>{0, 1, 2}));
+    struct Capture { std::string text; std::vector<int> ids; } capture;
+    Request req;
+    req.Reset();
+    req.stop_sequences = {"<END>"}; req.stop_buffer_max = 5;
+    req.user_data = &capture;
+    req.callback_ex = [](const char* text, int length, int id, int finished, void* data) {
+        auto& output = *static_cast<Capture*>(data);
+        if (!finished) {
+            output.text.append(text, length);
+            if (id >= 0) output.ids.push_back(id);
+        }
+    };
+    EngineState engine;
+    engine.status = EngineStatus::STOPPED;
+    const std::vector<std::string> pieces{"Paris", "<END>", "must not be committed"};
+    size_t emitted = 0;
+    for (int token : verified.tokens) {
+        std::string piece = pieces[token];
+        ++req.generated_count;
+        ++emitted;
+        PublishStopFilteredToken(&engine, &req, piece, token, true, std::chrono::steady_clock::now());
+        if (req.finished) break;
+    }
+    ASSERT_EQ(emitted, 2u);
+    ASSERT_TRUE(RestoreAcceptanceBoundary(scheduler, sequence, 15 + static_cast<int>(emitted),
+                                          blocks, n_past, checkpoints, emitted - 1, states));
+    EXPECT_EQ(capture.text, "Paris");
+    EXPECT_EQ(capture.ids, (std::vector<int>{0, 1}));
+    EXPECT_EQ(req.generated_count, 2);
+    EXPECT_EQ(n_past, 17);
+    EXPECT_EQ(manager.GetFilledSlots(blocks.back()), 1);
+    EXPECT_EQ(states[0].conv_state[0], 11);
+    EXPECT_EQ(states[0].ssm_state[0], 21);
+    scheduler.RemoveRequest(sequence);
+    manager.Free(blocks);
+    EXPECT_EQ(manager.GetFreeBlockCount(), 32);
+}

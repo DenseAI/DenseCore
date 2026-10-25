@@ -187,7 +187,7 @@ DENSECORE_API const char* DenseCoreGetLastError(void);
  * token_id for accurate decoding.
  */
 typedef struct {
-    int token_id;      ///< Token ID for external tokenizer decoding
+    int token_id;      ///< Token ID for external decoding; -1 for text-only flush/terminal chunks
     const char* text;  ///< Pre-decoded text (may be empty if using external tokenizer)
     int is_finished;   ///< 1 if generation is complete, 0 otherwise
 } TokenResult;

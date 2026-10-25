@@ -131,12 +131,14 @@ void PushResultEvent(EngineState* state, int request_id, const std::string& toke
                      bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                      void* user_data, GenerationCompletionCallback completion_callback = nullptr,
                      int generated_tokens = 0, DenseCoreGenerationFinishReason finish_reason = DENSECORE_GENERATION_STOP,
-                     std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {});
+                     std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {},
+                     bool prefix_before_terminal = false, bool* delivery_error = nullptr);
 void PushEmbeddingResultEvent(EngineState* state, int request_id, std::vector<float> embedding_data,
                               int status, EmbeddingCallback cb, void* user_data,
                               std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease = {});
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
-                       bool error, bool use_direct_callback);
+                       bool error, bool use_direct_callback, bool prefix_before_terminal = false,
+                       bool* delivery_error = nullptr);
 
 // Metrics tracking with thread-safe operations
 struct InternalMetrics {
@@ -218,6 +220,7 @@ struct ResultEvent {
     int token_id = -1;
     bool finished;
     bool error;
+    bool prefix_before_terminal = false; // token_str is one text-only flush, then an empty terminal.
 
     // Callback pointers (copied from Request at event creation time)
     TokenCallback callback;
@@ -280,6 +283,29 @@ struct OwnedGraphInput {
     int ndim = 0;
     std::vector<uint8_t> bytes;
 };
+
+// A bundled suffix is one queue item, so terminal allocation fallback cannot
+// overtake it. This does not add a sampled token or change native usage.
+inline bool DispatchStopTerminalBundle(const std::string& prefix, TokenCallback callback,
+    TokenCallbackEx callback_ex, TokenResultCallback structured, void* user_data,
+    GenerationCompletionCallback completion, int generated, DenseCoreGenerationFinishReason reason) noexcept {
+    auto invoke = [&](const char* text, int size, bool finished) {
+        if (callback_ex) callback_ex(text, size, -1, finished ? 1 : 0, user_data);
+        else if (callback) callback(text, finished ? 1 : 0, user_data);
+        else if (structured) {
+            TokenResult result{-1, text, finished ? 1 : 0};
+            structured(&result, user_data);
+        }
+    };
+    bool failed = false;
+    try { invoke(prefix.c_str(), static_cast<int>(prefix.size()), false); } catch (...) { failed = true; }
+    if (failed) reason = DENSECORE_GENERATION_ERROR;
+    if (completion) {
+        try { completion(generated, reason, user_data); } catch (...) { failed = true; }
+    }
+    try { invoke("", 0, true); } catch (...) { failed = true; }
+    return failed;
+}
 
 /**
  * Request structure representing a single inference request.
@@ -1418,6 +1444,7 @@ struct Request {
 };
 
 void FinalizeDecodeSilentFinishReason(Request* req);
+void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 
 inline bool CompleteGraphRequest(Request* req, const DenseCoreTensorOutput* outputs, int num_outputs) noexcept {
     if (!req || !req->is_graph_execution) return false;
@@ -1441,7 +1468,8 @@ inline bool CompleteGraphRequest(Request* req, const DenseCoreTensorOutput* outp
 }
 
 inline bool FinalizeGenerationRequestOnce(EngineState* state, Request* req, const std::string& terminal_text,
-                                          int token_id, bool error, bool use_direct_callback) {
+                                          int token_id, bool error, bool use_direct_callback,
+                                          bool* terminal_error = nullptr) {
     if (!state || !req || req->is_graph_execution || req->is_embedding) {
         return false;
     }
@@ -1452,9 +1480,31 @@ inline bool FinalizeGenerationRequestOnce(EngineState* state, Request* req, cons
         return false;
     }
 
+    // Active publication/holdback is worker-owned: CancelRequest only marks an
+    // atomic flag, and EngineState::Shutdown joins the worker before finalizing
+    // remaining requests. The CAS then excludes duplicate terminal publishers.
     req->finished = true;
+    const bool flush = !error && !req->stop_buffer.empty() &&
+        req->decode_finish_cause != DecodeFinishCause::StopSequence &&
+        req->decode_finish_cause != DecodeFinishCause::RequestCanceled;
+    bool delivery_failed = false;
     FinalizeDecodeSilentFinishReason(req);
-    EmitRequestResult(state, req, terminal_text, token_id, true, error, use_direct_callback);
+    try {
+        EmitRequestResult(state, req, flush ? req->stop_buffer : terminal_text, token_id, true, error,
+                          use_direct_callback, flush, &delivery_failed);
+    } catch (...) {
+        delivery_failed = true;
+    }
+    if (flush && !delivery_failed) {
+        NoteVisibleEmitProgress(req, std::chrono::steady_clock::now(), -1);
+        FinalizeDecodeSilentFinishReason(req);
+    }
+    req->stop_buffer.clear();
+    if (delivery_failed) {
+        error = true;
+        req->decode_finish_cause = DecodeFinishCause::Unknown;
+    }
+    if (terminal_error) *terminal_error = error;
     {
         std::lock_guard<std::mutex> lock(req->mu);
         req->cv.notify_all();
@@ -2665,7 +2715,8 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
                             bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                             void* user_data, GenerationCompletionCallback completion_callback,
                             int generated_tokens, DenseCoreGenerationFinishReason finish_reason,
-                            std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease) {
+                            std::shared_ptr<densecore::runtime::ResourceAllocationLease> admission_lease,
+                            bool prefix_before_terminal, bool* delivery_error) {
     try {
         ResultEvent event;
         event.admission_payload_lease = admission_lease;
@@ -2677,6 +2728,7 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
         event.token_id = token_id;
         event.finished = finished;
         event.error = error;
+        event.prefix_before_terminal = prefix_before_terminal;
         event.callback = cb;
         event.callback_ex = cb_ex;
         event.token_result_callback = token_result_cb;
@@ -2697,6 +2749,12 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
         // A terminal event cannot be lost after its request CAS commits. Queue
         // allocation failure falls back to direct delivery without allocating.
         // Callbacks run outside result_mu, and each is attempted only once.
+        if (prefix_before_terminal) {
+            const bool failed = DispatchStopTerminalBundle(token, cb, cb_ex, token_result_cb, user_data,
+                                                           completion_callback, generated_tokens, finish_reason);
+            if (delivery_error) *delivery_error = failed;
+            return;
+        }
         if (completion_callback) {
             try { completion_callback(generated_tokens, finish_reason, user_data); } catch (...) {}
         }

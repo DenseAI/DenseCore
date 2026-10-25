@@ -4,6 +4,10 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <future>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1452,4 +1456,328 @@ TEST(WorkerTokenCommitTiming, CountsFirstEosOrHiddenTokenWithoutVisibleOutput) {
     EXPECT_EQ(metrics.ttft_samples.front(), 25000);
     EXPECT_EQ(req.visible_emitted_token_count, 0u);
     EXPECT_EQ(req.first_token_time, committed);
+}
+
+namespace {
+struct StopOutputCapture {
+    std::string visible;
+    std::vector<int> ids;
+    int terminals = 0;
+    int completions = 0;
+    int generated = -1;
+    int reason = -1;
+    int flushes = 0;
+    bool throw_flush = false;
+    std::vector<std::string> order;
+};
+void StopLegacy(const char* text, int finished, void* data) {
+    auto& capture = *static_cast<StopOutputCapture*>(data);
+    if (finished) ++capture.terminals;
+    else capture.visible += text ? text : "";
+}
+void StopEx(const char* text, int size, int id, int finished, void* data) {
+    auto& capture = *static_cast<StopOutputCapture*>(data);
+    if (finished) { ++capture.terminals; capture.order.push_back("terminal"); return; }
+    if (id >= 0) capture.ids.push_back(id);
+    else {
+        capture.order.push_back("flush");
+        ++capture.flushes;
+        if (capture.throw_flush) throw std::runtime_error("flush callback failed");
+    }
+    capture.visible.append(text, static_cast<size_t>(size));
+}
+void StopStructured(const TokenResult* result, void* data) {
+    StopEx(result->text, result->text ? static_cast<int>(std::strlen(result->text)) : 0,
+           result->token_id, result->is_finished, data);
+}
+void StopCompletion(int count, int reason, void* data) {
+    auto& capture = *static_cast<StopOutputCapture*>(data);
+    ++capture.completions;
+    capture.order.push_back("metadata");
+    capture.generated = count;
+    capture.reason = reason;
+}
+void InitStopRequest(Request& req, StopOutputCapture& capture, int mode) {
+    req.Reset();
+    req.stop_sequences = {"<END>"};
+    req.stop_buffer_max = 5;
+    req.stop_buffer.reserve(req.stop_buffer_max);
+    req.user_data = &capture;
+    if (mode == 0) req.callback = StopLegacy;
+    else if (mode == 1) req.callback_ex = StopEx;
+    else req.token_result_callback = StopStructured;
+}
+void DrainStopEvents(EngineState& state) {
+    state.result_producers_done.store(true);
+    CallbackLoop(&state);
+}
+}
+
+TEST(StopOutputIntegration, StreamAndCollectedOutputExcludeMarkerAndPreserveRealIdsAndNativeUsage) {
+    for (bool direct : {false, true}) for (int mode = 0; mode < 3; ++mode) {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        state.generation_completion_callback.store(StopCompletion);
+        StopOutputCapture capture;
+        Request req;
+        InitStopRequest(req, capture, mode);
+        std::string first = "Paris<EN", second = "D>ignored";
+        ++req.generated_count;
+        EXPECT_FALSE(PublishStopFilteredToken(&state, &req, first, 10, direct, std::chrono::steady_clock::now()));
+        ++req.generated_count;
+        EXPECT_TRUE(PublishStopFilteredToken(&state, &req, second, 11, direct, std::chrono::steady_clock::now()));
+        EXPECT_TRUE(req.finished);
+        EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::StopSequence);
+        EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, direct));
+        EXPECT_FALSE(FinalizeGenerationRequestOnce(&state, &req, "duplicate", -1, false, direct));
+        if (!direct) DrainStopEvents(state);
+        EXPECT_EQ(capture.visible, "Paris");
+        EXPECT_EQ(capture.terminals, 1);
+        EXPECT_EQ(capture.completions, 1);
+        EXPECT_EQ(capture.generated, 2);
+        EXPECT_EQ(capture.reason, DENSECORE_GENERATION_STOP);
+        EXPECT_EQ(capture.flushes, 0);
+        if (mode != 0) EXPECT_EQ(capture.ids, (std::vector<int>{10, 11}));
+    }
+}
+
+TEST(StopOutputIntegration, EosAndLengthFlushIncompletePrefixAsNonTokenBeforeOneTerminal) {
+    for (auto cause : {DecodeFinishCause::StopToken, DecodeFinishCause::MaxTokens})
+        for (bool direct : {false, true}) for (int mode = 0; mode < 3; ++mode) {
+            EngineState state;
+            state.status = EngineStatus::STOPPED;
+            state.generation_completion_callback.store(StopCompletion);
+            StopOutputCapture capture;
+            Request req;
+            InitStopRequest(req, capture, mode);
+            std::string piece = "Hi<EN";
+            req.generated_count = 1;
+            EXPECT_FALSE(PublishStopFilteredToken(&state, &req, piece, 42, direct, std::chrono::steady_clock::now()));
+            req.decode_finish_cause = cause;
+            EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, direct));
+            EXPECT_FALSE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, direct));
+            if (!direct) DrainStopEvents(state);
+            EXPECT_EQ(capture.visible, "Hi<EN");
+            EXPECT_EQ(capture.generated, 1);
+            EXPECT_EQ(capture.completions, 1);
+            EXPECT_EQ(capture.terminals, 1);
+            EXPECT_TRUE(req.stop_buffer.empty());
+            EXPECT_EQ(capture.reason, cause == DecodeFinishCause::MaxTokens ? DENSECORE_GENERATION_LENGTH
+                                                                           : DENSECORE_GENERATION_STOP);
+            if (mode != 0) {
+                EXPECT_EQ(capture.ids, (std::vector<int>{42}));
+                EXPECT_EQ(capture.flushes, 1);
+                EXPECT_EQ(capture.order, (std::vector<std::string>{"flush", "metadata", "terminal"}));
+            }
+        }
+}
+
+TEST(StopOutputIntegration, FullyWithheldStructuredAndExIdsAreNotLostOrDoubleCountedByFlush) {
+    for (int mode : {1, 2}) {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        state.generation_completion_callback.store(StopCompletion);
+        StopOutputCapture capture;
+        Request req;
+        InitStopRequest(req, capture, mode);
+        for (int id = 0; id < 3; ++id) {
+            std::string piece(1, "<EN"[id]);
+            ++req.generated_count;
+            EXPECT_FALSE(PublishStopFilteredToken(&state, &req, piece, id, true, std::chrono::steady_clock::now()));
+        }
+        EXPECT_TRUE(capture.visible.empty());
+        req.decode_finish_cause = DecodeFinishCause::StopToken;
+        ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, true));
+        EXPECT_EQ(capture.visible, "<EN");
+        EXPECT_EQ(capture.ids, (std::vector<int>{0, 1, 2}));
+        EXPECT_EQ(capture.generated, 3);
+        EXPECT_EQ(capture.flushes, 1);
+    }
+}
+
+TEST(StopOutputIntegration, CancelAndErrorDiscardHeldSuffixAndRequestReuseIsClean) {
+    for (auto cause : {DecodeFinishCause::RequestCanceled, DecodeFinishCause::OutOfMemory}) {
+        EngineState state;
+        state.status = EngineStatus::STOPPED;
+        StopOutputCapture capture;
+        Request req;
+        InitStopRequest(req, capture, 2);
+        std::string piece = "body<EN";
+        ++req.generated_count;
+        PublishStopFilteredToken(&state, &req, piece, 7, true, std::chrono::steady_clock::now());
+        req.decode_finish_cause = cause;
+        ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "error", -1, true, true));
+        EXPECT_EQ(capture.visible, "body");
+        EXPECT_TRUE(req.stop_buffer.empty());
+        req.Reset();
+        EXPECT_TRUE(req.stop_buffer.empty());
+        EXPECT_TRUE(req.stop_sequences.empty());
+        EXPECT_EQ(req.stop_buffer_max, 0u);
+    }
+}
+
+TEST(StopOutputIntegration, FlushCallbackExceptionStillDeliversOneErrorTerminalAndWakesWaiter) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    state.generation_completion_callback.store(StopCompletion);
+    StopOutputCapture capture;
+    capture.throw_flush = true;
+    Request req;
+    InitStopRequest(req, capture, 1);
+    req.stop_buffer = "<EN";
+    req.generated_count = 3;
+    req.decode_finish_cause = DecodeFinishCause::MaxTokens;
+    ASSERT_TRUE(FinalizeSuccessfulGenerationRequest(&state, &req, true));
+    EXPECT_EQ(state.metrics.failed_requests.load(), 1);
+    EXPECT_EQ(state.metrics.completed_requests.load(), 0);
+    EXPECT_EQ(req.decode_finish_cause, DecodeFinishCause::Unknown);
+    EXPECT_EQ(capture.terminals, 1);
+    EXPECT_EQ(capture.completions, 1);
+    EXPECT_EQ(capture.generated, 3);
+    EXPECT_EQ(capture.reason, DENSECORE_GENERATION_ERROR);
+    EXPECT_FALSE(FinalizeGenerationRequestOnce(&state, &req, "", -1, true, true));
+    EXPECT_TRUE(req.stop_buffer.empty());
+    EXPECT_TRUE(req.finished);
+}
+
+TEST(StopOutputIntegration, JsonGrammarSeesCommittedRawPieceBeforeOutputIsFiltered) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    StopOutputCapture capture;
+    Request req;
+    InitStopRequest(req, capture, 2);
+    req.stop_sequences = {"}"};
+    req.stop_buffer_max = 1;
+    req.json_mode = true;
+    req.grammar.enabled = true;
+    req.grammar.is_json_mode = true;
+    req.grammar.state = JSONState::EXPECT_OBJECT_START;
+    std::string raw = "{}";
+    req.grammar.UpdateState(raw); // Production worker keeps this before output filtering.
+    const auto committed_state = req.grammar.state;
+    ASSERT_TRUE(PublishStopFilteredToken(&state, &req, raw, 7, true, std::chrono::steady_clock::now()));
+    EXPECT_EQ(capture.visible, "{");
+    EXPECT_EQ(req.grammar.state, committed_state);
+    EXPECT_NE(req.grammar.state, JSONState::EXPECT_OBJECT_START);
+}
+
+TEST(StopOutputIntegration, TokenUtf8CollectorRetainsSplitBytesBeforeStopFilter) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    StopOutputCapture capture;
+    Request req;
+    InitStopRequest(req, capture, 2);
+    req.stop_sequences = {"é!"};
+    req.stop_buffer_max = 3;
+    for (const std::string& fragment : {std::string("caf\xc3"), std::string("\xa9"), std::string("!ignored")}) {
+        req.utf8_pending += fragment;
+        const size_t valid = Utf8ValidPrefixLength(req.utf8_pending);
+        std::string piece = req.utf8_pending.substr(0, valid);
+        req.utf8_pending.erase(0, valid);
+        ++req.generated_count;
+        if (PublishStopFilteredToken(&state, &req, piece, req.generated_count, true,
+                                     std::chrono::steady_clock::now())) break;
+    }
+    EXPECT_EQ(capture.visible, "caf");
+    EXPECT_EQ(capture.ids, (std::vector<int>{1, 2, 3}));
+    EXPECT_TRUE(req.utf8_pending.empty());
+    EXPECT_TRUE(req.finished);
+}
+
+TEST(StopOutputIntegration, TerminalAllocationFallbackKeepsFlushMetadataTerminalInOneOrderedDelivery) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    state.generation_completion_callback.store(StopCompletion);
+    StopOutputCapture capture;
+    Request req;
+    InitStopRequest(req, capture, 2);
+    req.stop_buffer = "<EN";
+    req.generated_count = 3;
+    req.decode_finish_cause = DecodeFinishCause::StopToken;
+    state.fail_result_publication_for_test.store(true);
+    ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, false));
+    EXPECT_EQ(capture.visible, "<EN");
+    EXPECT_EQ(capture.order, (std::vector<std::string>{"flush", "metadata", "terminal"}));
+    EXPECT_EQ(capture.generated, 3);
+    EXPECT_EQ(capture.reason, DENSECORE_GENERATION_STOP);
+    EXPECT_TRUE(state.result_queue.empty());
+    EXPECT_TRUE(req.stop_buffer.empty());
+}
+
+TEST(StopOutputIntegration, QueuedFlushThrowStillAttemptsMetadataAndTerminalOnce) {
+    EngineState state;
+    state.status = EngineStatus::STOPPED;
+    state.generation_completion_callback.store(StopCompletion);
+    StopOutputCapture capture;
+    capture.throw_flush = true;
+    Request req;
+    InitStopRequest(req, capture, 1);
+    req.stop_buffer = "<EN";
+    req.generated_count = 3;
+    req.decode_finish_cause = DecodeFinishCause::MaxTokens;
+    ASSERT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "", -1, false, false));
+    DrainStopEvents(state);
+    EXPECT_EQ(capture.order, (std::vector<std::string>{"flush", "metadata", "terminal"}));
+    EXPECT_EQ(capture.reason, DENSECORE_GENERATION_ERROR);
+    EXPECT_EQ(capture.terminals, 1);
+    EXPECT_EQ(capture.completions, 1);
+}
+
+TEST(StopOutputIntegration, BoundedIntentionalHoldbackDoesNotTriggerVisibleOutputWatchdog) {
+    Request req;
+    req.Reset();
+    const auto now = std::chrono::steady_clock::now();
+    req.last_sampled_token_time = now;
+    req.last_external_emit_time = now - std::chrono::hours(1);
+    req.decode_no_output_steps = UINT64_MAX;
+    req.stop_buffer = "possible stop prefix";
+    EXPECT_FALSE(HasDecodeVisibleProgressStalled(&req, now));
+    req.stop_buffer.clear();
+    EXPECT_TRUE(HasDecodeVisibleProgressStalled(&req, now));
+}
+
+TEST(StopOutputIntegration, CancelAndShutdownDoNotFinalizeOrMutateHoldbackBeforeWorkerExit) {
+    EngineState state;
+    state.status = EngineStatus::RUNNING;
+    StopOutputCapture capture;
+    Request req;
+    InitStopRequest(req, capture, 1);
+    req.id = 77;
+    state.active_requests.push_back(&req); // Fixture retains ownership, worker erases before shutdown recovery.
+    std::promise<void> ready, release;
+    auto ready_future = ready.get_future();
+    auto release_future = release.get_future();
+    state.worker_thread = std::thread([&] {
+        std::string piece = "body<EN";
+        req.generated_count = 1;
+        PublishStopFilteredToken(&state, &req, piece, 42, true, std::chrono::steady_clock::now());
+        ready.set_value();
+        release_future.wait();
+        req.decode_finish_cause = DecodeFinishCause::RequestCanceled;
+        FinalizeGenerationRequestOnce(&state, &req, "canceled", -1, true, true);
+        std::lock_guard<std::mutex> lock(state.active_mu);
+        state.active_requests.clear();
+    });
+    const bool started = ready_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(started);
+    if (started) {
+        EXPECT_EQ(CancelRequest(&state, req.id), 0);
+        EXPECT_TRUE(req.cancelled.load());
+        EXPECT_FALSE(req.generation_terminal_dispatched.load());
+        EXPECT_EQ(req.stop_buffer, "<EN");
+    }
+    std::thread shutdown([&] { state.Shutdown(std::chrono::steady_clock::now()); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (state.status != EngineStatus::STOPPED && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    if (started) {
+        EXPECT_FALSE(req.generation_terminal_dispatched.load());
+        EXPECT_EQ(req.stop_buffer, "<EN");
+    }
+    release.set_value();
+    shutdown.join();
+    EXPECT_EQ(capture.visible, "body");
+    EXPECT_EQ(capture.terminals, 1);
+    EXPECT_TRUE(req.stop_buffer.empty());
+    EXPECT_TRUE(state.active_requests.empty());
 }

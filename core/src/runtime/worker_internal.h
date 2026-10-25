@@ -147,6 +147,10 @@ bool ResolveSamplingLogitsColumnForRequest(int token_offset, int processed_count
                                            int n_past_after, int* out_last_token_idx, std::string* error = nullptr,
                                            int sequence_index = -1, int num_sequences = 0);
 void RecordFirstTokenCommit(Request* req, InternalMetrics* metrics, std::chrono::steady_clock::time_point now);
+// Configured-stop output only; raw grammar/sampling state is already committed.
+bool FinalizeSuccessfulGenerationRequest(EngineState* state, Request* req, bool direct);
+bool PublishStopFilteredToken(EngineState* state, Request* req, std::string& piece, int token_id,
+                              bool direct, std::chrono::steady_clock::time_point now);
 void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 void NoteSuppressedToken(Request* req);
 void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);

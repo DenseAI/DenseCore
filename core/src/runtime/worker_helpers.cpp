@@ -1,4 +1,5 @@
 #include "runtime/worker_internal.h"
+#include "runtime/stop_output.h"
 
 #include <algorithm>
 #include <array>
@@ -587,7 +588,7 @@ bool IsReasoningTagSuppressionEnabled() {
 }
 
 void EmitRequestResult(EngineState* state, Request* req, const std::string& token, int token_id, bool finished,
-                       bool error, bool use_direct_callback) {
+                       bool error, bool use_direct_callback, bool prefix_before_terminal, bool* delivery_error) {
     if (!req || (!req->callback && !req->callback_ex && !req->token_result_callback)) {
         return;
     }
@@ -598,6 +599,12 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
         : req->decode_finish_cause == DecodeFinishCause::MaxTokens ? DENSECORE_GENERATION_LENGTH
                                                                  : DENSECORE_GENERATION_STOP;
     if (use_direct_callback) {
+        if (prefix_before_terminal) {
+            const bool failed = DispatchStopTerminalBundle(token, req->callback, req->callback_ex,
+                req->token_result_callback, req->user_data, completion_callback, req->generated_count, finish_reason);
+            if (delivery_error) *delivery_error = failed;
+            return;
+        }
         if (completion_callback) {
             completion_callback(req->generated_count, finish_reason, req->user_data);
         }
@@ -622,7 +629,7 @@ void EmitRequestResult(EngineState* state, Request* req, const std::string& toke
 
     PushResultEvent(state, req->id, token, token_id, finished, error, req->callback, req->callback_ex,
                     req->token_result_callback, req->user_data, completion_callback, req->generated_count,
-                    finish_reason,req->admission_payload_lease);
+                    finish_reason,req->admission_payload_lease,prefix_before_terminal,delivery_error);
 }
 
 bool ShouldBypassSingleRequestFastPathForLongHybridSSM(const TransformerModel* model, const Request* req) {
@@ -1733,6 +1740,32 @@ const char* DecodeSilentFinishReasonName(DecodeSilentFinishReason reason) {
     case DecodeSilentFinishReason::None:
     default: return "none";
     }
+}
+
+bool FinalizeSuccessfulGenerationRequest(EngineState* state, Request* req, bool direct) {
+    if (!state || !req || req->is_graph_execution || req->is_embedding) return false;
+    bool terminal_error = false;
+    if (!FinalizeGenerationRequestOnce(state, req, "", -1, false, direct, &terminal_error)) return false;
+    if (terminal_error) state->metrics.failed_requests++;
+    else state->metrics.completed_requests++;
+    return true;
+}
+
+bool PublishStopFilteredToken(EngineState* state, Request* req, std::string& piece, int token_id,
+                              bool direct, std::chrono::steady_clock::time_point now) {
+    const bool had_piece = !piece.empty();
+    const bool matched = densecore::runtime::FilterStopOutput(req->stop_buffer, piece, req->stop_sequences);
+    if (matched) {
+        req->finished = true;
+        req->decode_finish_cause = DecodeFinishCause::StopSequence;
+    }
+    // Structured IDs remain one per sampled token. Ex keeps the ID of a piece
+    // that would previously have been visible, even if its text is now held.
+    if (!piece.empty() || req->token_result_callback || (req->callback_ex && had_piece)) {
+        EmitRequestResult(state, req, piece, token_id, false, false, direct);
+        if (!piece.empty()) NoteVisibleEmitProgress(req, now, token_id);
+    }
+    return matched;
 }
 
 void RecordFirstTokenCommit(Request* req, InternalMetrics* metrics, std::chrono::steady_clock::time_point now) {
@@ -2878,7 +2911,8 @@ void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
 }
 
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now) {
-    if (!req || req->finished || req->last_sampled_token_time == std::chrono::steady_clock::time_point()) {
+    if (!req || req->finished || !req->stop_buffer.empty() ||
+        req->last_sampled_token_time == std::chrono::steady_clock::time_point()) {
         return false;
     }
     const auto last_emit = (req->last_external_emit_time == std::chrono::steady_clock::time_point())

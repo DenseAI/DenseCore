@@ -655,6 +655,8 @@ void InitCommonRequest(EngineState* state, Request* req, int max_tokens, float t
         for (const auto& seq : req->stop_sequences) {
             req->stop_buffer_max = std::max(req->stop_buffer_max, seq.size());
         }
+        // Admission already reserves stop bytes x8; no growing full-piece buffer.
+        req->stop_buffer.reserve(req->stop_buffer_max);
     }
 
     // Initialize grammar constraint if JSON mode is enabled

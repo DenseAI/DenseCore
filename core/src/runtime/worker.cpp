@@ -1179,15 +1179,7 @@ void EngineLoop(EngineState* state) {
         };
         auto finalize_generation_success = [&](Request* req, bool use_direct_callback,
                                                const densecore::TransformerGraphExecutionPlan* /*graph_plan*/ = nullptr) {
-            if (!req || req->is_graph_execution || req->is_embedding) {
-                return false;
-            }
-            FinalizeDecodeSilentFinishReason(req);
-            if (!FinalizeGenerationRequestOnce(state, req, "", -1, false, use_direct_callback)) {
-                return false;
-            }
-            state->metrics.completed_requests++;
-            return true;
+            return FinalizeSuccessfulGenerationRequest(state, req, use_direct_callback);
         };
         static constexpr auto kEmptyScheduleLogEvery = std::chrono::seconds(1);
 
@@ -6408,6 +6400,10 @@ void EngineLoop(EngineState* state) {
                         req->grammar.UpdateState(token_str);
                     }
 
+                    if (req->stop_buffer_max > 0) {
+                        PublishStopFilteredToken(state, req, token_str, best_token, global_direct_callback,
+                                                 decode_sample_time);
+                    } else {
                     // =========================================================================
                     // TOKEN STREAMING VIA CALLBACK QUEUE (GIL-Free Hot Path)
                     // =========================================================================
@@ -6431,6 +6427,8 @@ void EngineLoop(EngineState* state) {
                                 NoteVisibleEmitProgress(req, decode_sample_time, best_token);
                             }
                         }
+                    }
+
                     }
 
                     state->metrics.total_tokens_generated++;
@@ -6460,7 +6458,8 @@ void EngineLoop(EngineState* state) {
 
                     // Ensure we have enough blocks for the NEXT token
                     int blocks_needed = (req->n_past + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                    while (!mtp_batched_verified && (int)req->block_table.size() < blocks_needed) {
+                    while (!mtp_batched_verified && req->decode_finish_cause != DecodeFinishCause::StopSequence &&
+                           (int)req->block_table.size() < blocks_needed) {
                         auto new_blocks = current_kv_cache->block_manager->Allocate(1);
                         if (new_blocks.empty()) {
                             std::cerr << "[DenseCore] OOM during generation for req " << req->id << std::endl;
@@ -6472,22 +6471,6 @@ void EngineLoop(EngineState* state) {
                             break;
                         }
                         req->block_table.push_back(new_blocks[0]);
-                    }
-
-                    // Check stop sequences (best-effort, suffix match)
-                    if (!token_str.empty() && !req->stop_sequences.empty() && req->stop_buffer_max > 0) {
-                        req->stop_buffer.append(token_str);
-                        if (req->stop_buffer.size() > req->stop_buffer_max) {
-                            req->stop_buffer.erase(0, req->stop_buffer.size() - req->stop_buffer_max);
-                        }
-                        for (const auto& seq : req->stop_sequences) {
-                            if (!seq.empty() && req->stop_buffer.size() >= seq.size() &&
-                                req->stop_buffer.compare(req->stop_buffer.size() - seq.size(), seq.size(), seq) == 0) {
-                                req->finished = true;
-                                req->decode_finish_cause = DecodeFinishCause::StopSequence;
-                                break;
-                            }
-                        }
                     }
 
                     // Check finish conditions
