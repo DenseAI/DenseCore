@@ -220,7 +220,11 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
     // still own disjoint output rows; the scheduler retains its physical batch.
     // Private userdata has no shared quant buffer/stamp, so another worker
     // cannot overwrite an activation row while this worker still consumes it.
-    const bool canonical_q4k = ud->gemma4_canonical_q4k_columns && weight_type == GGML_TYPE_Q4_K &&
+    const bool qwen35_dense_columns = ud->qwen35_dense_canonical_q4k_columns &&
+                                      input_contig && (!callback_batch || callback_batch->lora_map.empty()) &&
+                                      !ud->require_q4k_true_batched && !ud->qwen36_ssm_q8_repacked_batched &&
+                                      !ud->qwen36_ssm_q8_direct_batched && !ud->qwen38_q4k_8x8_weight;
+    const bool canonical_q4k = (ud->gemma4_canonical_q4k_columns || qwen35_dense_columns) && weight_type == GGML_TYPE_Q4_K &&
                                ud->input_quant_type == GGML_TYPE_Q8_K;
     const bool canonical_ple_f32 = ud->gemma4_canonical_ple_f32_columns && weight_type == GGML_TYPE_F32 &&
                                    ud->input_quant_type == GGML_TYPE_F32 && input_contig &&

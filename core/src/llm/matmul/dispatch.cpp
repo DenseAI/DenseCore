@@ -1240,8 +1240,33 @@ static bool IsGemma4PleF32Projection(const TransformerModel* model, const ggml_t
     return false;
 }
 
+// Provisional ordinary-dense Qwen0.8 experiment. DenseProjection alone is
+// insufficient because unknown names inherit that role; require actual model
+// tensor ownership and keep every recurrent/fused/MoE/LM-head path outside it.
+static bool IsQwen35OrdinaryDenseQ4KProjection(const TransformerModel* model, const ggml_tensor* weight,
+                                              const ggml_tensor* input, const SmartMatmulDispatchState& dispatch) {
+    if (!densecore::runtime::IsQwen35Point8B(model) || !weight || !input ||
+        input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) ||
+        weight->type != GGML_TYPE_Q4_K ||
+        dispatch.tensor_role != densecore::runtime::DenseCoreTensorRole::DenseProjection ||
+        dispatch.semantic_op != densecore::runtime::DenseCoreSemanticOp::Matmul ||
+        dispatch.hybrid_ssm_projection || IsHybridSSMQkvWeightName(weight->name) ||
+        model->output == weight || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[0] % QK_K != 0 ||
+        weight->nb[0] != ggml_type_size(GGML_TYPE_Q4_K)) return false;
+    for (size_t index = 0; index < model->layers.size(); ++index) {
+        const auto& layer = model->layers[index];
+        if (layer.Get(model_keys::kFfnGate) == weight || layer.Get(model_keys::kFfnUp) == weight ||
+            layer.Get(model_keys::kFfnDown) == weight) return true;
+        if (!model->IsHybridSSMLayer(static_cast<int>(index)) &&
+            (layer.Get(model_keys::kAttnQWeight) == weight || layer.Get(model_keys::kAttnKWeight) == weight ||
+             layer.Get(model_keys::kAttnVWeight) == weight || layer.Get(model_keys::kAttnOWeight) == weight)) return true;
+    }
+    return false;
+}
+
 static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const TransformerModel* model,
-                                                const ggml_tensor* weight, const SmartMatmulDispatchState& dispatch,
+                                                const ggml_tensor* weight, const ggml_tensor* input, const SmartMatmulDispatchState& dispatch,
                                                 const SmartMatmulPrefillProjectionPlan& prefill,
                                                 const SmartMatmulQ4KBatchedAdmissionPlan& q4k_admission,
                                                 bool gemma4_dense_prefill_native, bool gemma4_prefill_safe_batched) {
@@ -1273,6 +1298,10 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const T
         ShouldUseQwenHybridSSMQ8RepackedBatched(prefill.qwen_hybrid_ssm_q8_prefill, dispatch.m);
     ud->qwen36_ssm_q8_direct_batched =
         ShouldUseQwenHybridSSMQ8DirectBatched(prefill.qwen_hybrid_ssm_q8_prefill, dispatch.m);
+    ud->qwen35_dense_canonical_q4k_columns = IsQwen35OrdinaryDenseQ4KProjection(model, weight, input, dispatch) &&
+                                               !ud->require_q4k_true_batched &&
+                                               !ud->qwen36_ssm_q8_repacked_batched &&
+                                               !ud->qwen36_ssm_q8_direct_batched;
     // Graph construction can classify a batched projection as decode-shaped
     // even though the callback executes during prefill. Prepare the immutable
     // model-owned alias from the batch shape; the callback still gates use on
@@ -1633,7 +1662,7 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
         // corrupts Gemma4 logits.
         const bool gemma4_prefill_safe_batched =
             ShouldUseGemma4PrefillSafeBatched(model, dispatch_state, gemma4_native_plan.dense_prefill_allowed);
-        ConfigureSmartMatmulBatchedUserData(ud, model, weight, dispatch_state, prefill_projection_plan,
+        ConfigureSmartMatmulBatchedUserData(ud, model, weight, input, dispatch_state, prefill_projection_plan,
                                             q4k_admission_plan, gemma4_native_plan.dense_prefill_allowed,
                                             gemma4_prefill_safe_batched);
         if (gemma4_native_plan.dense_prefill_allowed) {
@@ -1687,6 +1716,12 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 namespace densecore::testing {
 bool IsGemma4PleF32ProjectionForTest(const TransformerModel* model, const ggml_tensor* weight) {
     return ::IsGemma4PleF32Projection(model, weight);
+}
+bool IsQwen35OrdinaryDenseQ4KProjectionForTest(const TransformerModel* model, const ggml_tensor* weight,
+                                             const ggml_tensor* input) {
+    const auto dispatch = ResolveSmartMatmulDispatchState(model, weight, input, weight,
+        InferenceExecutionPhase::Decode, false, false);
+    return ::IsQwen35OrdinaryDenseQ4KProjection(model, weight, input, dispatch);
 }
 bool ShouldUseGemma4PrefillSafeBatchedForTest(bool is_gemma4, bool prefill_phase, int m, bool dense_prefill_allowed) {
     TransformerModel model{};

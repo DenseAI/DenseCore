@@ -69,6 +69,7 @@ struct GemvBatchedUserData {
     bool disable_quant_nrc_fast = false;
     bool gemma4_canonical_q4k_columns = false;
     bool gemma4_canonical_ple_f32_columns = false;
+    bool qwen35_dense_canonical_q4k_columns = false;
     bool gemma4_dense_prefill_native = false;
     bool gemma4_prefill_safe_batched = false;
     bool lfm2_q8_repacked_batched = false;

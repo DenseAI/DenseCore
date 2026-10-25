@@ -1401,6 +1401,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_activation_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_image_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_sampling_range.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_qwen35_canonical_matmul.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_speculative_verification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_nextn_moe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_mtp_qualification.cpp
