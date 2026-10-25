@@ -168,10 +168,12 @@ the sum of active requests and native pending requests; reducing
 `DENSECORE_MAX_NUM_SEQS` bounds requests holding execution state, including KV
 and hybrid recurrent state. Requests waiting for an execution slot remain in
 the native pending queue without recurrent state; cancellation can bypass a
-full execution budget. Pending request objects and their prompt payloads still
-consume memory, and the native pending queue currently has no independent
-count or byte cap. Use bounded client concurrency and request deadlines when
-controlling that memory. A configured sequence bound of eight does not prove
+full execution budget. Native admission now reserves request metadata, prompt
+payloads and buffered output against a partition of the existing allocator
+budget before copying inputs. Exhaustion returns an immediate native
+out-of-memory status; accepted requests retain their charge through pool and
+callback lifetimes. See [resource admission](RESOURCE_ADMISSION.md) for bounds
+and adapter limitations. A configured sequence bound of eight does not prove
 that a physical batch of eight was executed.
 
 Do not hard-code a universal KV or context budget. Model size, quantization,
