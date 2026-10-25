@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -1318,6 +1319,8 @@ struct Gemma4RepackStagingProbe {
     size_t live = 0;
     size_t peak = 0;
     int fail_after = -1;
+    int fail_publish_after = -1;
+    size_t available_requant_override = SIZE_MAX;
 };
 thread_local Gemma4RepackStagingProbe* gemma4_repack_staging_probe = nullptr;
 template<class T> struct Gemma4StagingAllocator {
@@ -1349,6 +1352,25 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         return;
     }
 
+    // The immutable loader prepares Gemma aliases once. Do not rebuild an
+    // already published, backend-owned preparation in its existing context.
+    if (auto* context = model->prepared_weights.ctx_cpu_repack) {
+        const auto owned = [&](const ggml_tensor* alias) {
+            if (!alias || !alias->data || !alias->buffer ||
+                std::find(model->prepared_weights.cpu_repack_buffers.begin(),
+                          model->prepared_weights.cpu_repack_buffers.end(),alias->buffer) ==
+                    model->prepared_weights.cpu_repack_buffers.end()) return false;
+            for (auto* tensor = ggml_get_first_tensor(context); tensor; tensor = ggml_get_next_tensor(context,tensor))
+                if (tensor == alias) return true;
+            return false;
+        };
+        for (const auto& layer : model->layers)
+            if (owned(layer.Get("attn_qkv.cpu_repack_fused")) || owned(layer.Get("ffn_gate_up.cpu_repack_fused"))) return;
+        for (const auto& entry : model->prepared_weights.cpu_repack_aliases)
+            if (owned(entry.second)) return;
+        throw std::logic_error("Gemma4 CPU_REPACK context has no owned published preparation; refusing incomplete retry");
+    }
+
     const CpuRepackBufferTypes repack_bufts =
         FindCpuRepackBufferTypes(model->cpu_backend ? model->cpu_backend : model->backend);
     ggml_backend_buffer_type_t primary_repack_buft = repack_bufts.cpu_repack;
@@ -1364,18 +1386,65 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     struct PendingAlias {
         ggml_tensor* source = nullptr;
         ggml_tensor* alias = nullptr;
-        Gemma4StagingVector<uint8_t> bytes;
+        bool requant_q8 = false;
         bool use_kleidiai = false;
     };
     struct PendingFusedAlias {
         TransformerLayer* layer = nullptr;
         ggml_tensor* alias = nullptr;
         std::string key;
-        Gemma4StagingVector<uint8_t> bytes;
+        std::array<ggml_tensor*,3> sources{};
+        ggml_tensor* previous = nullptr;
+        bool had_key = false;
+        bool ready = false;
         bool use_kleidiai = false;
     };
     std::vector<PendingAlias> pending;
     std::vector<PendingFusedAlias> pending_fused;
+    // Only resources created by this preparation are rolled back. Raw model
+    // weights and any aliases prepared by an earlier call retain ownership.
+    struct Rollback {
+        TransformerModel* model;
+        std::vector<PendingAlias>& pending;
+        std::vector<PendingFusedAlias>& fused;
+        size_t buffers, hosts;
+        ggml_context* cpu_context;
+        ggml_context* kleidiai_context;
+        bool committed = false;
+        ~Rollback() {
+            if (committed) return;
+            auto& weights = model->prepared_weights;
+            for (auto& item : fused) {
+                if (item.layer && item.layer->Get(item.key) == item.alias) {
+                    if (item.had_key) item.layer->tensors.find(item.key)->second = item.previous;
+                    else item.layer->tensors.erase(item.key);
+                }
+            }
+            for (auto& item : pending) {
+                auto found = weights.cpu_repack_aliases.find(item.source);
+                if (found != weights.cpu_repack_aliases.end() && found->second == item.alias)
+                    EraseCpuRepackAlias(model,item.source);
+            }
+            for (size_t i = buffers; i < weights.cpu_repack_buffers.size(); ++i)
+                if (weights.cpu_repack_buffers[i]) ggml_backend_buffer_free(weights.cpu_repack_buffers[i]);
+            weights.cpu_repack_buffers.resize(buffers);
+            if (weights.ctx_cpu_repack != cpu_context) {
+                ggml_free(weights.ctx_cpu_repack);
+                weights.ctx_cpu_repack = cpu_context;
+            }
+            if (weights.ctx_cpu_kleidiai != kleidiai_context) {
+                ggml_free(weights.ctx_cpu_kleidiai);
+                weights.ctx_cpu_kleidiai = kleidiai_context;
+            }
+            for (size_t i = hosts; i < weights.host_buffers.size(); ++i) {
+                auto& buffer = weights.host_buffers[i];
+                densecore::NumaAllocator::Free(buffer.ptr,buffer.size,buffer.type);
+            }
+            weights.host_buffers.resize(hosts);
+        }
+    } rollback{model,pending,pending_fused,model->prepared_weights.cpu_repack_buffers.size(),
+               model->prepared_weights.host_buffers.size(),model->prepared_weights.ctx_cpu_repack,
+               model->prepared_weights.ctx_cpu_kleidiai};
 
     const size_t tensor_slots = static_cast<size_t>(std::max<uint32_t>(1, model->hparams.n_layer)) * 16 + 96;
     auto init_repack_context = [&](ggml_context** ctx, const char* label) -> bool {
@@ -1452,7 +1521,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     }
 
     auto register_alias = [&](ggml_tensor* source, ggml_tensor* alias, const char* suffix,
-                              Gemma4StagingVector<uint8_t> bytes = {}) -> bool {
+                              bool requant_q8 = false) -> bool {
         if (!source || !alias) {
             return false;
         }
@@ -1461,20 +1530,16 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         }
         const std::string name = std::string(source->name[0] ? source->name : "gemma4_moe_weight") + suffix;
         ggml_set_name(alias, name.c_str());
-        if (bytes.empty() && ggml_nbytes(alias) != ggml_nbytes(source)) {
+        if (!requant_q8 && ggml_nbytes(alias) != ggml_nbytes(source)) {
             std::cerr << "[DenseCore] Warning: skipping Gemma4 CPU_REPACK alias for "
                       << (source->name[0] ? source->name : "<unnamed>") << " because packed byte size differs"
                       << std::endl;
             return false;
         }
-        if (!bytes.empty() && bytes.size() != ggml_nbytes(alias)) {
-            std::cerr << "[DenseCore] Warning: skipping Gemma4 CPU_REPACK alias for "
-                      << (source->name[0] ? source->name : "<unnamed>")
-                      << " because converted byte size does not match alias" << std::endl;
-            return false;
-        }
+        // Record before publishing maps so exception rollback can find a
+        // partially registered alias without allocating during cleanup.
+        pending.push_back({source, alias, requant_q8, use_kleidiai_for_type(alias->type)});
         RegisterCpuRepackAlias(model, source, alias);
-        pending.push_back({source, alias, std::move(bytes), use_kleidiai_for_type(alias->type)});
         return true;
     };
 
@@ -1525,7 +1590,11 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         return register_alias(source, alias, suffix);
     };
 
-    const size_t available_requant_bytes = ReadMemAvailableBytes();
+    size_t available_requant_bytes = ReadMemAvailableBytes();
+#ifdef DENSECORE_TEST_BUILD
+    if (gemma4_repack_staging_probe && gemma4_repack_staging_probe->available_requant_override != SIZE_MAX)
+        available_requant_bytes = gemma4_repack_staging_probe->available_requant_override;
+#endif
     const size_t q5_down_requant_bytes = EstimateGemma4Q5DownRequantBytes(model);
     const bool auto_requant_q5_1_down_to_q8_0 =
         available_requant_bytes > 0 &&
@@ -1558,22 +1627,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         if (!alias) {
             return false;
         }
-        Gemma4StagingVector<uint8_t> converted(ggml_nbytes(alias));
-        Gemma4StagingVector<float> row(static_cast<size_t>(ne0), 0.0f);
-        const size_t dst_row_size = ggml_row_size(GGML_TYPE_Q8_0, ne0);
-        for (int64_t expert = 0; expert < ne2; ++expert) {
-            for (int64_t row_idx = 0; row_idx < ne1; ++row_idx) {
-                const char* src_row = static_cast<const char*>(source->data) +
-                                      static_cast<size_t>(expert) * static_cast<size_t>(source->nb[2]) +
-                                      static_cast<size_t>(row_idx) * static_cast<size_t>(source->nb[1]);
-                uint8_t* dst_row = converted.data() + (static_cast<size_t>(expert) * static_cast<size_t>(ne1) +
-                                                       static_cast<size_t>(row_idx)) *
-                                                          dst_row_size;
-                src_traits->to_float(src_row, row.data(), ne0);
-                dst_traits->from_float(row.data(), dst_row, ne0);
-            }
-        }
-        return register_alias(source, alias, suffix, std::move(converted));
+        return register_alias(source, alias, suffix, true);
     };
 
     auto make_fused_pair_alias = [&](TransformerLayer& layer, uint32_t layer_idx, const char* output_key,
@@ -1610,20 +1664,10 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         fused.layer = &layer;
         fused.alias = alias;
         fused.key = output_key;
-        fused.bytes.resize(row_bytes * static_cast<size_t>(fused_rows));
+        fused.sources = {first,second,nullptr};
+        fused.previous = layer.Get(output_key);
+        fused.had_key = layer.tensors.find(output_key) != layer.tensors.end();
         fused.use_kleidiai = use_kleidiai_for_type(alias->type);
-
-        size_t dst_row = 0;
-        auto append_rows = [&](const ggml_tensor* src) {
-            const uint8_t* src_bytes = static_cast<const uint8_t*>(src->data);
-            for (int64_t r = 0; r < src->ne[1]; ++r) {
-                std::memcpy(fused.bytes.data() + dst_row * row_bytes,
-                            src_bytes + static_cast<size_t>(r) * static_cast<size_t>(src->nb[1]), row_bytes);
-                ++dst_row;
-            }
-        };
-        append_rows(first);
-        append_rows(second);
         pending_fused.push_back(std::move(fused));
         return true;
     };
@@ -1664,21 +1708,10 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         fused.layer = &layer;
         fused.alias = alias;
         fused.key = "attn_qkv.cpu_repack_fused";
-        fused.bytes.resize(row_bytes * static_cast<size_t>(fused_rows));
+        fused.sources = {q,k,v};
+        fused.previous = layer.Get(fused.key);
+        fused.had_key = layer.tensors.find(fused.key) != layer.tensors.end();
         fused.use_kleidiai = use_kleidiai_for_type(alias->type);
-
-        size_t dst_row = 0;
-        auto append_rows = [&](const ggml_tensor* src) {
-            const uint8_t* src_bytes = static_cast<const uint8_t*>(src->data);
-            for (int64_t r = 0; r < src->ne[1]; ++r) {
-                std::memcpy(fused.bytes.data() + dst_row * row_bytes,
-                            src_bytes + static_cast<size_t>(r) * static_cast<size_t>(src->nb[1]), row_bytes);
-                ++dst_row;
-            }
-        };
-        append_rows(q);
-        append_rows(k);
-        append_rows(v);
         pending_fused.push_back(std::move(fused));
         return true;
     };
@@ -1761,17 +1794,17 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         std::cerr << "[DenseCore] Warning: Gemma4 CPU_REPACK aliases require CPU_REPACK because this model uses "
                      "non-KleidiAI quant types, but CPU_REPACK is unavailable"
                   << std::endl;
-        ClearCpuRepackAliases(model);
         return;
     }
 
+    model->prepared_weights.cpu_repack_buffers.reserve(rollback.buffers + pending.size() + pending_fused.size() + 2);
+    model->prepared_weights.host_buffers.reserve(rollback.hosts + pending.size() + pending_fused.size());
     if (cpu_repack_aliases > 0) {
         ggml_backend_buffer_t buffer =
             ggml_backend_alloc_ctx_tensors_from_buft(model->prepared_weights.ctx_cpu_repack, primary_repack_buft);
         if (!buffer) {
             std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 " << primary_repack_buft_name << " buffer"
                       << std::endl;
-            ClearCpuRepackAliases(model);
             return;
         }
         model->prepared_weights.cpu_repack_buffers.push_back(buffer);
@@ -1781,134 +1814,138 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
             ggml_backend_alloc_ctx_tensors_from_buft(model->prepared_weights.ctx_cpu_kleidiai, repack_bufts.cpu_kleidiai);
         if (!buffer) {
             std::cerr << "[DenseCore] Warning: failed to allocate Gemma4 CPU_KLEIDIAI buffer" << std::endl;
-            ClearCpuRepackAliases(model);
-            return;
+                return;
         }
         model->prepared_weights.cpu_repack_buffers.push_back(buffer);
     }
 
-    auto commit_plain_cpu_alias = [&](PendingAlias& item) -> bool {
-        if (!item.source || !item.alias || item.bytes.empty() || item.alias->type != GGML_TYPE_Q8_0) {
-            return false;
+    auto materialize_alias = [&](const PendingAlias& item) {
+        Gemma4StagingVector<uint8_t> bytes;
+        if (!item.requant_q8) return bytes;
+        bytes.resize(ggml_nbytes(item.alias));
+        const auto* source_traits = ggml_get_type_traits(item.source->type);
+        const auto* target_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+        const int64_t width = item.alias->ne[0];
+        Gemma4StagingVector<float> row(static_cast<size_t>(width),0.f);
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0,width);
+        for (int64_t expert = 0; expert < item.alias->ne[2]; ++expert) {
+            for (int64_t r = 0; r < item.alias->ne[1]; ++r) {
+                const auto* input = static_cast<const char*>(item.source->data) + expert*item.source->nb[2] + r*item.source->nb[1];
+                auto* output = bytes.data() + (expert*item.alias->ne[1]+r)*row_bytes;
+                source_traits->to_float(input,row.data(),width);
+                target_traits->from_float(row.data(),output,width);
+            }
         }
-        ggml_tensor* alias = ggml_new_tensor(model->prepared_weights.ctx_cpu_repack, item.alias->type, GGML_MAX_DIMS, item.alias->ne);
-        if (!alias) {
-            return false;
+        return bytes;
+    };
+    auto materialize_fused = [&](const PendingFusedAlias& item) {
+        Gemma4StagingVector<uint8_t> bytes(ggml_nbytes(item.alias));
+        const size_t row_bytes = ggml_row_size(item.alias->type,item.alias->ne[0]);
+        size_t offset = 0;
+        for (auto* source : item.sources) {
+            if (!source) continue;
+            for (int64_t r = 0; r < source->ne[1]; ++r) {
+                std::memcpy(bytes.data()+offset,static_cast<const uint8_t*>(source->data)+r*source->nb[1],row_bytes);
+                offset += row_bytes;
+            }
         }
-        ggml_format_name(alias, "%s.cpu_q8_0", item.source->name[0] ? item.source->name : "gemma4_weight");
-
-        void* data = densecore::NumaAllocator::AllocateAlignedOnNode(item.bytes.size(), 64, -1);
-        if (!data) {
-            return false;
-        }
-        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, item.bytes.size());
-        if (!buffer) {
-            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
-            return false;
-        }
-        if (ggml_backend_tensor_alloc(buffer, alias, data) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(buffer);
-            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
-            return false;
-        }
-        std::memcpy(alias->data, item.bytes.data(), item.bytes.size());
-        model->prepared_weights.host_buffers.push_back({data, item.bytes.size(), densecore::AllocationType::Aligned});
-        model->prepared_weights.cpu_repack_buffers.push_back(buffer);
-        RegisterCpuRepackAlias(model, item.source, alias);
-        item.alias = alias;
-        return true;
+        return bytes;
     };
 
-    auto commit_plain_cpu_fused_alias = [&](PendingFusedAlias& item) -> bool {
-        if (!item.alias || !item.layer || item.key.empty() || item.bytes.empty() ||
-            item.alias->type != GGML_TYPE_Q8_0 || item.bytes.size() != ggml_nbytes(item.alias)) {
-            return false;
-        }
-        ggml_tensor* alias = ggml_new_tensor(model->prepared_weights.ctx_cpu_repack, item.alias->type, GGML_MAX_DIMS, item.alias->ne);
-        if (!alias) {
-            return false;
-        }
-        ggml_set_name(alias, item.alias->name[0] ? item.alias->name : "gemma4_fused_q8_0");
-
-        void* data = densecore::NumaAllocator::AllocateAlignedOnNode(item.bytes.size(), 64, -1);
-        if (!data) {
-            return false;
-        }
-        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, item.bytes.size());
-        if (!buffer) {
-            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
-            return false;
-        }
-        if (ggml_backend_tensor_alloc(buffer, alias, data) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(buffer);
-            densecore::NumaAllocator::Free(data, item.bytes.size(), densecore::AllocationType::Aligned);
-            return false;
-        }
-        std::memcpy(alias->data, item.bytes.data(), item.bytes.size());
-        model->prepared_weights.host_buffers.push_back({data, item.bytes.size(), densecore::AllocationType::Aligned});
-        model->prepared_weights.cpu_repack_buffers.push_back(buffer);
-        item.layer->Set(item.key, alias);
+    auto commit_plain_storage = [&](ggml_tensor* alias, const Gemma4StagingVector<uint8_t>& bytes) {
+        const auto free_host = [size = bytes.size()](void* ptr) {
+            if (ptr) densecore::NumaAllocator::Free(ptr,size,densecore::AllocationType::Aligned);
+        };
+        std::unique_ptr<void,decltype(free_host)> host(
+            densecore::NumaAllocator::AllocateAlignedOnNode(bytes.size(),64,-1),free_host);
+        if (!host) return false;
+        // buffer_from_ptr allocates a C++ wrapper and can throw. Keep its
+        // non-owning host backing locally owned until both final vectors own it.
+        std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
+            ggml_backend_cpu_buffer_from_ptr(host.get(),bytes.size()),ggml_backend_buffer_free);
+        if (!buffer || ggml_backend_tensor_alloc(buffer.get(),alias,host.get()) != GGML_STATUS_SUCCESS) return false;
+        ggml_backend_tensor_set(alias,bytes.data(),0,bytes.size());
+        // Both vectors were reserved before any allocation; these trivial
+        // pointer/HostBuffer insertions cannot allocate or throw.
+        model->prepared_weights.host_buffers.push_back({host.get(),bytes.size(),densecore::AllocationType::Aligned});
+        model->prepared_weights.cpu_repack_buffers.push_back(buffer.get());
+        buffer.release();
+        host.release();
+        return true;
+    };
+    auto commit_plain_cpu_alias = [&](PendingAlias& item, const Gemma4StagingVector<uint8_t>& bytes) -> bool {
+        if (!item.source || !item.alias || bytes.empty() || item.alias->type != GGML_TYPE_Q8_0) return false;
+        ggml_tensor* alias = ggml_new_tensor(model->prepared_weights.ctx_cpu_repack,item.alias->type,GGML_MAX_DIMS,item.alias->ne);
+        if (!alias) return false;
+        ggml_format_name(alias,"%s.cpu_q8_0",item.source->name[0] ? item.source->name : "gemma4_weight");
+        if (!commit_plain_storage(alias,bytes)) return false;
+        item.alias = alias;
+        RegisterCpuRepackAlias(model,item.source,alias);
+        return true;
+    };
+    auto commit_plain_cpu_fused_alias = [&](PendingFusedAlias& item, const Gemma4StagingVector<uint8_t>& bytes) -> bool {
+        if (!item.alias || !item.layer || item.key.empty() || bytes.empty() ||
+            item.alias->type != GGML_TYPE_Q8_0 || bytes.size() != ggml_nbytes(item.alias)) return false;
+        ggml_tensor* alias = ggml_new_tensor(model->prepared_weights.ctx_cpu_repack,item.alias->type,GGML_MAX_DIMS,item.alias->ne);
+        if (!alias) return false;
+        ggml_set_name(alias,item.alias->name[0] ? item.alias->name : "gemma4_fused_q8_0");
+        if (!commit_plain_storage(alias,bytes)) return false;
         item.alias = alias;
         return true;
     };
 
     std::vector<PendingAlias> supported;
     supported.reserve(pending.size());
+    size_t bytes = 0;
     for (auto& item : pending) {
-        if (!item.alias || !item.source) {
+        if (!item.alias || !item.source) continue;
+        if (!item.alias->extra && (!item.requant_q8 || item.alias->type != GGML_TYPE_Q8_0)) {
+            EraseCpuRepackAlias(model,item.source);
             continue;
         }
-        if (!item.alias->extra && commit_plain_cpu_alias(item)) {
-            supported.push_back(item);
-            continue;
-        }
+        auto input = materialize_alias(item);
         if (!item.alias->extra) {
-            if (densecore::env::ParseDiagnosticEnv("DENSECORE_DEBUG_GEMMA4_CPU_REPACK")) {
-                std::cerr << "[DenseCore] Warning: Gemma4 CPU_REPACK did not support tensor "
-                          << (item.source->name[0] ? item.source->name : "<unnamed>")
-                          << " type=" << ggml_type_name(item.source->type) << " alias_ne=[" << item.alias->ne[0] << ","
-                          << item.alias->ne[1] << "," << item.alias->ne[2] << "," << item.alias->ne[3]
-                          << "]; keeping raw tensor for that projection" << std::endl;
+            if (!commit_plain_cpu_alias(item,input)) {
+                EraseCpuRepackAlias(model,item.source);
+                continue;
             }
-            EraseCpuRepackAlias(model, item.source);
-            continue;
+        } else {
+            const void* data = input.empty() ? item.source->data : input.data();
+            ggml_backend_tensor_set(item.alias,data,0,ggml_nbytes(item.alias));
         }
-        supported.push_back(item);
+        supported.push_back(item); // Descriptor only, never retains staging.
+        bytes += ggml_nbytes(item.alias);
     }
     size_t fused_supported = 0;
     for (auto& item : pending_fused) {
-        if (!item.alias || !item.layer || item.bytes.empty()) {
-            continue;
-        }
-        if (!item.alias->extra && commit_plain_cpu_fused_alias(item)) {
-            ++fused_supported;
-            continue;
-        }
+        if (!item.alias || !item.layer || (!item.alias->extra && item.alias->type != GGML_TYPE_Q8_0)) continue;
+        // A separate scope per alias avoids old+new vector-capacity overlap.
+        auto input = materialize_fused(item);
         if (!item.alias->extra) {
-            continue;
+            if (!commit_plain_cpu_fused_alias(item,input)) continue;
+        } else {
+            // CPU_REPACK requires one synchronous whole-tensor upload.
+            ggml_backend_tensor_set(item.alias,input.data(),0,input.size());
         }
-        ggml_backend_tensor_set(item.alias, item.bytes.data(), 0, item.bytes.size());
-        item.layer->Set(item.key, item.alias);
+        item.ready = true;
         ++fused_supported;
+        bytes += ggml_nbytes(item.alias);
     }
     if (supported.empty() && fused_supported == 0) {
         std::cerr << "[DenseCore] Warning: no Gemma4 CPU_REPACK aliases were supported by this ggml build" << std::endl;
-        ClearCpuRepackAliases(model);
         return;
     }
-    size_t bytes = 0;
-    for (const auto& item : supported) {
-        const void* data = item.bytes.empty() ? item.source->data : item.bytes.data();
-        const size_t nbytes = item.bytes.empty() ? ggml_nbytes(item.source) : item.bytes.size();
-        ggml_backend_tensor_set(item.alias, data, 0, nbytes);
-        bytes += ggml_nbytes(item.alias);
-    }
-    for (const auto& item : pending_fused) {
-        if (item.alias && (item.alias->extra || item.alias->data)) {
-            bytes += ggml_nbytes(item.alias);
+    // Publish fused keys only after every upload/materialization has finished.
+    for (auto& item : pending_fused) {
+        if (!item.ready) continue;
+#ifdef DENSECORE_TEST_BUILD
+        if (auto* probe = gemma4_repack_staging_probe) {
+            if (probe->fail_publish_after == 0) throw std::bad_alloc();
+            if (probe->fail_publish_after > 0) --probe->fail_publish_after;
         }
+#endif
+        item.layer->Set(item.key,item.alias);
     }
-
     std::ostringstream type_summary;
     bool first_type = true;
     for (const auto& [type, count] : alias_type_counts) {
@@ -1918,6 +1955,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         first_type = false;
         type_summary << ggml_type_name(type) << ":" << count;
     }
+    rollback.committed = true;
     std::cout << "[DenseCore] Gemma4 CPU_REPACK aliases prepared: buft="
               << (cpu_kleidiai_aliases > 0 ? std::string(primary_repack_buft_name) + "+CPU_KLEIDIAI"
                                            : std::string(primary_repack_buft_name))
@@ -1930,9 +1968,11 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
 
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore::testing {
-bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel* model, size_t* peak, size_t* live, int fail_after) {
+bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel* model, size_t* peak, size_t* live, int fail_after, int fail_publish_after, size_t available_requant_override) {
     Gemma4RepackStagingProbe probe;
     probe.fail_after = fail_after;
+    probe.fail_publish_after = fail_publish_after;
+    probe.available_requant_override = available_requant_override;
     auto* previous = gemma4_repack_staging_probe;
     gemma4_repack_staging_probe = &probe;
     struct Restore { Gemma4RepackStagingProbe* previous; ~Restore() { gemma4_repack_staging_probe = previous; } } restore{previous};

@@ -471,14 +471,17 @@ TEST(Gemma4ModelLoaderTest, LoadedTextSoftcapControlsNativeAttentionAndGreedyLog
 }
 
 namespace densecore::testing {
-bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel*, size_t*, size_t*, int);
+bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel*, size_t*, size_t*, int, int = -1, size_t = SIZE_MAX);
 }
 
 namespace {
 struct GemmaRepackFixture {
     std::unique_ptr<TransformerModel> model = std::make_unique<TransformerModel>();
     std::vector<std::vector<uint8_t>> old_fused_inputs;
-    GemmaRepackFixture(int layers = 3, int rows = 8, ggml_type type = GGML_TYPE_Q4_0) {
+    std::list<std::vector<uint8_t>> padded_sources;
+    int width;
+    GemmaRepackFixture(int layers = 3, int rows = 8, ggml_type type = GGML_TYPE_Q4_0,
+                       bool padded_growing = false, int columns = 64) : width(columns) {
         model->arch_flags.is_gemma4 = true;
         model->hparams.n_layer = layers;
         model->backend = ggml_backend_cpu_init();
@@ -488,13 +491,26 @@ struct GemmaRepackFixture {
         const auto* traits = ggml_get_type_traits_cpu(type);
         for (int layer = 0; layer < layers; ++layer) {
             std::vector<ggml_tensor*> source;
+            const int layer_rows = padded_growing ? rows*(layer+1) : rows;
             for (int part = 0; part < 5; ++part) {
-                auto* tensor = ggml_new_tensor_2d(model->ctx_w,type,64,rows);
-                std::vector<float> values(static_cast<size_t>(64*rows));
+                auto* tensor = ggml_new_tensor_2d(model->ctx_w,type,width,layer_rows);
+                std::vector<float> values(static_cast<size_t>(width*layer_rows));
                 for (size_t i = 0; i < values.size(); ++i)
                     values[i] = .3f*std::sin(static_cast<float>(i+13*part+41*layer)*.071f);
                 if (type == GGML_TYPE_F32) std::memcpy(tensor->data,values.data(),values.size()*sizeof(float));
                 else traits->from_float(values.data(),tensor->data,values.size());
+                if (padded_growing) {
+                    const size_t row_bytes = ggml_row_size(type,width);
+                    const size_t stride = row_bytes+32;
+                    padded_sources.emplace_back(stride*layer_rows,0xAC);
+                    auto& backing = padded_sources.back();
+                    for (int r = 0; r < layer_rows; ++r)
+                        std::memcpy(backing.data()+r*stride,static_cast<const uint8_t*>(tensor->data)+r*row_bytes,row_bytes);
+                    tensor->data = backing.data();
+                    tensor->nb[1] = stride;
+                    tensor->nb[2] = stride*layer_rows;
+                    tensor->nb[3] = tensor->nb[2];
+                }
                 const char* keys[] = {"attn_q.weight","attn_k.weight","attn_v.weight","ffn_gate.weight","ffn_up.weight"};
                 model->layers[layer].Set(keys[part],tensor);
                 source.push_back(tensor);
@@ -503,7 +519,9 @@ struct GemmaRepackFixture {
                 std::vector<uint8_t> fused;
                 for (int i : indexes) {
                     const auto* bytes = static_cast<const uint8_t*>(source[i]->data);
-                    fused.insert(fused.end(),bytes,bytes+ggml_nbytes(source[i]));
+                    const size_t row_bytes = ggml_row_size(type,width);
+                    for (int64_t r = 0; r < source[i]->ne[1]; ++r)
+                        fused.insert(fused.end(),bytes+r*source[i]->nb[1],bytes+r*source[i]->nb[1]+row_bytes);
                 }
                 old_fused_inputs.push_back(std::move(fused));
             }
@@ -524,14 +542,15 @@ std::vector<float> GemmaRepackOutput(ggml_tensor* weight) {
 }
 }
 
-TEST(Gemma4RepackStaging, MultipleAliasesMatchPriorPackedBytesAndOutputWithOneAliasPeak) {
-    GemmaRepackFixture fixture;
+namespace {
+void CheckGemmaRepackGolden(GemmaRepackFixture& fixture) {
     auto bufts = densecore::llm::weights::FindCpuRepackBufferTypes(fixture.model->backend);
     ASSERT_NE(bufts.cpu_repack,nullptr);
     std::unique_ptr<ggml_context,decltype(&ggml_free)> expected(ggml_init({1024*1024,nullptr,true}),ggml_free);
     std::vector<ggml_tensor*> expected_aliases;
     for (size_t i = 0; i < fixture.old_fused_inputs.size(); ++i)
-        expected_aliases.push_back(ggml_new_tensor_2d(expected.get(),GGML_TYPE_Q4_0,64,i%2 ? 16 : 24));
+        expected_aliases.push_back(ggml_new_tensor_2d(expected.get(),GGML_TYPE_Q4_0,fixture.width,
+            fixture.old_fused_inputs[i].size()/ggml_row_size(GGML_TYPE_Q4_0,fixture.width)));
     std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
         ggml_backend_alloc_ctx_tensors_from_buft(expected.get(),bufts.cpu_repack),ggml_backend_buffer_free);
     ASSERT_NE(buffer,nullptr);
@@ -552,6 +571,18 @@ TEST(Gemma4RepackStaging, MultipleAliasesMatchPriorPackedBytesAndOutputWithOneAl
         EXPECT_EQ(std::memcmp(alias->data,expected_aliases[i]->data,ggml_nbytes(alias)),0);
         EXPECT_EQ(GemmaRepackOutput(alias),GemmaRepackOutput(expected_aliases[i]));
     }
+}
+
+} // namespace
+
+TEST(Gemma4RepackStaging, MultipleAliasesMatchPriorPackedBytesAndOutputWithOneAliasPeak) {
+    GemmaRepackFixture fixture;
+    CheckGemmaRepackGolden(fixture);
+}
+
+TEST(Gemma4RepackStaging, GrowingPaddedSourceRowsPreserveBytesOutputsAndSinglePayloadPeak) {
+    GemmaRepackFixture fixture(3,8,GGML_TYPE_Q4_0,true);
+    CheckGemmaRepackGolden(fixture);
 }
 
 TEST(Gemma4RepackStaging, FailedMaterializationReleasesStagingAndLeavesNoPublishedAliases) {
@@ -579,5 +610,118 @@ TEST(Gemma4RepackStaging, NoAliasAndUnsupportedRowsDoNotStageOrRetainBuffers) {
         EXPECT_EQ(live,0u);
         EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
         EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_aliases.empty());
+    }
+}
+
+TEST(Gemma4RepackStaging, PublicationFailureRestoresOlderKeysAndAllowsCleanRetry) {
+    for (int publication : {0,1,3}) {
+        GemmaRepackFixture fixture;
+        auto* previous = fixture.model->layers[0].Get("attn_q.weight");
+        fixture.model->layers[0].Set("attn_qkv.cpu_repack_fused",previous);
+        size_t peak = 0,live = 0;
+        EXPECT_FALSE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1,publication));
+        EXPECT_EQ(live,0u);
+        EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
+        EXPECT_EQ(fixture.model->layers[0].Get("ffn_gate_up.cpu_repack_fused"),nullptr);
+        EXPECT_EQ(fixture.model->prepared_weights.ctx_cpu_repack,nullptr);
+        EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
+        EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_aliases.empty());
+        EXPECT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
+        EXPECT_NE(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
+    }
+}
+
+TEST(Gemma4RepackStaging, AlreadyOwnedPreparationIsIdempotentAndIncompleteContextIsRejected) {
+    GemmaRepackFixture fixture(2,8,GGML_TYPE_Q4_K,false,256);
+    size_t peak = 0,live = 0;
+    ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
+    auto& weights = fixture.model->prepared_weights;
+    auto* context = weights.ctx_cpu_repack;
+    const auto buffers = weights.cpu_repack_buffers;
+    const auto aliases = weights.cpu_repack_aliases;
+    const auto sources = weights.cpu_repack_alias_sources;
+    const auto layouts = weights.cpu_repack_alias_layouts;
+    auto* fused = fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused");
+    ASSERT_NE(context,nullptr);
+    ASSERT_NE(fused,nullptr);
+    ASSERT_FALSE(aliases.empty());
+    const auto output = GemmaRepackOutput(fused);
+    const auto* bytes = static_cast<const uint8_t*>(fused->data);
+    const std::vector<uint8_t> packed(bytes,bytes+ggml_nbytes(fused));
+    ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,0));
+    EXPECT_EQ(peak,0u);
+    EXPECT_EQ(live,0u);
+    EXPECT_EQ(weights.ctx_cpu_repack,context);
+    EXPECT_EQ(weights.cpu_repack_buffers,buffers);
+    EXPECT_EQ(weights.cpu_repack_aliases,aliases);
+    EXPECT_EQ(weights.cpu_repack_alias_sources,sources);
+    EXPECT_EQ(weights.cpu_repack_alias_layouts,layouts);
+    EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),fused);
+    EXPECT_EQ(std::memcmp(packed.data(),fused->data,packed.size()),0);
+    EXPECT_EQ(GemmaRepackOutput(fused),output);
+    GemmaRepackFixture incomplete;
+    incomplete.model->prepared_weights.ctx_cpu_repack = ggml_init({1024*1024,nullptr,true});
+    auto* original = incomplete.model->prepared_weights.ctx_cpu_repack;
+    EXPECT_THROW(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(incomplete.model.get(),&peak,&live,-1),std::logic_error);
+    EXPECT_EQ(incomplete.model->prepared_weights.ctx_cpu_repack,original);
+    EXPECT_TRUE(incomplete.model->prepared_weights.cpu_repack_buffers.empty());
+}
+
+TEST(Gemma4RepackStaging, DeferredQ5DownConversionPreservesQ8BytesAndBoundsRowScratch) {
+    const auto make = [] {
+        auto model = std::make_unique<TransformerModel>();
+        model->arch_flags.is_gemma4 = true;
+        model->hparams.n_layer = 2;
+        model->backend = ggml_backend_cpu_init();
+        model->cpu_backend = model->backend;
+        model->ctx_w = ggml_init({4*1024*1024,nullptr,false});
+        model->layers.resize(2);
+        for (int layer = 0; layer < 2; ++layer) {
+            auto* gate = ggml_new_tensor_3d(model->ctx_w,GGML_TYPE_Q4_0,64,128,2);
+            auto* down = ggml_new_tensor_3d(model->ctx_w,GGML_TYPE_Q5_1,64,64,2);
+            for (auto* tensor : {gate,down}) {
+                std::vector<float> data(ggml_nelements(tensor));
+                for (size_t i = 0; i < data.size(); ++i) data[i] = .31f*std::sin(static_cast<float>(i+17*layer)*.09f);
+                ggml_get_type_traits_cpu(tensor->type)->from_float(data.data(),tensor->data,data.size());
+            }
+            model->layers[layer].Set("ffn_gate_up_exps.weight",gate);
+            model->layers[layer].Set("ffn_down_exps.weight",down);
+        }
+        return model;
+    };
+    auto model = make();
+    std::vector<std::vector<uint8_t>> expected;
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0,64);
+    for (const auto& layer : model->layers) {
+        auto* source = layer.Get("ffn_down_exps.weight");
+        std::vector<uint8_t> bytes(row_bytes*64*2);
+        std::vector<float> row(64);
+        for (int expert = 0; expert < 2; ++expert) for (int r = 0; r < 64; ++r) {
+            const auto* input = static_cast<const uint8_t*>(source->data)+expert*source->nb[2]+r*source->nb[1];
+            ggml_get_type_traits(GGML_TYPE_Q5_1)->to_float(input,row.data(),64);
+            ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float(row.data(),bytes.data()+(expert*64+r)*row_bytes,64);
+        }
+        expected.push_back(std::move(bytes));
+    }
+    size_t peak = 0,live = 0;
+    ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(model.get(),&peak,&live,-1,-1,size_t{1}<<40));
+    EXPECT_EQ(live,0u);
+    EXPECT_LE(peak,expected[0].size()+64*sizeof(float));
+    EXPECT_GE(peak,expected[0].size());
+    for (size_t layer = 0; layer < model->layers.size(); ++layer) {
+        auto* source = model->layers[layer].Get("ffn_down_exps.weight");
+        auto* alias = model->prepared_weights.cpu_repack_aliases.at(source);
+        ASSERT_EQ(alias->type,GGML_TYPE_Q8_0);
+        EXPECT_EQ(std::memcmp(alias->data,expected[layer].data(),expected[layer].size()),0);
+    }
+    for (int fail_after : {0,1,2}) {
+        auto failing = make();
+        EXPECT_FALSE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(failing.get(),&peak,&live,fail_after,-1,size_t{1}<<40));
+        EXPECT_EQ(live,0u);
+        EXPECT_TRUE(failing->prepared_weights.host_buffers.empty());
+        EXPECT_TRUE(failing->prepared_weights.cpu_repack_buffers.empty());
+        EXPECT_TRUE(failing->prepared_weights.cpu_repack_aliases.empty());
+        EXPECT_TRUE(failing->prepared_weights.cpu_repack_alias_sources.empty());
+        EXPECT_EQ(failing->prepared_weights.ctx_cpu_repack,nullptr);
     }
 }
