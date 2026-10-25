@@ -146,6 +146,7 @@ bool ResolveSamplingLogitsColumnForRequest(int token_offset, int processed_count
                                            bool sampled_from_prefill, int remaining_prompt_tokens, int n_past_before,
                                            int n_past_after, int* out_last_token_idx, std::string* error = nullptr,
                                            int sequence_index = -1, int num_sequences = 0);
+void RecordFirstTokenCommit(Request* req, InternalMetrics* metrics, std::chrono::steady_clock::time_point now);
 void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);
 void NoteSuppressedToken(Request* req);
 void NoteVisibleEmitProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id);

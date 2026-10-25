@@ -1735,6 +1735,14 @@ const char* DecodeSilentFinishReasonName(DecodeSilentFinishReason reason) {
     }
 }
 
+void RecordFirstTokenCommit(Request* req, InternalMetrics* metrics, std::chrono::steady_clock::time_point now) {
+    if (!req || !metrics || req->generated_count != 0 ||
+        req->first_token_time != std::chrono::steady_clock::time_point{}) return;
+    metrics->RecordTTFT(std::chrono::duration_cast<std::chrono::microseconds>(now - req->start_time).count());
+    req->first_token_time = now;
+    req->last_token_time = now;
+}
+
 void NoteDecodeSampleProgress(Request* req, std::chrono::steady_clock::time_point now, int token_id) {
     if (!req) {
         return;

@@ -6112,12 +6112,6 @@ void EngineLoop(EngineState* state) {
                         req->prompt_tokens_for_cache.clear();
                         req->original_prompt_tokens_for_cache.clear();
 
-                        req->first_token_time = std::chrono::steady_clock::now();
-                        auto ttft_us = std::chrono::duration_cast<std::chrono::microseconds>(req->first_token_time -
-                                                                                             req->start_time)
-                                           .count();
-                        state->metrics.RecordTTFT(ttft_us);
-                        req->last_token_time = req->first_token_time;
                         LogDeterminismBoundary(
                             "after_prefill_complete", req, current_model, prefix_cache_allowed,
                             /*prefix_cache_hit=*/determinism_prefix_hit_reqs.count(req->id) != 0,
@@ -6310,6 +6304,9 @@ void EngineLoop(EngineState* state) {
                         !was_prefill_step && processed_count == 1 && req->tokens.size() == 1 ? req->tokens.front() : -1;
                     req->tokens.clear();
                     req->tokens.push_back(best_token);
+                    // First committed sampled token, including EOS/hidden pieces:
+                    // target sampling and any MTP bootstrap/replay are complete.
+                    RecordFirstTokenCommit(req, &state->metrics, std::chrono::steady_clock::now());
                     req->generated_count++;
                     req->token_history.push_back(best_token);
                     constexpr size_t kMaxTokenHistory = 2048;

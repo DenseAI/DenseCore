@@ -1416,3 +1416,40 @@ TEST(WorkerResultDispatchTest, GemmaTargetLabelsDistinguishActualVariants) {
     model.hparams.n_experts = 128;
     EXPECT_STREQ(densecore::runtime::TargetFastPathLabel(densecore::runtime::ResolveTargetFastPathPlan(&model)), "gemma4_26b_a4b");
 }
+
+TEST(WorkerTokenCommitTiming, IncludesSamplingBootstrapAndReplayExactlyOnce) {
+    Request req;
+    InternalMetrics metrics;
+    const auto start = std::chrono::steady_clock::time_point{} + std::chrono::seconds(1);
+    req.start_time = start;
+    // Prefill completion is not an output commit: no sample or timestamp yet.
+    const auto prefill_end = start + std::chrono::milliseconds(10);
+    EXPECT_TRUE(metrics.ttft_samples.empty());
+    EXPECT_EQ(req.first_token_time, std::chrono::steady_clock::time_point{});
+    const auto committed = prefill_end + std::chrono::milliseconds(70);
+    RecordFirstTokenCommit(&req, &metrics, committed);
+    ASSERT_EQ(metrics.ttft_samples.size(), 1u);
+    EXPECT_EQ(metrics.ttft_samples.front(), 80000);
+    EXPECT_EQ(req.first_token_time, committed);
+    EXPECT_EQ(req.last_token_time, committed);
+    RecordFirstTokenCommit(&req, &metrics, committed + std::chrono::milliseconds(1));
+    req.generated_count++;
+    RecordFirstTokenCommit(&req, &metrics, committed + std::chrono::milliseconds(20));
+    EXPECT_EQ(metrics.ttft_samples.size(), 1u);
+    EXPECT_EQ(req.first_token_time, committed);
+    EXPECT_EQ(req.last_token_time, committed);
+}
+
+TEST(WorkerTokenCommitTiming, CountsFirstEosOrHiddenTokenWithoutVisibleOutput) {
+    Request req;
+    InternalMetrics metrics;
+    req.start_time = std::chrono::steady_clock::time_point{} + std::chrono::seconds(1);
+    req.visible_emitted_token_count = 0;
+    req.tokens.push_back(2); // EOS/hidden IDs remain sampled tokens under native accounting.
+    const auto committed = req.start_time + std::chrono::milliseconds(25);
+    RecordFirstTokenCommit(&req, &metrics, committed);
+    ASSERT_EQ(metrics.ttft_samples.size(), 1u);
+    EXPECT_EQ(metrics.ttft_samples.front(), 25000);
+    EXPECT_EQ(req.visible_emitted_token_count, 0u);
+    EXPECT_EQ(req.first_token_time, committed);
+}
