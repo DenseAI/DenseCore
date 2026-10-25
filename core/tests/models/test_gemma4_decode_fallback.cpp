@@ -2428,7 +2428,7 @@ std::unique_ptr<TransformerModel> MakeE4BMetadataOnlyBudgetModel() {
     if(!m->ctx_w)throw std::runtime_error("weight descriptor context");
     const auto norm=[&](int n){return ggml_new_tensor_1d(m->ctx_w,GGML_TYPE_F32,n);};
     const auto weight=[&](int in,int out){return ggml_new_tensor_2d(m->ctx_w,GGML_TYPE_Q4_0,in,out);};
-    m->tok_embeddings=weight(2560,262144);m->output=m->tok_embeddings;m->output_norm=norm(2560);
+    m->tok_embeddings=ggml_new_tensor_2d(m->ctx_w,GGML_TYPE_Q8_0,2560,262144);m->output=m->tok_embeddings;m->output_norm=norm(2560);
     m->gemma4_per_layer_token_embeddings=weight(256*42,262144);
     m->gemma4_per_layer_model_projection=ggml_new_tensor_2d(m->ctx_w,GGML_TYPE_BF16,2560,256*42);
     m->gemma4_per_layer_projection_norm=norm(256);
@@ -2460,12 +2460,13 @@ TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWi
     // No model file, compute, weight payload, or KV arena is allocated. All
     // descriptors have actual E4B geometry; no_alloc construction must not read weights.
     auto model=MakeE4BMetadataOnlyBudgetModel();
-    for(const auto shape:std::vector<std::pair<int,int>>{{1,1},{2,1},{4,1},{8,1},{1,32},{4,32},{8,32},{1,256}}){
+    for(const auto shape:std::vector<std::pair<int,int>>{{1,1},{2,1},{4,1},{8,1},{1,32},{4,32},{8,32},{1,256},{1,2048},{4,512},{8,512}}){
         const auto [width,chunk]=shape;SCOPED_TRACE("width="+std::to_string(width)+" chunk="+std::to_string(chunk));
         PagedKVCache cache{};cache.head_dim=cache.v_head_dim=512;cache.n_head_kv=2;cache.n_layer=42;
         cache.max_blocks=128*width;cache.cache_type=GGML_TYPE_Q8_0;cache.layer_n_head_kv.assign(42,2);
         for(int layer=0;layer<42;++layer){const int dim=layer%6==5?512:256;cache.layer_head_dims.push_back(dim);cache.layer_v_head_dims.push_back(dim);}
         BatchSpec batch{};batch.num_seqs=width;batch.n_past.assign(width,2048-chunk);batch.block_tables.resize(width);
+        for(int seq=1;seq<width;++seq)batch.n_past[seq]=2047;
         for(int seq=0;seq<width;++seq){
             for(int block=0;block<128;++block)batch.block_tables[seq].push_back(seq*128+block);
             const int queries=seq==0?chunk:1;
