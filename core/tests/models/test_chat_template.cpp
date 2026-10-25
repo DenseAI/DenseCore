@@ -38,9 +38,7 @@ TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialTurnFormatWithImplicitInstru
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
 TEST(ChatTemplateTest, GemmaAutoTemplateUsesStartOfTurnTokensWhenPresentInVocab) {
@@ -60,9 +58,7 @@ TEST(ChatTemplateTest, GemmaAutoTemplateUsesStartOfTurnTokensWhenPresentInVocab)
               "<start_of_turn>user\n"
               "hello"
               "<end_of_turn>\n"
-              "<start_of_turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<start_of_turn>model\n");
 }
 
 TEST(ChatTemplateTest, GemmaAutoTemplateLeavesRealStartOfTurnPromptUntouched) {
@@ -99,7 +95,7 @@ TEST(ChatTemplateTest, GemmaAutoTemplateLeavesChannelCueToModelWhenThinkingEnabl
               "<|turn>model\n");
 }
 
-TEST(ChatTemplateTest, GemmaAutoTemplateAddsEmptyThoughtChannelWhenThinkingDisabled) {
+TEST(ChatTemplateTest, GemmaAutoTemplateUsesOfficialGenerationCueWhenThinkingDisabled) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.variant = ModelVariant::GEMMA4;
@@ -116,9 +112,7 @@ TEST(ChatTemplateTest, GemmaAutoTemplateAddsEmptyThoughtChannelWhenThinkingDisab
               "<|turn>user\n"
               "hello"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
 TEST(ChatTemplateTest, AutoTemplateLeavesGemmaPromptUntouchedWhenAlreadyTemplated) {
@@ -677,12 +671,10 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererMatchesTurnTags) {
               "<|turn>user\n"
               "What is the capital of France?"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
-TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenThinkingDisabled) {
+TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesOfficialGenerationCueWhenThinkingDisabled) {
     TransformerModel model{};
     model.arch = ModelArch::GEMMA;
     model.arch_flags.is_gemma4 = true;
@@ -705,9 +697,7 @@ TEST(CanonicalChatRenderTest, GemmaCanonicalRendererUsesEmptyThoughtChannelWhenT
               "<|turn>user\n"
               "What is the capital of France?"
               "<turn|>\n"
-              "<|turn>model\n"
-              "<|channel>thought\n"
-              "<channel|>");
+              "<|turn>model\n");
 }
 
 TEST(CanonicalChatRenderTest, GemmaCanonicalRendererLeavesChannelCueToModelWhenThinkingEnabled) {

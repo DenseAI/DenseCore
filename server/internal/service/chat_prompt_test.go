@@ -129,7 +129,7 @@ func TestFormatChatPromptGemmaUsesTurnTemplate(t *testing.T) {
 	if strings.Contains(prompt, "<|turn>system\nYou are a helpful assistant.\n") {
 		t.Fatalf("expected no implicit gemma system prompt, got %q", prompt)
 	}
-	expected := "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+	expected := "<bos><|turn>user\n안녕?<turn|>\n<|turn>model\n"
 	if prompt != expected {
 		t.Fatalf("expected llama.cpp-compatible gemma turn template, got %q", prompt)
 	}
@@ -166,14 +166,14 @@ func TestFormatChatPromptGemmaThinkingInjectsSystemThinkMarker(t *testing.T) {
 	}
 }
 
-func TestFormatChatPromptGemmaNoThinkingUsesEmptyThoughtChannelCue(t *testing.T) {
+func TestFormatChatPromptGemmaNoThinkingUsesOfficialGenerationCue(t *testing.T) {
 	enableThinking := false
 	prompt := FormatChatPrompt("/tmp/gemma-4-E2B-it-Q4_K_M.gguf", []domain.Message{
 		{Role: "user", Content: "Hello"},
 	}, &domain.ChatTemplateKwargs{EnableThinking: &enableThinking})
 
-	if !strings.HasSuffix(prompt, "<|turn>model\n<|channel>thought\n<channel|>") {
-		t.Fatalf("expected gemma no-thinking prompt to end at empty thought channel cue, got %q", prompt)
+	if !strings.HasSuffix(prompt, "<|turn>model\n") {
+		t.Fatalf("expected gemma no-thinking prompt to end at the official model generation cue, got %q", prompt)
 	}
 	if strings.Contains(prompt, "<|channel>final\n<channel|>") {
 		t.Fatalf("expected gemma no-thinking prompt not to inject final channel cue, got %q", prompt)
