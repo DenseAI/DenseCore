@@ -96,16 +96,41 @@ struct Q6KRepackedMoEWeight {
     std::vector<uint8_t> blocks;
 };
 
+template <typename Weight> struct RepackedMoECacheState {
+    std::mutex mutex;
+    std::unordered_map<RepackedMoEKey, std::shared_ptr<Weight>, RepackedMoEKeyHash> entries;
+    size_t cache_bytes = 0;
+    std::atomic<uint64_t> use_clock{0};
+};
+
+template <typename Weight> RepackedMoECacheState<Weight>& RepackedMoECache() {
+    static RepackedMoECacheState<Weight> state;
+    return state;
+}
+
+void RetireMoERepackedCaches() {
+    auto& q5 = RepackedMoECache<Q5KRepackedMoEWeight>();
+    auto& q6 = RepackedMoECache<Q6KRepackedMoEWeight>();
+    // MoE builders hold their cache mutex throughout repacking. The clear waits
+    // for a builder, then removes its source identity before model storage dies.
+    std::scoped_lock lock(q5.mutex, q6.mutex);
+    q5.entries.clear();
+    q6.entries.clear();
+    q5.cache_bytes = 0;
+    q6.cache_bytes = 0;
+}
+
 std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void* weight_ptr, int64_t rows,
                                                                       int64_t cols) {
     if (!weight_ptr || rows <= 0 || cols <= 0 || (rows % 8) != 0 || (cols % QK_K) != 0 ||
         !CanUseQ5KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    static std::mutex mutex;
-    static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q5KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
-    static size_t cache_bytes = 0;
-    static std::atomic<uint64_t> use_clock{0};
+    auto& state = RepackedMoECache<Q5KRepackedMoEWeight>();
+    auto& mutex = state.mutex;
+    auto& cache = state.entries;
+    auto& cache_bytes = state.cache_bytes;
+    auto& use_clock = state.use_clock;
 
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q5_K, cols);
     const RepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};
@@ -165,10 +190,11 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
         !CanUseQ6KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    static std::mutex mutex;
-    static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q6KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
-    static size_t cache_bytes = 0;
-    static std::atomic<uint64_t> use_clock{0};
+    auto& state = RepackedMoECache<Q6KRepackedMoEWeight>();
+    auto& mutex = state.mutex;
+    auto& cache = state.entries;
+    auto& cache_bytes = state.cache_bytes;
+    auto& use_clock = state.use_clock;
 
     const size_t raw_bytes = static_cast<size_t>(rows) * ggml_row_size(GGML_TYPE_Q6_K, cols);
     const RepackedMoEKey key{weight_ptr, rows, cols, FingerprintRepackedMoEWeight(weight_ptr, raw_bytes)};

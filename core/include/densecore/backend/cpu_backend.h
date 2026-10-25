@@ -611,6 +611,7 @@ public:
     // Retire before releasing a model's immutable weights. Stops background
     // rebalancing so no copied registry reference can outlive the weights.
     void UnregisterMoEExperts(const TransformerLayer* layer_key);
+    static void RetireRepackedMoECaches();
 
     /**
      * @brief Get registered expert weights (thread-safe)

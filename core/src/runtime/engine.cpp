@@ -37,6 +37,7 @@
 #include "densecore/runtime/optimization_bridge.h"  // Runtime SIMD dispatch
 #include "densecore/simd/simd_ops.h"
 #include "llm/config/runtime_config.h"
+#include "kernels/q4k_repacked_gemv.h"
 #include "models/model_prompt_templates.h"
 #include "runtime/engine_internal.h"
 #include "runtime/request_builder.h"
@@ -1671,6 +1672,13 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
 
 }
 
+void EngineState::RetireModelExecutionCaches(const TransformerModel* model) {
+    if (!model) return;
+    RetireModelMoERegistries(model);
+    densecore::kernels::RetireRepackedWeightCaches();
+    densecore::CpuBackend::RetireRepackedMoECaches();
+}
+
 int UnloadModel(DenseCoreHandle handle, const char* model_id) {
     if (!handle || !model_id) {
         SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "UnloadModel: invalid arguments");
@@ -1692,7 +1700,7 @@ int UnloadModel(DenseCoreHandle handle, const char* model_id) {
         return DENSECORE_STATUS_INVALID_ARGUMENT;  // Cannot unload last model
     }
 
-    state->RetireModelMoERegistries(it->second->model.get());
+    state->RetireModelExecutionCaches(it->second->model.get());
     state->models.erase(it);
 
     // Update default if needed

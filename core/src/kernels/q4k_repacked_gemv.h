@@ -64,6 +64,10 @@ size_t Q4KRepackedGemvSetRuntimeCacheBudgetFloor(size_t floor_bytes);
 size_t Q4KRepackedGemvRuntimeCacheBudgetFloorBytes();
 #ifdef DENSECORE_TEST_BUILD
 void Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest();
+void Q4KRepackedGemvFailNextAllocationForTest(bool enabled = true);
+size_t Q4KRepackedGemvBuildersForTest();
+void Q4KRepackedGemvPauseNextBuildForTest(bool enabled);
+bool Q4KRepackedGemvWaitForPausedBuildForTest(int timeout_ms);
 #endif
 Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot();
 Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheToBytes(size_t target_bytes);
@@ -72,6 +76,11 @@ Q4KRepackedGemvCacheStats Q4KRepackedGemvTrimCacheForAvailableMemory(size_t rese
 // and last 4 KiB; this is not a full-weight integrity checksum or stable ID.
 uint64_t FingerprintQ4KRepackedGemvWeight(const void* weight_ptr, size_t bytes);
 uint64_t Q4KRepackedGemvWeightFingerprint(const void* weight_ptr, int64_t rows, int64_t cols);
+
+// Model retirement boundary: drop process-global source-address identities.
+// Already acquired packed views own their storage and remain valid. Builders
+// detached by retirement must not republish or charge stale cache entries.
+void RetireRepackedWeightCaches();
 
 std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const void* weight_ptr, int64_t rows,
                                                                         int64_t cols,

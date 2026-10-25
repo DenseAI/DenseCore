@@ -771,6 +771,10 @@ void PopulateMoEDequantCacheEntry(CacheEntry* entry, const CpuBackend::ExpertWei
 
 }  // namespace
 
+void CpuBackend::RetireRepackedMoECaches() {
+    RetireMoERepackedCaches();
+}
+
 bool RunQ5KRepackedMoEFusedSwiGLURawProjection(const CpuExecutionOptions& options, CpuBackend* backend, const void* gate_weight_ptr,
                                                const void* up_weight_ptr, const float* input_data,
                                                const uint8_t* qinput_data, size_t qinput_row_bytes, float* output_data,
@@ -980,6 +984,18 @@ bool RunMoEQ4KRawBatchedFusedSwiGLUToQ8(const CpuExecutionOptions& options, CpuB
 }
 
 namespace testing {
+#ifdef DENSECORE_TEST_BUILD
+bool Q5RepackedMoESupportedForTest() { return CanUseQ5KRepackedMoEGemvFastPath(); }
+std::shared_ptr<void> Q5RepackedMoEViewForTest(const void* source, int64_t rows, int64_t cols,
+                                            const void** data, size_t* bytes) {
+    auto weight = GetOrCreateQ5KRepackedMoEWeight(source, rows, cols);
+    if (weight) {
+        *data = weight->blocks.data();
+        *bytes = weight->bytes;
+    }
+    return weight;
+}
+#endif
 bool RunMoEQ4KQ8KBatchedRowPairParityForTest(const CpuExecutionOptions& options, const void* gate_weight_row, const void* up_weight_row,
                                              const uint8_t* qinput_data, size_t qinput_row_bytes, int M, int K,
                                              bool* specialized_pair_used) {

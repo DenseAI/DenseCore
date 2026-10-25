@@ -5,10 +5,18 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <vector>
 
 #include "kernels/q4k_repacked_gemv.h"
 #include "densecore.h"
+#include "densecore/runtime/resource_ledger.h"
+
+namespace densecore::testing {
+bool Q5RepackedMoESupportedForTest();
+std::shared_ptr<void> Q5RepackedMoEViewForTest(const void* source, int64_t rows, int64_t cols,
+                                            const void** data, size_t* bytes);
+}
 
 namespace {
 using densecore::kernels::FingerprintQ4KRepackedGemvWeight;
@@ -95,5 +103,109 @@ TEST(Q4KRepackedLifetimeTest, EngineRetirementInvalidatesReusedStorageWithIdenti
                                   expected.data(), original->bytes), 0);
     EXPECT_EQ(std::memcmp(replacement->blocks.data(), expected.data(), replacement->bytes), 0);
     EXPECT_NE(std::memcmp(original->blocks.data(), expected.data(), original->bytes), 0);
+}
+
+TEST(Q4KRepackedLifetimeTest, EngineRetirementAlsoInvalidatesMoEQ5PackedViews) {
+    using namespace densecore::testing;
+    if (!Q5RepackedMoESupportedForTest()) GTEST_SKIP() << "Host has no packed MoE Q5_K kernel";
+    constexpr int64_t rows = 128;
+    constexpr int64_t cols = 256;
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q5_K, cols);
+    std::vector<float> source(rows * cols);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = std::sin(static_cast<float>(i) * 0.013f);
+    std::vector<uint8_t> reused_storage(rows * row_bytes);
+    for (int64_t row = 0; row < rows; ++row)
+        ggml_quantize_chunk(GGML_TYPE_Q5_K, source.data() + row * cols, reused_storage.data() + row * row_bytes,
+                            0, 1, cols, nullptr);
+    const void* old_data = nullptr;
+    size_t old_bytes = 0;
+    const auto old_owner = Q5RepackedMoEViewForTest(reused_storage.data(), rows, cols, &old_data, &old_bytes);
+    ASSERT_NE(old_owner, nullptr);
+    const auto* old_begin = static_cast<const uint8_t*>(old_data);
+    const std::vector<uint8_t> old_copy(old_begin, old_begin + old_bytes);
+    DenseCoreHandle engine = InitEngine("mock", nullptr, 1);
+    ASSERT_NE(engine, nullptr) << DenseCoreGetLastError();
+    FreeEngine(engine);
+    reused_storage[reused_storage.size() / 2 + 64] ^= 0x11;
+    const void* new_data = nullptr;
+    size_t new_bytes = 0;
+    const auto replacement = Q5RepackedMoEViewForTest(reused_storage.data(), rows, cols, &new_data, &new_bytes);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_NE(replacement, old_owner);
+    EXPECT_EQ(old_bytes, new_bytes);
+    EXPECT_EQ(std::memcmp(old_data, old_copy.data(), old_bytes), 0);
+    std::vector<uint8_t> expected(old_bytes);
+    ASSERT_EQ(ggml_repack_q5_K_8x8(reused_storage.data(), reused_storage.size(), rows, cols,
+                                  expected.data(), expected.size()), 0);
+    EXPECT_EQ(std::memcmp(new_data, expected.data(), new_bytes), 0);
+    EXPECT_NE(std::memcmp(old_data, expected.data(), old_bytes), 0);
+}
+
+TEST(Q4KRepackedLifetimeTest, AllocationFailureDoesNotStrandBuilderOrBudget) {
+    using namespace densecore::kernels;
+    if (!Q4KRealPackedGemvKernelAvailable()) GTEST_SKIP() << "Host has no packed Q4_K kernel";
+    struct Cleanup {
+        ~Cleanup() { Q4KRepackedGemvFailNextAllocationForTest(false); RetireRepackedWeightCaches(); }
+    } cleanup;
+    RetireRepackedWeightCaches();
+    constexpr int64_t rows = 128;
+    constexpr int64_t cols = 256;
+    std::vector<uint8_t> source(rows * ggml_row_size(GGML_TYPE_Q4_K, cols), 0);
+    const auto before = densecore::runtime::ResourceLedgerUsageSnapshot().repack_bytes;
+    Q4KRepackedGemvFailNextAllocationForTest();
+    EXPECT_THROW(GetOrCreateQ4KRepackedGemvWeight(source.data(), rows, cols), std::bad_alloc);
+    Q4KRepackedGemvFailNextAllocationForTest(false);
+    ASSERT_EQ(Q4KRepackedGemvBuildersForTest(), 0u);
+    EXPECT_EQ(densecore::runtime::ResourceLedgerUsageSnapshot().repack_bytes, before);
+    const auto recovered = GetOrCreateQ4KRepackedGemvWeight(source.data(), rows, cols);
+    ASSERT_NE(recovered, nullptr);
+    EXPECT_EQ(Q4KRepackedGemvBuildersForTest(), 0u);
+}
+
+void CheckRetirementDuringBuild(bool fail_detached_builder) {
+    using namespace densecore::kernels;
+    constexpr int64_t rows = 128;
+    constexpr int64_t cols = 256;
+    std::vector<uint8_t> source(rows * ggml_row_size(GGML_TYPE_Q4_K, cols), 0);
+    std::future<std::shared_ptr<Q4KRepackedGemvWeight>> delayed;
+    struct Cleanup {
+        ~Cleanup() {
+            Q4KRepackedGemvFailNextAllocationForTest(false);
+            Q4KRepackedGemvPauseNextBuildForTest(false);
+            RetireRepackedWeightCaches();
+        }
+    } cleanup;  // Releases a paused future before its destructor waits.
+    RetireRepackedWeightCaches();
+    Q4KRepackedGemvPauseNextBuildForTest(true);
+    delayed = std::async(std::launch::async, [&]() {
+        return GetOrCreateQ4KRepackedGemvWeight(source.data(), rows, cols);
+    });
+    ASSERT_TRUE(Q4KRepackedGemvWaitForPausedBuildForTest(5000));
+    RetireRepackedWeightCaches();
+    const auto replacement = GetOrCreateQ4KRepackedGemvWeight(source.data(), rows, cols);
+    ASSERT_NE(replacement, nullptr);
+    if (fail_detached_builder) Q4KRepackedGemvFailNextAllocationForTest();
+    Q4KRepackedGemvPauseNextBuildForTest(false);
+    if (fail_detached_builder) {
+        EXPECT_THROW(delayed.get(), std::bad_alloc);
+    } else {
+        const auto detached = delayed.get();
+        ASSERT_NE(detached, nullptr);
+        EXPECT_NE(detached, replacement);
+    }
+    const auto current = GetOrCreateQ4KRepackedGemvWeight(source.data(), rows, cols);
+    EXPECT_EQ(current, replacement);
+    EXPECT_EQ(Q4KRepackedGemvCacheStatsSnapshot().resident_bytes, replacement->bytes);
+    EXPECT_EQ(Q4KRepackedGemvBuildersForTest(), 0u);
+}
+
+TEST(Q4KRepackedLifetimeTest, DetachedBuilderCannotChargeRetiredCacheEntry) {
+    if (!densecore::kernels::Q4KRealPackedGemvKernelAvailable()) GTEST_SKIP() << "Host has no packed Q4_K kernel";
+    CheckRetirementDuringBuild(false);
+}
+
+TEST(Q4KRepackedLifetimeTest, FailedDetachedBuilderCannotEraseReplacementEntry) {
+    if (!densecore::kernels::Q4KRealPackedGemvKernelAvailable()) GTEST_SKIP() << "Host has no packed Q4_K kernel";
+    CheckRetirementDuringBuild(true);
 }
 }  // namespace

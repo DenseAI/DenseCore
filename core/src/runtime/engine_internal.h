@@ -1688,6 +1688,8 @@ struct EngineState {
         for (const auto& layer : model->layers) cpu->UnregisterMoEExperts(&layer);
     }
 
+    void RetireModelExecutionCaches(const TransformerModel* model);
+
     // Multi-model pool
     std::map<std::string, std::unique_ptr<ModelEntry>> models;  // Smart pointer ownership
     std::string default_model_id;
@@ -2573,7 +2575,7 @@ struct EngineState {
         // Cleanup all models - smart pointers handle automatic cleanup
         {
             std::lock_guard<std::mutex> lock(models_mu);
-            for (const auto& item : models) RetireModelMoERegistries(item.second->model.get());
+            for (const auto& item : models) RetireModelExecutionCaches(item.second->model.get());
             models.clear();
         }
 

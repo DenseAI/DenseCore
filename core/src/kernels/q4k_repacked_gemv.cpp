@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 
 #if defined(__linux__)
@@ -18,6 +20,40 @@
 
 namespace densecore::kernels {
 namespace {
+
+template <typename State, typename Key, typename Entry>
+void AbortRepackBuild(State& state, const Key& key, const std::shared_ptr<Entry>& entry) {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const auto current = state.entries.find(key);
+    if (current != state.entries.end() && current->second == entry) state.entries.erase(current);
+    entry->building = false;
+    entry->cv.notify_all();
+}
+
+#ifdef DENSECORE_TEST_BUILD
+std::atomic<bool> fail_next_repack_allocation{false};
+struct RepackPause {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool armed = false;
+    bool paused = false;
+    bool released = false;
+};
+RepackPause& RepackPauseForTest() { static RepackPause state; return state; }
+void MaybePauseRepackBuildForTest() {
+    auto& state = RepackPauseForTest();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    if (!state.armed) return;
+    state.armed = false;
+    state.paused = true;
+    state.cv.notify_all();
+    state.cv.wait(lock, [&]() { return state.released; });
+    state.paused = false;
+}
+void MaybeFailRepackAllocationForTest() {
+    if (fail_next_repack_allocation.exchange(false)) throw std::bad_alloc();
+}
+#endif
 
 struct Q4KRepackedGemvKey {
     const void* weight_ptr = nullptr;
@@ -240,6 +276,29 @@ void Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest() {
     RuntimeAutoCacheFloorBytes().store(0, std::memory_order_relaxed);
     RuntimeAutoCacheLimitBytes().store(kUninitializedCacheLimit, std::memory_order_relaxed);
 }
+void Q4KRepackedGemvFailNextAllocationForTest(bool enabled) {
+    fail_next_repack_allocation.store(enabled);
+}
+void Q4KRepackedGemvPauseNextBuildForTest(bool enabled) {
+    auto& state = RepackPauseForTest();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.armed = enabled;
+    state.paused = false;
+    state.released = !enabled;
+    state.cv.notify_all();
+}
+bool Q4KRepackedGemvWaitForPausedBuildForTest(int timeout_ms) {
+    auto& state = RepackPauseForTest();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() { return state.paused; });
+}
+size_t Q4KRepackedGemvBuildersForTest() {
+    auto& state = CacheState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    size_t count = 0;
+    for (const auto& entry : state.entries) count += entry.second->building ? 1 : 0;
+    return count;
+}
 #endif
 
 Q4KRepackedGemvCacheStats Q4KRepackedGemvCacheStatsSnapshot() {
@@ -371,8 +430,9 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
     std::shared_ptr<Q4KRepackedGemvCacheEntry> entry;
     {
         std::unique_lock<std::mutex> lock(state.mutex);
-        auto found = state.entries.find(key);
-        if (found != state.entries.end()) {
+        for (;;) {
+            auto found = state.entries.find(key);
+            if (found == state.entries.end()) break;
             entry = found->second;
             if (entry->weight) {
                 entry->weight->last_use = now;
@@ -398,7 +458,9 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
                 if (lookup) {
                     lookup->waited = false;
                 }
+                continue;  // Retirement may have installed a different entry.
             }
+            state.entries.erase(found);
         }
         if (cache_limit == 0 || packed_bytes > cache_limit) {
             if (lookup) {
@@ -413,44 +475,58 @@ std::shared_ptr<Q4KRepackedGemvWeight> GetOrCreateQ4KRepackedGemvWeight(const vo
         state.entries[key] = entry;
     }
 
-    auto candidate = densecore::runtime::MakeBudgetedRepackedWeight<Q4KRepackedGemvWeight>(packed_bytes);
-    if (candidate) {
-        candidate->rows = rows;
-        candidate->cols = cols;
-        candidate->blocks_per_row = cols / kQ4KSuperBlock;
-        candidate->blocks.resize(packed_blocks);
-        candidate->bytes = packed_bytes;
-        candidate->last_use = now;
-        if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
-            candidate.reset();
-        } else {
-            state.repack_bytes.fetch_add(static_cast<uint64_t>(packed_bytes), std::memory_order_relaxed);
-            if (lookup) {
-                lookup->repacked = true;
-                lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+#ifdef DENSECORE_TEST_BUILD
+    MaybePauseRepackBuildForTest();
+#endif
+    std::shared_ptr<Q4KRepackedGemvWeight> candidate;
+    try {
+        candidate = densecore::runtime::MakeBudgetedRepackedWeight<Q4KRepackedGemvWeight>(packed_bytes);
+        if (candidate) {
+#ifdef DENSECORE_TEST_BUILD
+            MaybeFailRepackAllocationForTest();
+#endif
+            candidate->rows = rows;
+            candidate->cols = cols;
+            candidate->blocks_per_row = cols / kQ4KSuperBlock;
+            candidate->blocks.resize(packed_blocks);
+            candidate->bytes = packed_bytes;
+            candidate->last_use = now;
+            if (ggml_repack_q4_K_8x8(weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), candidate->bytes) != 0) {
+                candidate.reset();
+            } else {
+                state.repack_bytes.fetch_add(static_cast<uint64_t>(packed_bytes), std::memory_order_relaxed);
+                if (lookup) {
+                    lookup->repacked = true;
+                    lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+                }
             }
         }
+
+    } catch (...) {
+        AbortRepackBuild(state, key, entry);
+        throw;
     }
 
     {
         std::lock_guard<std::mutex> lock(state.mutex);
+        const auto resident = state.entries.find(key);
+        const bool owns_entry = resident != state.entries.end() && resident->second == entry;
         if (candidate) {
             entry->weight = candidate;
-            state.cache_bytes += candidate->bytes;
-            uint64_t evictions = 0;
-            uint64_t evicted_bytes = 0;
-            EvictIfNeededLocked(state, key, cache_limit, &evictions, &evicted_bytes);
-            if (lookup) {
-                lookup->cache_evictions = evictions;
-                lookup->cache_evicted_bytes = evicted_bytes;
-                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+            if (owns_entry) {
+                state.cache_bytes += candidate->bytes;
+                uint64_t evictions = 0;
+                uint64_t evicted_bytes = 0;
+                EvictIfNeededLocked(state, key, cache_limit, &evictions, &evicted_bytes);
+                if (lookup) {
+                    lookup->cache_evictions = evictions;
+                    lookup->cache_evicted_bytes = evicted_bytes;
+                }
             }
-        } else if (!entry->weight) {
-            state.entries.erase(key);
-            if (lookup) {
-                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
-            }
+        } else if (!entry->weight && owns_entry) {
+            state.entries.erase(resident);
         }
+        if (lookup) lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
         entry->building = false;
         entry->cv.notify_all();
     }
@@ -653,8 +729,9 @@ std::shared_ptr<RepackedDenseGemmWeight> GetOrCreateRepackedDenseGemmWeight(int3
     std::shared_ptr<RepackedDenseGemmEntry> entry;
     {
         std::unique_lock<std::mutex> lock(state.mutex);
-        auto found = state.entries.find(key);
-        if (found != state.entries.end()) {
+        for (;;) {
+            auto found = state.entries.find(key);
+            if (found == state.entries.end()) break;
             entry = found->second;
             if (entry->weight) {
                 entry->weight->last_use = now;
@@ -677,7 +754,9 @@ std::shared_ptr<RepackedDenseGemmWeight> GetOrCreateRepackedDenseGemmWeight(int3
                     }
                     return entry->weight;
                 }
+                continue;
             }
+            state.entries.erase(found);
         }
         if (cache_limit == 0 || packed_bytes > cache_limit) {
             if (lookup) {
@@ -692,40 +771,70 @@ std::shared_ptr<RepackedDenseGemmWeight> GetOrCreateRepackedDenseGemmWeight(int3
         state.entries[key] = entry;
     }
 
-    auto candidate = densecore::runtime::MakeBudgetedRepackedWeight<RepackedDenseGemmWeight>(packed_bytes);
-    if (candidate) {
-        candidate->source_type = ggml_type_id;
-        candidate->rows = rows;
-        candidate->cols = cols;
-        candidate->blocks_per_row = static_cast<int64_t>(blocks_per_row);
-        candidate->block_bytes = block_bytes;
-        candidate->bytes = packed_bytes;
-        candidate->last_use = now;
-        candidate->blocks.resize(packed_bytes);
-        if (DenseGemmRepack(ggml_type_id, weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), packed_bytes) != 0) {
-            candidate.reset();
-        } else if (lookup) {
-            lookup->repacked = true;
-            lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+#ifdef DENSECORE_TEST_BUILD
+    MaybePauseRepackBuildForTest();
+#endif
+    std::shared_ptr<RepackedDenseGemmWeight> candidate;
+    try {
+        candidate = densecore::runtime::MakeBudgetedRepackedWeight<RepackedDenseGemmWeight>(packed_bytes);
+        if (candidate) {
+#ifdef DENSECORE_TEST_BUILD
+            MaybeFailRepackAllocationForTest();
+#endif
+            candidate->source_type = ggml_type_id;
+            candidate->rows = rows;
+            candidate->cols = cols;
+            candidate->blocks_per_row = static_cast<int64_t>(blocks_per_row);
+            candidate->block_bytes = block_bytes;
+            candidate->bytes = packed_bytes;
+            candidate->last_use = now;
+            candidate->blocks.resize(packed_bytes);
+            if (DenseGemmRepack(ggml_type_id, weight_ptr, raw_bytes, rows, cols, candidate->blocks.data(), packed_bytes) != 0) {
+                candidate.reset();
+            } else if (lookup) {
+                lookup->repacked = true;
+                lookup->repack_bytes = static_cast<uint64_t>(packed_bytes);
+            }
         }
+
+    } catch (...) {
+        AbortRepackBuild(state, key, entry);
+        throw;
     }
 
     {
         std::lock_guard<std::mutex> lock(state.mutex);
+        const auto resident = state.entries.find(key);
+        const bool owns_entry = resident != state.entries.end() && resident->second == entry;
         if (candidate) {
             entry->weight = candidate;
-            state.cache_bytes += candidate->bytes;
-            EvictDenseGemmLocked(state, key, cache_limit);
-            if (lookup) {
-                lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
+            if (owns_entry) {
+                state.cache_bytes += candidate->bytes;
+                EvictDenseGemmLocked(state, key, cache_limit);
             }
-        } else if (!entry->weight) {
-            state.entries.erase(key);
+        } else if (!entry->weight && owns_entry) {
+            state.entries.erase(resident);
         }
+        if (lookup) lookup->resident_bytes = static_cast<uint64_t>(state.cache_bytes);
         entry->building = false;
         entry->cv.notify_all();
     }
     return candidate;
+}
+
+void RetireRepackedWeightCaches() {
+    {
+        auto& state = CacheState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.entries.clear();
+        state.cache_bytes = 0;
+    }
+    {
+        auto& state = DenseGemmCacheState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.entries.clear();
+        state.cache_bytes = 0;
+    }
 }
 
 bool RunRepackedDenseGemmGroup(const RepackedDenseGemmWeight& packed, const void* q8x4_group, float* output,
