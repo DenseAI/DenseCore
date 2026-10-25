@@ -453,3 +453,48 @@ TEST(RequestLifecycleCallbackModeTest, ShutdownPendingRequestUsesConfiguredDirec
 }
 
 }  // namespace
+
+TEST_F(RequestLifecycleTest, WorkerExceptionTerminatesActiveAndPendingRequestsAndRejectsAdmission) {
+    auto* state = static_cast<EngineState*>(engine_);
+    densecore::testing::EnablePauseAfterSchedulerAdmissionForTest(true);
+    CallbackState active, pending;
+    EmbeddingCallbackState embedding;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_, "active", 100, nullptr, 0.7f, 0.9f, 20, 1.0f, nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &active), 0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseAfterSchedulerAdmissionForTest(5000));
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_, "pending", 100, nullptr, 0.7f, 0.9f, 20, 1.0f, nullptr, 0, nullptr, 0, 0, nullptr, 0, LifecycleCallbackEx, &pending), 0);
+    ASSERT_GT(SubmitEmbeddingRequest(engine_, "pending embedding", EmbeddingLifecycleCallback, &embedding), 0);
+    state->fail_worker_for_test.store(true);
+    densecore::testing::ReleasePauseAfterSchedulerAdmissionForTest();
+    ASSERT_TRUE(active.WaitForFinal());
+    ASSERT_TRUE(pending.WaitForFinal());
+    ASSERT_TRUE(embedding.Wait());
+    EXPECT_EQ(active.final_count, 1);
+    EXPECT_EQ(pending.final_count, 1);
+    EXPECT_EQ(embedding.callback_count, 1);
+    EXPECT_LT(embedding.terminal_size, 0);
+    EXPECT_NE(active.final_texts.front().find("worker failed"), std::string::npos);
+    EXPECT_EQ(state->status.load(), EngineStatus::STOPPED);
+    EXPECT_EQ(SubmitEmbeddingRequest(engine_, "rejected", EmbeddingLifecycleCallback, &embedding),
+              DENSECORE_STATUS_ENGINE_STOPPED);
+    FreeEngine(engine_);
+    engine_ = nullptr;
+    EXPECT_EQ(active.final_count, 1);
+    EXPECT_EQ(pending.final_count, 1);
+    EXPECT_EQ(embedding.callback_count, 1);
+}
+
+TEST_F(RequestLifecycleTest, WorkerExceptionWhileDequeuedTerminatesEmbeddingBeforeSchedulerAdmission) {
+    auto* state = static_cast<EngineState*>(engine_);
+    densecore::testing::EnablePauseBeforePendingDequeueForTest(true);
+    EmbeddingCallbackState embedding;
+    EngineCloseGuard close_before_callback_state{&engine_};
+    ASSERT_GT(SubmitEmbeddingRequest(engine_, "dequeued embedding", EmbeddingLifecycleCallback, &embedding), 0);
+    ASSERT_TRUE(densecore::testing::WaitForPauseBeforePendingDequeueForTest(5000));
+    state->fail_worker_for_test.store(true);
+    densecore::testing::ReleasePauseBeforePendingDequeueForTest();
+    ASSERT_TRUE(embedding.Wait());
+    EXPECT_EQ(embedding.callback_count, 1);
+    EXPECT_EQ(embedding.terminal_size, DENSECORE_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(state->pending_requests.Size(), 0u);
+}

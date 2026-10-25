@@ -802,6 +802,69 @@ void EngineLoop(EngineState* state) {
         ~WorkContextBinder() { SetCurrentWorkContext(nullptr); }
     };
 
+    // A dequeued request is not published in active_requests until scheduler
+    // admission finishes. Keep that ownership visible to exception cleanup.
+    Request* dequeued_request = nullptr;
+    auto fail_worker = [&](const char* message) {
+        {
+            std::lock_guard<std::mutex> admission_lock(state->admission_mu);
+            std::lock_guard<std::mutex> wake_lock(state->cv_mu);
+            state->status.store(EngineStatus::STOPPED, std::memory_order_release);
+        }
+        std::vector<Request*> failed;
+        {
+            std::lock_guard<std::mutex> active_lock(state->active_mu);
+            failed.swap(state->active_requests);
+        }
+        if (dequeued_request && std::find(failed.begin(), failed.end(), dequeued_request) == failed.end()) {
+            failed.push_back(dequeued_request);
+        }
+        dequeued_request = nullptr;
+        while (auto* pending = state->pending_requests.Pop()) failed.push_back(pending);
+        auto* entry = state->GetDefaultModel();
+        auto* cache = entry ? entry->kv_cache.get() : nullptr;
+        const bool direct = state->fast_path_config.worker.callback_mode ==
+                            densecore::llm::config::WorkerRuntimeConfig::CallbackMode::Direct;
+        for (auto* req : failed) {
+            state->RemovePendingRequest(req->id);
+            req->cancelled.store(true, std::memory_order_relaxed);
+            if (cache && !req->block_table.empty()) {
+                cache->block_manager->Free(req->block_table);
+                req->block_table.clear();
+            }
+            if (state->scheduler && req->seq_id >= 0) state->scheduler->RemoveRequest(req->seq_id, false);
+            try {
+                bool completed;
+                if (req->is_graph_execution) {
+                    req->finished = true;
+                    completed = CompleteGraphRequest(req, nullptr, DENSECORE_STATUS_INTERNAL_ERROR);
+                } else if (req->is_embedding) {
+                    completed = FinalizeEmbeddingRequestOnce(state, req, {}, DENSECORE_STATUS_INTERNAL_ERROR, direct);
+                } else {
+                    req->decode_finish_cause = DecodeFinishCause::GraphBuildFailed;
+                    completed = FinalizeGenerationRequestOnce(state, req, std::string("Error: worker failed: ") + message,
+                                                             -1, true, direct);
+                }
+                if (completed) state->metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                // A throwing client callback must not strand the other requests.
+                LOG_ERROR("Terminal callback threw while failing request {}", req->id);
+            }
+            {
+                std::lock_guard<std::mutex> lock(req->mu);
+                req->cv.notify_all();
+            }
+            state->request_pool.Release(req);
+        }
+        state->metrics.active_requests.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(state->result_mu);
+            state->result_producers_done.store(true, std::memory_order_release);
+        }
+        state->queue_cv.notify_all();
+        state->result_cv.notify_all();
+    };
+
     try {
         auto work_ctx = std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)>(
             CreateInferenceWorkContext(), DestroyInferenceWorkContext);
@@ -840,8 +903,7 @@ void EngineLoop(EngineState* state) {
         ModelEntry* model_entry = state->GetDefaultModel();
 
         if (!model_entry) {
-            LOG_CRITICAL("FATAL: No model loaded. EngineLoop exiting.");
-            return;
+            throw std::runtime_error("No model loaded");
         }
         ScopedFastPathRuntimeConfigBinder fast_path_runtime_config_binder(&state->fast_path_config);
         TransformerModel* current_model = model_entry->model.get();
@@ -1125,8 +1187,10 @@ void EngineLoop(EngineState* state) {
                 while (state->status == EngineStatus::RUNNING) {
                     Request* req = state->PopReadyPendingRequest(exclusive_execution);
                     if (!req) break;  // Queue empty
+                    dequeued_request = req;
 #ifdef DENSECORE_TEST_BUILD
                     MaybePauseBeforePendingDequeueForTest();
+                    if (state->fail_worker_for_test.exchange(false)) throw std::runtime_error("injected dequeue failure");
 #endif
 
                     state->RemovePendingRequest(req->id);
@@ -1142,6 +1206,7 @@ void EngineLoop(EngineState* state) {
                                                       "Error: Engine shutdown", global_direct_callback);
                         }
                         state->request_pool.Release(req);
+                        dequeued_request = nullptr;
                         continue;
                     }
 
@@ -1164,6 +1229,7 @@ void EngineLoop(EngineState* state) {
                             // Request finalized before scheduler admission.
                         }
                         state->request_pool.Release(req);
+                        dequeued_request = nullptr;
                         continue;
                     }
 
@@ -1284,6 +1350,7 @@ void EngineLoop(EngineState* state) {
                             state->metrics.failed_requests++;
                         }
                         state->request_pool.Release(req);
+                        dequeued_request = nullptr;
                         continue;
                     }
                     req->start_time = std::chrono::steady_clock::now();
@@ -1299,6 +1366,7 @@ void EngineLoop(EngineState* state) {
                         finalize_generation_error(req, DecodeFinishCause::MissingTokens, "Error: Missing tokens",
                                                   global_direct_callback);
                         state->request_pool.Release(req);
+                        dequeued_request = nullptr;
                         continue;
                     }
                     state->metrics.total_prompt_tokens += req->tokens.size();
@@ -1343,6 +1411,7 @@ void EngineLoop(EngineState* state) {
                             "Error: Request cannot be scheduled (queue full or prefill budget exceeded)",
                             global_direct_callback);
                         state->request_pool.Release(req);
+                        dequeued_request = nullptr;
                         continue;
                     }
 
@@ -1355,9 +1424,11 @@ void EngineLoop(EngineState* state) {
                     {
                         std::lock_guard<std::mutex> active_lock(state->active_mu);
                         state->active_requests.push_back(req);
+                        dequeued_request = nullptr;
                     }
 #ifdef DENSECORE_TEST_BUILD
                     densecore::testing::MaybePauseAfterSchedulerAdmissionForTest();
+                    if (state->fail_worker_for_test.exchange(false)) throw std::runtime_error("injected worker failure");
 #endif
                     req->empty_schedule_stall_count = 0;
                     req->last_progress_time = req->start_time;
@@ -6227,7 +6298,12 @@ void EngineLoop(EngineState* state) {
         graph_cache.ClearArenas();
     } catch (const densecore::DenseCoreException& e) {
         std::cerr << "[DenseCore] Worker thread exception (" << e.CodeInt() << "): " << e.what() << std::endl;
+        fail_worker(e.what());
     } catch (const std::exception& e) {
         std::cerr << "[DenseCore] Worker thread exception: " << e.what() << std::endl;
+        fail_worker(e.what());
+    } catch (...) {
+        std::cerr << "[DenseCore] Worker thread unknown exception" << std::endl;
+        fail_worker("unknown exception");
     }
 }

@@ -1635,8 +1635,11 @@ struct EngineState {
     // Serializes request/model-tokenizer preparation, never generation completion.
     std::mutex construction_mu;
     std::mutex admission_mu;
+    std::mutex shutdown_mu;
+    bool shutdown_complete = false;
 #ifdef DENSECORE_TEST_BUILD
     std::atomic<bool> fail_pending_publication_for_test{false};
+    std::atomic<bool> fail_worker_for_test{false};
 #endif
 
     // Worker thread
@@ -2338,21 +2341,15 @@ struct EngineState {
      * Waits up to 5 seconds for active requests to complete before force-killing.
      */
     void Shutdown() {
+        // Cleanup remains necessary after a worker failure has closed admission.
+        // Serialize repeated callers so they never race on std::thread::join.
+        std::lock_guard<std::mutex> shutdown_lock(shutdown_mu);
+        if (shutdown_complete) return;
         {
             std::lock_guard<std::mutex> admission_lock(admission_mu);
-            EngineStatus expected = EngineStatus::RUNNING;
-            bool began_shutdown;
-            {
-                // The worker checks this predicate under cv_mu before sleeping.
-                std::lock_guard<std::mutex> wake_lock(cv_mu);
-                began_shutdown = status.compare_exchange_strong(expected, EngineStatus::DRAINING);
-            }
-            if (!began_shutdown) {
-                // Already shutting down or stopped
-                if (worker_thread.joinable()) {
-                    worker_thread.join();
-                }
-                return;
+            std::lock_guard<std::mutex> wake_lock(cv_mu);
+            if (status.load(std::memory_order_acquire) == EngineStatus::RUNNING) {
+                status.store(EngineStatus::DRAINING, std::memory_order_release);
             }
         }
 
@@ -2421,7 +2418,9 @@ struct EngineState {
             for (Request* req : remaining_active) {
                 req->cancelled.store(true, std::memory_order_relaxed);
                 bool finalized = false;
-                if (req->is_embedding) {
+                if (req->is_graph_execution) {
+                    finalized = CompleteGraphRequest(req, nullptr, DENSECORE_STATUS_ENGINE_STOPPED);
+                } else if (req->is_embedding) {
                     finalized = FinalizeEmbeddingRequestOnce(this, req, {}, DENSECORE_STATUS_ENGINE_STOPPED,
                                                              use_direct_callback);
                 } else {
@@ -2498,6 +2497,7 @@ struct EngineState {
         ClearPendingCancellations();
 
 
+        shutdown_complete = true;
         LOG_INFO("Engine shutdown complete.");
     }
 
