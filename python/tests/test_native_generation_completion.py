@@ -641,3 +641,206 @@ def test_task_cancel_consumes_native_error_already_delivered_before_submit_retur
     assert errors == [] and library.cancelled == []
     empty_tracking(engine)
     engine.close()
+
+
+@pytest.mark.parametrize("operation", [
+    "metrics", "count", "tokenizer", "template", "tokenize", "runtime_plan",
+    "render", "lora_load", "lora_unload", "lora_enable", "lora_disable", "graph", "weights",
+])
+def test_every_opaque_handle_operation_finishes_before_native_free(monkeypatch, operation):
+    import ctypes
+    import types
+    import numpy as np
+    engine, library = make_engine(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    def blocked(result, *args):
+        entered.set()
+        assert release.wait(2)
+        return result
+    class Lora:
+        def load(self, *_args, **_kwargs): pass
+        def activate(self, *_args): pass
+        def unload(self, *_args): pass
+        def deactivate(self): pass
+        def list_adapters(self): return ["adapter"]
+    engine._lora_manager = Lora()
+    if operation == "metrics":
+        engine._has_metrics = True
+        library.GetMetrics = lambda *_args: blocked(types.SimpleNamespace(
+            requests_per_second=1., tokens_per_second=2., active_requests=1, total_tokens_generated=3
+        ))
+        call = engine.get_metrics
+    elif operation == "count":
+        engine._has_count_tokens_api = True
+        library.CountTokens = lambda *_args: blocked(1)
+        def call():
+            return engine.count_tokens("x")
+    elif operation in ("tokenizer", "template"):
+        engine._has_tokenizer_metadata_api = engine._has_chat_template_api = True
+        library.GetTokenizerType = library.GetChatTemplate = lambda *_args: blocked(b"value")
+        call = engine.get_tokenizer_type if operation == "tokenizer" else engine.get_chat_template
+    elif operation == "tokenize":
+        engine._has_count_tokens_api = engine._has_native_tokenizer_api = True
+        library.CountTokens = lambda *_args: 1
+        def tokenize(*args):
+            blocked(0)
+            args[4][0] = 42
+            return 1
+        library.DenseCoreTokenizeText = tokenize
+        def call():
+            return engine.tokenize_text("x")
+    elif operation == "runtime_plan":
+        monkeypatch.setattr(engine_module, "runtime_plan", lambda *_args: blocked({"context": 16}))
+        call = engine.get_runtime_plan
+    elif operation == "render":
+        engine._has_native_chat_render_api = True
+        def render(*args):
+            blocked(0)
+            output = ctypes.cast(args[-1], ctypes.POINTER(engine_module.DenseCoreRenderedChatPrompt)).contents
+            output.rendered_prompt = b"rendered"
+            output.tokenizer_type = b"unit"
+            return 0
+        library.DenseCoreRenderChatPrompt = render
+        def call():
+            return engine.render_chat_prompt([{"role": "user", "content": "x"}])
+    elif operation.startswith("lora_"):
+        engine._has_lora_api = True
+        library.LoadLoraAdapter = library.UnloadLoraAdapter = library.DeactivateLoraAdapters = lambda *_args: 0
+        library.ActivateLoraAdapter = lambda *_args: 0
+        symbol = {"lora_load": "LoadLoraAdapter", "lora_unload": "UnloadLoraAdapter",
+                  "lora_enable": "ActivateLoraAdapter", "lora_disable": "DeactivateLoraAdapters"}[operation]
+        setattr(library, symbol, lambda *_args: blocked(0))
+        call = {"lora_load": lambda: engine.load_lora("file", name="adapter"),
+                "lora_unload": lambda: engine.unload_lora("adapter"),
+                "lora_enable": lambda: engine.enable_lora("adapter"),
+                "lora_disable": engine.disable_lora}[operation]
+    elif operation == "graph":
+        def graph(*args):
+            blocked(0)
+            args[4][0].ndim = 1
+            args[4][0].shape[0] = 1
+            return 0
+        library.ExecuteGraphSync = graph
+        def call():
+            return engine._execute_graph_sync([("input", np.zeros(1, dtype=np.float32))], "unit")
+    else:
+        class Weights:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def keys(self): return ["weight"]
+            def get_tensor(self, _key): return np.zeros(1, dtype=np.float32)
+        monkeypatch.setattr(engine_module, "SAFETENSORS_AVAILABLE", True)
+        monkeypatch.setattr(engine_module, "safe_open", lambda *_args, **_kwargs: Weights(), raising=False)
+        engine._has_hal_api = True
+        library.DenseCoreSetWeight = lambda *_args: blocked(0)
+        def call():
+            return engine.load_weights("file")
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        operation_done = pool.submit(call)
+        assert entered.wait(2)
+        closed = pool.submit(engine.close)
+        deadline = time.monotonic() + 2
+        while not engine._closing and time.monotonic() < deadline:
+            time.sleep(.001)
+        assert engine._closing and library.free_calls == 0
+        assert not closed.done()
+        release.set()
+        operation_done.result(2)
+        closed.result(2)
+    assert library.free_calls == 1
+
+
+def test_bound_handle_operation_captured_before_quarantine_cannot_enter_native(monkeypatch):
+    engine, library = make_engine(monkeypatch)
+    engine._has_count_tokens_api = True
+    calls = []
+    library.CountTokens = lambda *_args: calls.append("count") or 1
+    captured_operation = engine.count_tokens
+    failure = RuntimeError("native free outcome unknown")
+    monkeypatch.setattr(library, "FreeEngine", lambda _handle: (_ for _ in ()).throw(failure))
+    try:
+        with pytest.raises(RuntimeError):
+            engine.close()
+        with pytest.raises(RuntimeError) as error:
+            captured_operation("x")
+        assert error.value is failure and calls == []
+    finally:
+        engine_module._failed_close_owners.pop(id(engine), None)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("close_engine", [False, True])
+def test_queued_async_submit_cancelled_before_executor_starts_never_enters_native(monkeypatch, streaming, close_engine):
+    import asyncio
+    engine, library = make_engine(monkeypatch)
+    executor = concurrent.futures.ThreadPoolExecutor(1)
+    occupied, release = threading.Event(), threading.Event()
+    blocker = executor.submit(lambda: (occupied.set(), release.wait(3)))
+    assert occupied.wait(2)
+    monkeypatch.setattr(engine_module, "_get_inference_executor", lambda: executor)
+    native_calls = []
+    monkeypatch.setattr(engine, "_submit_request_impl", tracked_submit(
+        engine, library, lambda *_args: native_calls.append("submit")
+    ))
+    errors = []
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        async def execute():
+            if streaming:
+                return [piece async for piece in engine.stream_async("prompt")]
+            return await engine.generate_async("prompt")
+        task = asyncio.create_task(execute())
+        for _ in range(2000):
+            if engine._request_completions and engine._request_completions[1].submit_job is not None:
+                break
+            await asyncio.sleep(.001)
+        else:
+            pytest.fail("submit job was not queued")
+        if close_engine:
+            engine.close()
+        else:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        empty_tracking(engine)
+        assert native_calls == [] and library.cancelled == []
+        await asyncio.sleep(0)
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        blocker.result(2)
+        executor.shutdown(wait=True, cancel_futures=True)
+    assert errors == [] and native_calls == []
+    engine.close()
+
+
+def test_executor_cancelling_never_started_submit_retires_request_without_loop_dependency(monkeypatch):
+    import asyncio
+    engine, library = make_engine(monkeypatch)
+    executor = concurrent.futures.ThreadPoolExecutor(1)
+    occupied, release = threading.Event(), threading.Event()
+    blocker = executor.submit(lambda: (occupied.set(), release.wait(3)))
+    assert occupied.wait(2)
+    monkeypatch.setattr(engine_module, "_get_inference_executor", lambda: executor)
+    native_calls = []
+    monkeypatch.setattr(engine, "_submit_request_impl", lambda *_args: native_calls.append("submit") or 701)
+    async def run():
+        task = asyncio.create_task(engine.generate_async("prompt"))
+        for _ in range(2000):
+            if engine._request_completions and engine._request_completions[1].submit_job is not None:
+                break
+            await asyncio.sleep(.001)
+        executor.shutdown(wait=False, cancel_futures=True)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        empty_tracking(engine)
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        blocker.result(2)
+        executor.shutdown(wait=True)
+    assert native_calls == []
+    engine.close()

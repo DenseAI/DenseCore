@@ -17,7 +17,8 @@ import sys
 import threading
 import warnings
 from collections.abc import AsyncIterator, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future as ConcurrentFuture, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -253,6 +254,7 @@ class _RequestCompletionState:
     cancel_requested: bool = False
     cancel_dispatched: bool = False
     terminal_claimed: bool = False
+    submit_job: Optional[ConcurrentFuture] = None
 
 
 
@@ -693,13 +695,14 @@ class DenseCore:
         self._active_ctypes_refs: Dict[int, List[Any]] = {}  # Prevent GC of ctypes objects
         self._request_parity_mode: Dict[int, bool] = {}
         self._request_completions: Dict[int, _RequestCompletionState] = {}
-        self._native_call_lock = threading.RLock()
+        self._active_native_calls = 0
         self._closing = False
         self._close_attempt: Optional[_CloseAttempt] = None
         self._close_failed = False
         self._close_indeterminate = False
         self._req_id_counter = 0
         self._lock = threading.Lock()
+        self._native_call_condition = threading.Condition(self._lock)
         self._verbose = verbose
         self._model_path = ""
         self._hf_repo_id = hf_repo_id or ""
@@ -802,9 +805,8 @@ class DenseCore:
 
     def get_runtime_plan(self) -> dict:
         """Return effective settings and reserved memory bytes (not measured RSS)."""
-        if self._closed or not self._handle:
-            raise EngineNotInitializedError("engine is closed")
-        return runtime_plan(self._lib, self._handle)
+        with self._native_handle_operation():
+            return runtime_plan(self._lib, self._handle)
 
     @classmethod
     def from_pretrained(
@@ -1209,9 +1211,10 @@ class DenseCore:
                     dc_tensor = DenseCoreTensor.from_numpy(arr)
 
                     # Call C API
-                    self._lib.DenseCoreSetWeight(
-                        self._handle, key.encode("utf-8"), ctypes.byref(dc_tensor)
-                    )
+                    with self._native_handle_operation():
+                        self._lib.DenseCoreSetWeight(
+                            self._handle, key.encode("utf-8"), ctypes.byref(dc_tensor)
+                        )
                     count += 1
                 except ValueError as e:
                     if self._verbose:
@@ -1285,20 +1288,21 @@ class DenseCore:
     def _install_generation_completion_callback(self) -> None:
         # Only absence of the export permits legacy fallback. A present but
         # failing setter must not pretend that native usage is authoritative.
-        try:
-            setter = self._lib.DenseCoreSetGenerationCompletionCallback
-        except AttributeError:
-            self._has_generation_completion_api = False
-            return
-        self._has_generation_completion_api = True
-        setter.argtypes = [ctypes.c_void_p, GENERATION_COMPLETION_CALLBACK_TYPE]
-        setter.restype = ctypes.c_int
-        self._c_generation_completion_callback = GENERATION_COMPLETION_CALLBACK_TYPE(
-            self._global_generation_completion_callback
-        )
-        status = setter(self._handle, self._c_generation_completion_callback)
-        if status < 0:
-            raise _error_code_to_exception(status, context="registering generation completion callback")
+        with self._native_handle_operation():
+            try:
+                setter = self._lib.DenseCoreSetGenerationCompletionCallback
+            except AttributeError:
+                self._has_generation_completion_api = False
+                return
+            self._has_generation_completion_api = True
+            setter.argtypes = [ctypes.c_void_p, GENERATION_COMPLETION_CALLBACK_TYPE]
+            setter.restype = ctypes.c_int
+            self._c_generation_completion_callback = GENERATION_COMPLETION_CALLBACK_TYPE(
+                self._global_generation_completion_callback
+            )
+            status = setter(self._handle, self._c_generation_completion_callback)
+            if status < 0:
+                raise _error_code_to_exception(status, context="registering generation completion callback")
 
     def _global_generation_completion_callback(
         self, generated_tokens: int, reason: int, user_data: int
@@ -1336,15 +1340,49 @@ class DenseCore:
         except EngineNotInitializedError:
             pass
 
-    def _native_call_mutex(self):
-        # The lazy path also supports older test/adapter instances constructed
-        # with __new__. Never hold _lock while entering native code: callbacks
-        # may run synchronously before SubmitRequest/CancelRequest returns.
+    @contextmanager
+    def _native_handle_operation(self):
+        # Enter atomically with the close state check. Callbacks need _lock, so
+        # never retain it while calling C or copying borrowed native results.
         with self._lock:
-            mutex = getattr(self, "_native_call_lock", None)
-            if mutex is None:
-                mutex = self._native_call_lock = threading.RLock()
-            return mutex
+            if getattr(self, "_close_failed", False):
+                raise self._close_attempt.error
+            if getattr(self, "_closed", False) or getattr(self, "_closing", False) or not self._handle:
+                raise EngineNotInitializedError("engine is closing or closed")
+            if not hasattr(self, "_native_call_condition"):
+                self._native_call_condition = threading.Condition(self._lock)
+            self._active_native_calls = getattr(self, "_active_native_calls", 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_native_calls -= 1
+                if self._active_native_calls == 0:
+                    self._native_call_condition.notify_all()
+
+    def _owned_async_submission(self, loop, req_id, prompt, params):
+        # Own the concurrent job independently of an asyncio caller/loop. A
+        # cancelled queued job is proven never to have entered native submit.
+        with self._lock:
+            state = getattr(self, "_request_completions", {}).get(req_id)
+            if state is None or getattr(self, "_closed", False) or getattr(self, "_closing", False):
+                raise EngineNotInitializedError("engine is closing or closed")
+            if state.cancel_requested:
+                job = ConcurrentFuture()
+                job.cancel()
+            else:
+                job = _get_inference_executor().submit(self._submit_request, req_id, prompt, params)
+            state.submit_job = job
+        def retire_cancelled_job(completed):
+            if completed.cancelled():
+                self._cleanup_request(req_id)
+        job.add_done_callback(retire_cancelled_job)
+        submitted = asyncio.wrap_future(job, loop=loop)
+        def consume_outcome(completed):
+            if not completed.cancelled():
+                completed.exception()
+        submitted.add_done_callback(consume_outcome)
+        return submitted
 
     def _global_callback(self, token: bytes, is_finished: int, user_data: int) -> None:
         """Deliver string content, then retire request tracking after terminal."""
@@ -1502,10 +1540,11 @@ class DenseCore:
         self, req_id: int, prompt: Union[str, List[int]], params: Dict[str, Any]
     ) -> int:
         try:
-            with self._native_call_mutex():
+            with self._native_handle_operation():
                 with self._lock:
-                    if getattr(self, "_closed", False) or getattr(self, "_closing", False) or getattr(self, "_close_failed", False) or not self._handle:
-                        raise EngineNotInitializedError("engine is closing or closed")
+                    state = getattr(self, "_request_completions", {}).get(req_id)
+                    if state is not None and state.cancel_requested:
+                        raise DenseCoreRuntimeError("request canceled before native submission")
                 result = self._submit_request_impl(req_id, prompt, params)
             if result < 0:
                 self._cleanup_request(req_id)
@@ -2214,9 +2253,8 @@ class DenseCore:
         completed = False
         try:
             prompt_arg = self._normalize_prompt(prompt, kwargs.get("input_ids"))
-            ret = await loop.run_in_executor(
-                _get_inference_executor(), self._submit_request, req_id, prompt_arg, params
-            )
+            submission = self._owned_async_submission(loop, req_id, prompt_arg, params)
+            ret = await asyncio.shield(submission)
             if ret < 0:
                 raise _error_code_to_exception(ret, context="in generate_async()")
             result = await future
@@ -2279,9 +2317,8 @@ class DenseCore:
         req_id = self._register_request(handler)
         terminal_seen = False
         try:
-            ret = await loop.run_in_executor(
-                _get_inference_executor(), self._submit_request, req_id, prompt_arg, params
-            )
+            submission = self._owned_async_submission(loop, req_id, prompt_arg, params)
+            ret = await asyncio.shield(submission)
             if ret < 0:
                 raise _error_code_to_exception(ret, context="in stream_async()")
             while True:
@@ -2473,29 +2510,30 @@ class DenseCore:
             preserve_thinking=-1 if preserve_thinking is None else int(bool(preserve_thinking)),
         )
         rendered = DenseCoreRenderedChatPrompt()
-        self._lib.DenseCoreRenderChatPrompt(
-            self._handle,
-            c_messages,
-            len(normalized_messages),
-            ctypes.byref(options),
-            ctypes.byref(rendered),
-        )
-        return {
-            "prompt": rendered.rendered_prompt.decode("utf-8") if rendered.rendered_prompt else "",
-            "tokenizer_type": rendered.tokenizer_type.decode("utf-8")
-            if rendered.tokenizer_type
-            else "",
-            "chat_template": rendered.chat_template.decode("utf-8")
-            if rendered.chat_template
-            else "",
-            "model_variant": rendered.model_variant.decode("utf-8")
-            if rendered.model_variant
-            else "",
-            "prompt_family": rendered.prompt_family.decode("utf-8")
-            if rendered.prompt_family
-            else "",
-            "thinking_enabled": bool(rendered.thinking_enabled),
-        }
+        with self._native_handle_operation():
+            self._lib.DenseCoreRenderChatPrompt(
+                self._handle,
+                c_messages,
+                len(normalized_messages),
+                ctypes.byref(options),
+                ctypes.byref(rendered),
+            )
+            return {
+                "prompt": rendered.rendered_prompt.decode("utf-8") if rendered.rendered_prompt else "",
+                "tokenizer_type": rendered.tokenizer_type.decode("utf-8")
+                if rendered.tokenizer_type
+                else "",
+                "chat_template": rendered.chat_template.decode("utf-8")
+                if rendered.chat_template
+                else "",
+                "model_variant": rendered.model_variant.decode("utf-8")
+                if rendered.model_variant
+                else "",
+                "prompt_family": rendered.prompt_family.decode("utf-8")
+                if rendered.prompt_family
+                else "",
+                "thinking_enabled": bool(rendered.thinking_enabled),
+            }
 
     def chat(
         self,
@@ -2694,28 +2732,31 @@ class DenseCore:
     def get_tokenizer_type(self) -> str:
         if not getattr(self, "_has_tokenizer_metadata_api", False) or not self._handle:
             return ""
-        value = self._lib.GetTokenizerType(self._handle)
-        return value.decode("utf-8") if value else ""
+        with self._native_handle_operation():
+            value = self._lib.GetTokenizerType(self._handle)
+            return value.decode("utf-8") if value else ""
 
     def get_chat_template(self) -> str:
         if not getattr(self, "_has_chat_template_api", False) or not self._handle:
             return ""
-        value = self._lib.GetChatTemplate(self._handle)
-        return value.decode("utf-8") if value else ""
+        with self._native_handle_operation():
+            value = self._lib.GetChatTemplate(self._handle)
+            return value.decode("utf-8") if value else ""
 
     def count_tokens(self, text: str, *, add_bos: bool = False, add_eos: bool = False) -> int:
         if not getattr(self, "_has_count_tokens_api", False):
             raise NotImplementedError(
                 "CountTokens API is not available in the loaded DenseCore library"
             )
-        return int(
-            self._lib.CountTokens(
-                self._handle,
-                text.encode("utf-8"),
-                int(add_bos),
-                int(add_eos),
+        with self._native_handle_operation():
+            return int(
+                self._lib.CountTokens(
+                    self._handle,
+                    text.encode("utf-8"),
+                    int(add_bos),
+                    int(add_eos),
+                )
             )
-        )
 
     def tokenize_text(
         self, text: str, *, add_bos: bool = False, add_eos: bool = False
@@ -2724,19 +2765,20 @@ class DenseCore:
             raise NotImplementedError(
                 "DenseCoreTokenizeText API is not available in the loaded DenseCore library"
             )
-        count = self.count_tokens(text, add_bos=add_bos, add_eos=add_eos)
-        if count <= 0:
-            return []
-        buffer = (ctypes.c_int * count)()
-        written = self._lib.DenseCoreTokenizeText(
-            self._handle,
-            text.encode("utf-8"),
-            int(add_bos),
-            int(add_eos),
-            buffer,
-            count,
-        )
-        return [int(buffer[index]) for index in range(int(written))]
+        with self._native_handle_operation():
+            count = self.count_tokens(text, add_bos=add_bos, add_eos=add_eos)
+            if count <= 0:
+                return []
+            buffer = (ctypes.c_int * count)()
+            written = self._lib.DenseCoreTokenizeText(
+                self._handle,
+                text.encode("utf-8"),
+                int(add_bos),
+                int(add_eos),
+                buffer,
+                count,
+            )
+            return [int(buffer[index]) for index in range(int(written))]
 
     # =========================================================================
     # LoRA Adapter Management
@@ -2765,18 +2807,19 @@ class DenseCore:
 
         # Call C++ API to actually load the adapter
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
-            ret = self._lib.LoadLoraAdapter(
-                self._handle,
-                adapter_path.encode("utf-8"),
-                ctypes.c_float(scale),
-                name.encode("utf-8"),
-            )
-            if ret < 0:
-                raise RuntimeError(f"Failed to load LoRA adapter: error code {ret}")
+            with self._native_handle_operation():
+                ret = self._lib.LoadLoraAdapter(
+                    self._handle,
+                    adapter_path.encode("utf-8"),
+                    ctypes.c_float(scale),
+                    name.encode("utf-8"),
+                )
+                if ret < 0:
+                    raise RuntimeError(f"Failed to load LoRA adapter: error code {ret}")
 
-            # Activate immediately
-            self._lib.ActivateLoraAdapter(self._handle, name.encode("utf-8"))
-            self._lora_manager.activate(name)
+                # Activate immediately
+                self._lib.ActivateLoraAdapter(self._handle, name.encode("utf-8"))
+                self._lora_manager.activate(name)
         else:
             # Fallback: Python-level tracking only (legacy warning removed)
             self._lora_manager.activate(name)
@@ -2793,11 +2836,12 @@ class DenseCore:
         """
         # Call C++ API first
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
-            ret = self._lib.UnloadLoraAdapter(self._handle, name.encode("utf-8"))
-            if ret < 0:
-                warnings.warn(
-                    f"Failed to unload LoRA adapter in C++: error code {ret}", stacklevel=2
-                )
+            with self._native_handle_operation():
+                ret = self._lib.UnloadLoraAdapter(self._handle, name.encode("utf-8"))
+                if ret < 0:
+                    warnings.warn(
+                        f"Failed to unload LoRA adapter in C++: error code {ret}", stacklevel=2
+                    )
 
         self._lora_manager.unload(name)
 
@@ -2816,9 +2860,10 @@ class DenseCore:
 
         # Call C++ API
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
-            ret = self._lib.ActivateLoraAdapter(self._handle, name.encode("utf-8"))
-            if ret < 0:
-                raise RuntimeError(f"Failed to activate LoRA adapter: error code {ret}")
+            with self._native_handle_operation():
+                ret = self._lib.ActivateLoraAdapter(self._handle, name.encode("utf-8"))
+                if ret < 0:
+                    raise RuntimeError(f"Failed to activate LoRA adapter: error code {ret}")
 
         self._lora_manager.activate(name)
 
@@ -2826,11 +2871,12 @@ class DenseCore:
         """Disable all LoRA adapters (use base model only)."""
         # Call C++ API
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
-            ret = self._lib.DeactivateLoraAdapters(self._handle)
-            if ret < 0:
-                warnings.warn(
-                    f"Failed to deactivate LoRA adapters in C++: error code {ret}", stacklevel=2
-                )
+            with self._native_handle_operation():
+                ret = self._lib.DeactivateLoraAdapters(self._handle)
+                if ret < 0:
+                    warnings.warn(
+                        f"Failed to deactivate LoRA adapters in C++: error code {ret}", stacklevel=2
+                    )
 
         self._lora_manager.deactivate()
 
@@ -3003,35 +3049,40 @@ class DenseCore:
     # =========================================================================
 
     def stop_generation(self, req_id: int) -> bool:
-        """Cancel a registered Python request using its actual native request ID.
+        """Cancel a registered request using its returned native request ID.
 
-        A request submitted concurrently can defer cancellation until native
-        submission returns. Handlers and ctypes references remain registered
-        until the real terminal callback. Without native cancellation support,
-        this returns False and leaves normal completion tracking intact.
+        Queued Python submissions can be retired before entering C. A running
+        submission defers cancellation until its native ID is known. Accepted
+        requests retain handlers/ctypes refs until their real native terminal.
         """
         with self._lock:
             if not self._handle or getattr(self, "_closed", False):
                 raise EngineNotInitializedError("Engine handle is null")
-            if getattr(self, "_closing", False) or getattr(self, "_close_indeterminate", False) or not getattr(self, "_has_cancel_api", False):
+            if getattr(self, "_closing", False) or getattr(self, "_close_indeterminate", False):
                 return False
             state = getattr(self, "_request_completions", {}).get(req_id)
             if state is None or state.terminal_claimed:
                 return False
-            state.cancel_requested = True
-            if state.native_request_id is None or state.cancel_dispatched:
-                return True
-            state.cancel_dispatched = True
+            job = state.submit_job
             native_id = state.native_request_id
+            if not getattr(self, "_has_cancel_api", False) and job is None:
+                return False
+            state.cancel_requested = True
+            if native_id is not None:
+                if not getattr(self, "_has_cancel_api", False):
+                    return False
+                if state.cancel_dispatched:
+                    return True
+                state.cancel_dispatched = True
+        if native_id is None:
+            # Future.cancel invokes done callbacks synchronously; never call it
+            # under _lock, because retirement acquires the same request lock.
+            if job is not None and job.cancel():
+                return True
+            return bool(getattr(self, "_has_cancel_api", False))
         try:
-            with self._native_call_mutex():
-                with self._lock:
-                    closing = getattr(self, "_closing", False) or getattr(self, "_closed", False)
-                    handle = self._handle
-                if closing or not handle:
-                    accepted = False
-                else:
-                    accepted = self._lib.CancelRequest(handle, ctypes.c_int(native_id)) >= 0
+            with self._native_handle_operation():
+                accepted = self._lib.CancelRequest(self._handle, ctypes.c_int(native_id)) >= 0
         except Exception:
             accepted = False
         if not accepted:
@@ -3202,28 +3253,29 @@ class DenseCore:
         outputs_array = (DenseCoreTensorOutput * num_outputs)(output_tensor)
 
         # Execute graph
-        result = self._lib.ExecuteGraphSync(
-            self._handle,
-            inputs_array,
-            len(input_tensors),
-            graph_name.encode("utf-8"),
-            outputs_array,
-            num_outputs,
-        )
+        with self._native_handle_operation():
+            result = self._lib.ExecuteGraphSync(
+                self._handle,
+                inputs_array,
+                len(input_tensors),
+                graph_name.encode("utf-8"),
+                outputs_array,
+                num_outputs,
+            )
 
-        if result < 0:
-            raise DenseCoreRuntimeError(f"Graph execution failed with code {result}")
+            if result < 0:
+                raise DenseCoreRuntimeError(f"Graph execution failed with code {result}")
 
-        # Extract output tensor
-        out = outputs_array[0]
-        shape = tuple(out.shape[i] for i in range(out.ndim))
+            # Extract output tensor
+            out = outputs_array[0]
+            shape = tuple(out.shape[i] for i in range(out.ndim))
 
-        # Calculate size and reshape
-        size = 1
-        for s in shape:
-            size *= s
+            # Calculate size and reshape
+            size = 1
+            for s in shape:
+                size *= s
 
-        return output_buffer[:size].reshape(shape)
+            return output_buffer[:size].reshape(shape)
 
     def process_image(
         self,
@@ -3408,8 +3460,9 @@ class DenseCore:
     def close(self) -> None:
         """Join native producers before releasing callback state.
 
-        A failed cleanup quarantines handle/callback ownership and disables
-        further native calls. No retry guesses whether destruction completed.
+        Waits for in-flight native operations and callback producers; no Python
+        close deadline is promised. Failed cleanup quarantines handle/callback
+        ownership and disables further native calls without retrying destruction.
         """
         if not hasattr(self, "_closed"):
             return
@@ -3431,9 +3484,17 @@ class DenseCore:
                 raise attempt.error
             return
         try:
-            with self._native_call_mutex():
-                if self._handle:
-                    self._lib.FreeEngine(self._handle)
+            with self._lock:
+                queued_jobs = [state.submit_job for state in getattr(self, "_request_completions", {}).values()
+                               if state.submit_job is not None]
+            for job in queued_jobs:
+                job.cancel()
+            with self._lock:
+                while getattr(self, "_active_native_calls", 0):
+                    self._native_call_condition.wait()
+                handle, library = self._handle, self._lib
+            if handle:
+                library.FreeEngine(handle)
         except BaseException as error:
             with self._lock:
                 self._closing = False
@@ -3470,13 +3531,14 @@ class DenseCore:
             or not getattr(self, "_has_metrics", False)
         ):
             return None
-        metrics = self._lib.GetMetrics(self._handle)
-        return {
-            "requests_per_second": float(metrics.requests_per_second),
-            "tokens_per_second": float(metrics.tokens_per_second),
-            "active_requests": int(metrics.active_requests),
-            "total_tokens_generated": int(metrics.total_tokens_generated),
-        }
+        with self._native_handle_operation():
+            metrics = self._lib.GetMetrics(self._handle)
+            return {
+                "requests_per_second": float(metrics.requests_per_second),
+                "tokens_per_second": float(metrics.tokens_per_second),
+                "active_requests": int(metrics.active_requests),
+                "total_tokens_generated": int(metrics.total_tokens_generated),
+            }
 
     def __enter__(self) -> "DenseCore":
         """Context manager entry."""
