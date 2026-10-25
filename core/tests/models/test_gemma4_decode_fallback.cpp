@@ -2230,6 +2230,7 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimi
         for (int c=0; c<max_columns; ++c) for (int i=0; i<reduction; ++i)
             inputs[c*reduction+i] = .17f*std::sin((i+1)*.019f+c*.37f)+.031f*std::cos((i+9)*.041f-c*.11f);
         auto model = MakeBaseGemma4GraphModel(1);
+        model->variant = ModelVariant::GEMMA4;
         model->hparams.n_embd = embedding;
         model->gemma4_hidden_size_per_layer_input = hidden;
         model->layers[0].Set(gate ? model_keys::kGemma4PerLayerInputGate : model_keys::kGemma4PerLayerProjection, weight);
