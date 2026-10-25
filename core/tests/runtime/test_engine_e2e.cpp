@@ -228,6 +228,14 @@ TEST(RuntimeOptimizationStateTest, ReportsEligiblePrefixAndRecurrentSnapshotPoli
         EXPECT_EQ(output.token_id_submit_supported, 1);
         EXPECT_EQ(output.prefix_cache_reuse_enabled, policy.expected_prefix);
         EXPECT_EQ(output.hybrid_ssm_snapshot_restore_enabled, policy.expected_snapshot);
+
+        state.speculation_selected.store(2);
+        ASSERT_EQ(DenseCoreGetRuntimeOptimizationState(&state, &output), DENSECORE_STATUS_OK);
+        EXPECT_EQ(output.prefix_cache_reuse_enabled, 0);
+        EXPECT_EQ(output.hybrid_ssm_snapshot_restore_enabled, 0);
+        EXPECT_EQ(output.prefill_graph_cache_enabled, 0);
+        EXPECT_EQ(output.decode_graph_cache_enabled, 0);
+        EXPECT_EQ(output.prefill_arena_reuse_enabled, 0);
     }
 }
 

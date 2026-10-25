@@ -731,13 +731,14 @@ int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle, DenseCoreRuntim
         model && model->arch_flags.is_hybrid_ssm && model_variant == ModelVariant::QWEN36;
     const bool qwen38_hybrid =
         model && model->arch_flags.is_hybrid_ssm && model_variant == ModelVariant::QWEN38;
-    const bool graph_reuse_globally_enabled = !config.worker.graph_cache_reuse_disabled;
+    const bool mtp_reference = state->speculation_selected.load(std::memory_order_acquire) == 2;
+    const bool graph_reuse_globally_enabled = !config.worker.graph_cache_reuse_disabled && !mtp_reference;
     const bool prefill_graph_model_eligible =
         model && model->hparams.n_experts == 0 && !model->arch_flags.is_hybrid_ssm;
     const bool prefill_arena_model_eligible = model && model->arch_flags.is_gemma4;
     out->token_id_submit_supported = 1;
     out->prefix_cache_reuse_enabled =
-        (!config.worker.prefix_cache_reuse_disabled &&
+        (!mtp_reference && !config.worker.prefix_cache_reuse_disabled &&
          (!qwen36_hybrid || config.worker.qwen36_prefix_cache_reuse_enabled) &&
          (!qwen35_hybrid || config.worker.qwen35_prefix_cache_reuse_enabled) && !qwen38_hybrid)
             ? 1

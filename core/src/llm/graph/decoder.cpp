@@ -2044,7 +2044,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 cur = apply_weighted_rms_norm(cur, post_attn_norm, "post_attention_norm", il);
             }
 
-            if (il == static_cast<int>(model->layers.size()) - 1 && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+            if (il == static_cast<int>(model->layers.size()) - 1 &&
+                !(overrides && overrides->pre_output_norm_hidden) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
                 const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
                 cur = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
                 cur = ggml_cont(ctx_c, cur);
