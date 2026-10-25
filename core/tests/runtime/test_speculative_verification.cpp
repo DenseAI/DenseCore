@@ -69,6 +69,18 @@ std::unique_ptr<TransformerModel> MakeTinyNextNSource() {
     return owner;
 }
 
+TEST(MtpReferenceSession, BootstrapRetainsFirstTokenAndCarriesPreviousTargetHiddenAcrossChunks) {
+    const std::vector<int> tokens = {10, 20, 30};
+    const std::vector<float> hidden = {1, 2, 3, 4, 5, 6};
+    const auto full = BuildNextNBootstrapBatch(tokens, hidden, 2, 0, 3);
+    EXPECT_EQ(full.tokens, tokens);
+    EXPECT_EQ(full.hidden, (std::vector<float>{0, 0, 1, 2, 3, 4}));
+    const auto next_chunk = BuildNextNBootstrapBatch(tokens, hidden, 2, 1, 2);
+    EXPECT_EQ(next_chunk.tokens, (std::vector<int>{20, 30}));
+    EXPECT_EQ(next_chunk.hidden, (std::vector<float>{1, 2, 3, 4}));
+    EXPECT_THROW(BuildNextNBootstrapBatch(tokens, hidden, 2, 2, 2), std::invalid_argument);
+}
+
 TEST(MtpReferenceSession, VerifiesGreedyProposalsAndRecoversFromRejection) {
     auto source = MakeTinyNextNSource();
     auto* ctx = ggml_init({1024 * 1024, nullptr, false});

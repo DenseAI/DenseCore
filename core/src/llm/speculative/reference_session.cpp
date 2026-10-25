@@ -26,6 +26,26 @@ void CheckCancelled(const std::atomic<bool>& cancelled) {
     if (cancelled.load(std::memory_order_relaxed)) throw std::runtime_error("MTP request canceled");
 }
 }
+NextNBootstrapBatch BuildNextNBootstrapBatch(const std::vector<int>& prompt,
+                                             const std::vector<float>& normalized_hidden,
+                                             size_t embedding, size_t begin, size_t count) {
+    if (embedding == 0 || normalized_hidden.size() / embedding != prompt.size() ||
+        normalized_hidden.size() % embedding || begin > prompt.size() || count > prompt.size() - begin) {
+        throw std::invalid_argument("MTP prompt/hidden alignment mismatch");
+    }
+    NextNBootstrapBatch result;
+    result.tokens.assign(prompt.begin() + begin, prompt.begin() + begin + count);
+    result.hidden.assign(count * embedding, 0.0f);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t position = begin + i;
+        if (position > 0) {
+            std::copy_n(normalized_hidden.data() + (position - 1) * embedding, embedding,
+                        result.hidden.data() + i * embedding);
+        }
+    }
+    return result;
+}
+
 ReferenceSession::ReferenceSession(TransformerModel& model, int max_context, int draft_n_max,
                                    uint64_t seed, int threads)
     : source_(model), head_(model), work_(CreateInferenceWorkContext(), DestroyInferenceWorkContext),
@@ -119,12 +139,11 @@ void ReferenceSession::Bootstrap(const InferenceDependencies* deps, const std::a
         throw std::invalid_argument("MTP requires every prompt token hidden state");
     }
     const size_t embd = source_.hparams.n_embd;
-    for (size_t begin = 0; begin + 1 < prompt_tokens_.size();) {
+    for (size_t begin = 0; begin < prompt_tokens_.size();) {
         CheckCancelled(cancelled);
-        const size_t count = std::min(size_t{16}, prompt_tokens_.size() - 1 - begin);
-        std::vector<int> tokens(prompt_tokens_.begin() + begin + 1, prompt_tokens_.begin() + begin + 1 + count);
-        std::vector<float> hidden(prompt_hidden_.begin() + begin * embd, prompt_hidden_.begin() + (begin + count) * embd);
-        ForwardHead(tokens, hidden, nullptr, deps);
+        const size_t count = std::min(size_t{16}, prompt_tokens_.size() - begin);
+        auto input = BuildNextNBootstrapBatch(prompt_tokens_, prompt_hidden_, embd, begin, count);
+        ForwardHead(input.tokens, input.hidden, nullptr, deps);
         begin += count;
     }
     prompt_tokens_.clear(); prompt_tokens_.shrink_to_fit();
@@ -133,7 +152,7 @@ void ReferenceSession::Bootstrap(const InferenceDependencies* deps, const std::a
 }
 void ReferenceSession::MakeProposals(int selected_token, const SamplingParams& params,
                                      const InferenceDependencies* deps, const std::atomic<bool>& cancelled) {
-    const int keep = target_seen_ - 1;
+    const int keep = target_seen_;
     if (keep < 0 || keep > head_past_ || !cache_->block_manager->RollbackExclusiveSuffix(&blocks_, keep)) {
         throw std::runtime_error("MTP head rollback failed");
     }

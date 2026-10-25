@@ -8,6 +8,16 @@
 
 namespace densecore::llm::speculative {
 
+struct NextNBootstrapBatch {
+    std::vector<int> tokens;
+    std::vector<float> hidden;
+};
+// Prompt token t is paired with normalized target h[t-1]; t=0 uses zeros.
+// Absolute positions remain unchanged, including across bootstrap chunks.
+NextNBootstrapBatch BuildNextNBootstrapBatch(const std::vector<int>& prompt,
+                                             const std::vector<float>& normalized_hidden,
+                                             size_t embedding, size_t begin, size_t count);
+
 // Correctness reference: target verification remains one ordinary decode step
 // per worker iteration. K head proposals are generated ahead, but no unverified
 // token enters the output path or the target KV/recurrent state. This is not a
