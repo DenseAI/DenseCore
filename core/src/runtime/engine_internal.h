@@ -1648,6 +1648,7 @@ struct EngineState {
 #ifdef DENSECORE_TEST_BUILD
     std::atomic<bool> fail_pending_publication_for_test{false};
     std::atomic<bool> fail_worker_for_test{false};
+    std::atomic<bool> fail_result_publication_for_test{false};
 #endif
 
     // Worker thread
@@ -2559,26 +2560,53 @@ inline void PushResultEvent(EngineState* state, int request_id, const std::strin
                             bool error, TokenCallback cb, TokenCallbackEx cb_ex, TokenResultCallback token_result_cb,
                             void* user_data, GenerationCompletionCallback completion_callback,
                             int generated_tokens, DenseCoreGenerationFinishReason finish_reason) {
-    ResultEvent event;
-    event.completion_callback = completion_callback;
-    event.generated_tokens = generated_tokens;
-    event.finish_reason = finish_reason;
-    event.request_id = request_id;
-    event.token_str = token;
-    event.token_id = token_id;
-    event.finished = finished;
-    event.error = error;
-    event.callback = cb;
-    event.callback_ex = cb_ex;
-    event.token_result_callback = token_result_cb;
-    event.user_data = user_data;
-    event.emb_callback = nullptr;
-    // embedding_data is default-constructed as empty vector (no assignment needed)
+    try {
+        ResultEvent event;
+        event.completion_callback = completion_callback;
+        event.generated_tokens = generated_tokens;
+        event.finish_reason = finish_reason;
+        event.request_id = request_id;
+        event.token_str = token;
+        event.token_id = token_id;
+        event.finished = finished;
+        event.error = error;
+        event.callback = cb;
+        event.callback_ex = cb_ex;
+        event.token_result_callback = token_result_cb;
+        event.user_data = user_data;
+        event.emb_callback = nullptr;
+        // embedding_data is default-constructed as empty vector (no assignment needed)
 
-    {
-        std::unique_lock<std::mutex> lock(state->result_mu);
-        ApplyResultQueueBackpressure(state, lock);
-        state->result_queue.push_back(std::move(event));
+        {
+            std::unique_lock<std::mutex> lock(state->result_mu);
+            ApplyResultQueueBackpressure(state, lock);
+    #ifdef DENSECORE_TEST_BUILD
+            if (finished && state->fail_result_publication_for_test.exchange(false)) throw std::bad_alloc();
+    #endif
+            state->result_queue.push_back(std::move(event));
+        }
+    } catch (...) {
+        if (!finished) throw;
+        // A terminal event cannot be lost after its request CAS commits. Queue
+        // allocation failure falls back to direct delivery without allocating.
+        // Callbacks run outside result_mu, and each is attempted only once.
+        if (completion_callback) {
+            try { completion_callback(generated_tokens, finish_reason, user_data); } catch (...) {}
+        }
+        try {
+            if (cb_ex) {
+                cb_ex(token.data(), static_cast<int>(token.size()), token_id, 1, user_data);
+            } else if (cb) {
+                cb(token.c_str(), 1, user_data);
+            } else if (token_result_cb) {
+                TokenResult result;
+                result.token_id = token_id;
+                result.text = token.c_str();
+                result.is_finished = 1;
+                token_result_cb(&result, user_data);
+            }
+        } catch (...) {}
+        return;
     }
     state->result_cv.notify_one();
 }
@@ -2596,10 +2624,24 @@ inline void PushEmbeddingResultEvent(EngineState* state, int request_id, std::ve
     event.embedding_data = std::move(embedding_data);  // RAII ownership transfer
     event.embedding_status = status;
 
-    {
+    try {
         std::unique_lock<std::mutex> lock(state->result_mu);
         ApplyResultQueueBackpressure(state, lock);
+#ifdef DENSECORE_TEST_BUILD
+        if (state->fail_result_publication_for_test.exchange(false)) throw std::bad_alloc();
+#endif
         state->result_queue.push_back(std::move(event));
+    } catch (...) {
+        // Preserve successful embedding bytes in the local event when queue
+        // publication fails; moving them into a retry would lose the payload.
+        try {
+            if (cb && status == DENSECORE_STATUS_OK && !event.embedding_data.empty()) {
+                cb(event.embedding_data.data(), static_cast<int>(event.embedding_data.size()), user_data);
+            } else if (cb) {
+                cb(nullptr, status < 0 ? status : DENSECORE_STATUS_INTERNAL_ERROR, user_data);
+            }
+        } catch (...) {}
+        return;
     }
     state->result_cv.notify_one();
 }

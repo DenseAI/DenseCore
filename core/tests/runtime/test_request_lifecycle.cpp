@@ -498,3 +498,35 @@ TEST_F(RequestLifecycleTest, WorkerExceptionWhileDequeuedTerminatesEmbeddingBefo
     EXPECT_EQ(embedding.terminal_size, DENSECORE_STATUS_INTERNAL_ERROR);
     EXPECT_EQ(state->pending_requests.Size(), 0u);
 }
+
+TEST(RequestTerminalPublicationTest, GenerationQueueFailureFallsBackOnceAndWakesCaller) {
+    EngineState state;
+    Request req;
+    CallbackState callback;
+    req.callback_ex = LifecycleCallbackEx;
+    req.user_data = &callback;
+    state.fail_result_publication_for_test.store(true);
+    EXPECT_TRUE(FinalizeGenerationRequestOnce(&state, &req, "failure", -1, true, false));
+    EXPECT_TRUE(callback.WaitForFinal(10ms));
+    EXPECT_EQ(callback.final_count, 1);
+    EXPECT_TRUE(state.result_queue.empty());
+    EXPECT_FALSE(FinalizeGenerationRequestOnce(&state, &req, "duplicate", -1, true, false));
+    EXPECT_EQ(callback.final_count, 1);
+}
+
+TEST(RequestTerminalPublicationTest, EmbeddingQueueFailurePreservesSuccessPayloadAndCompletesOnce) {
+    EngineState state;
+    Request req;
+    EmbeddingCallbackState callback;
+    req.is_embedding = true;
+    req.embedding_callback = EmbeddingLifecycleCallback;
+    req.user_data = &callback;
+    state.fail_result_publication_for_test.store(true);
+    EXPECT_TRUE(FinalizeEmbeddingRequestOnce(&state, &req, {1.0f, 2.0f}, DENSECORE_STATUS_OK, false));
+    EXPECT_TRUE(callback.Wait(10ms));
+    EXPECT_EQ(callback.callback_count, 1);
+    EXPECT_EQ(callback.embedding, (std::vector<float>{1.0f, 2.0f}));
+    EXPECT_TRUE(state.result_queue.empty());
+    EXPECT_FALSE(FinalizeEmbeddingRequestOnce(&state, &req, {}, DENSECORE_STATUS_INTERNAL_ERROR, false));
+    EXPECT_EQ(callback.callback_count, 1);
+}

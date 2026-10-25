@@ -70,6 +70,8 @@ void cb_kv_update_and_gather_custom(struct ggml_tensor* dst, int ith, int nth, v
 void cb_rope_precomputed_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata);
 
 namespace {
+// Initialized before runtime OOM; terminal delivery must not build an error string.
+const std::string kWorkerFailureTerminalText = "Error: worker failed";
 using densecore::llm::graph::ScopedGgmlGraphArena;
 
 thread_local const densecore::llm::config::FastPathRuntimeConfig* tls_fast_path_runtime_config = nullptr;
@@ -805,7 +807,7 @@ void EngineLoop(EngineState* state) {
     // A dequeued request is not published in active_requests until scheduler
     // admission finishes. Keep that ownership visible to exception cleanup.
     Request* dequeued_request = nullptr;
-    auto fail_worker = [&](const char* message) {
+    auto fail_worker = [&]() {
         {
             std::lock_guard<std::mutex> admission_lock(state->admission_mu);
             std::lock_guard<std::mutex> wake_lock(state->cv_mu);
@@ -840,7 +842,7 @@ void EngineLoop(EngineState* state) {
                     completed = FinalizeEmbeddingRequestOnce(state, req, {}, DENSECORE_STATUS_INTERNAL_ERROR, direct);
                 } else {
                     req->decode_finish_cause = DecodeFinishCause::GraphBuildFailed;
-                    completed = FinalizeGenerationRequestOnce(state, req, std::string("Error: worker failed: ") + message,
+                    completed = FinalizeGenerationRequestOnce(state, req, kWorkerFailureTerminalText,
                                                              -1, true, direct);
                 }
                 if (completed) state->metrics.failed_requests.fetch_add(1, std::memory_order_relaxed);
@@ -6284,12 +6286,12 @@ void EngineLoop(EngineState* state) {
         graph_cache.ClearArenas();
     } catch (const densecore::DenseCoreException& e) {
         std::cerr << "[DenseCore] Worker thread exception (" << e.CodeInt() << "): " << e.what() << std::endl;
-        fail_worker(e.what());
+        fail_worker();
     } catch (const std::exception& e) {
         std::cerr << "[DenseCore] Worker thread exception: " << e.what() << std::endl;
-        fail_worker(e.what());
+        fail_worker();
     } catch (...) {
         std::cerr << "[DenseCore] Worker thread unknown exception" << std::endl;
-        fail_worker("unknown exception");
+        fail_worker();
     }
 }
