@@ -1364,6 +1364,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_decode_thread_policy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_model_family_internal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_worker_result_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_stop_output.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_request_lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_request_submission.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/test_gemma4_decode_fallback.cpp
