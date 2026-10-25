@@ -59,7 +59,7 @@ def digest(path):
 
 def write(path, result):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n')
+    path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n', errors='backslashreplace')
 
 
 def validate_native(row):
@@ -251,11 +251,13 @@ def native_child(args):
     write(args.out, result)
 
 
-def http_request(base, case, stream, max_tokens, timeout):
+def http_request(base, case, stream, max_tokens, timeout, sampling=None):
     from compare_servers import validate_response
     body = {'model': 'local', 'messages': [{'role': 'user', 'content': case['prompt']}],
         'temperature': 0, 'max_tokens': max_tokens, 'stream': stream, 'cache_prompt': False,
         'chat_template_kwargs': {'enable_thinking': False}}
+    if sampling: body.update(sampling)
+    if case.get('stop'): body['stop'] = case['stop']
     if stream: body['stream_options'] = {'include_usage': True}
     raw = {'case': case['id'], 'stream': stream, 'body': body, 'events': []}
     request = urllib.request.Request(base + '/v1/chat/completions', data=json.dumps(body).encode(),
@@ -295,7 +297,8 @@ def http_request(base, case, stream, max_tokens, timeout):
     return raw
 
 
-def http_mode(args, mode, out, environment):
+def http_mode(args, mode, out, environment, request_fn=http_request, cases=None, probe_sampling=None):
+    cases = CASES if cases is None else cases
     base = f'http://127.0.0.1:{args.port}'
     log = out / f'http-{mode}.log'
     with log.open('w') as output:
@@ -315,14 +318,15 @@ def http_mode(args, mode, out, environment):
             rows = []
             for concurrency in args.concurrency:
                 for stream in (False, True):
-                    jobs = [case for _ in range(args.repeats) for case in CASES]
+                    jobs = [case for _ in range(args.repeats) for case in cases]
                     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                        requests = list(pool.map(lambda case: http_request(base, case, stream, args.http_max_tokens, args.timeout), jobs))
+                        requests = list(pool.map(lambda case: request_fn(base, case, stream, args.http_max_tokens, args.timeout), jobs))
                     rows.append({'mode': mode, 'concurrency': concurrency, 'stream': stream, 'requests': requests})
             # Disconnect a live stream, then prove readiness and a completed follow-up.
             connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
             probe = {'model': 'local', 'messages': [{'role': 'user', 'content': 'List the integers from 1 through 10000.'}],
                      'stream': True, 'max_tokens': args.http_max_tokens, 'temperature': 0}
+            if probe_sampling: probe.update(probe_sampling)
             connection.request('POST', '/v1/chat/completions', json.dumps(probe), {'Content-Type': 'application/json'})
             response = connection.getresponse()
             saw_event, probe_events = False, []
@@ -338,7 +342,7 @@ def http_mode(args, mode, out, environment):
             response.close(); connection.close()
             with urllib.request.urlopen(base + '/health/ready', timeout=5) as ready:
                 ready_status = ready.status
-            followup = http_request(base, CASES[0], True, args.http_max_tokens, args.timeout)
+            followup = request_fn(base, cases[0], True, args.http_max_tokens, args.timeout)
             result = {'groups': rows, 'disconnect_probe': {'saw_event': saw_event, 'events': probe_events,
                 'ready_after_disconnect': ready_status, 'followup': followup,
                 'scope': 'disconnect after visible/reasoning token and recovery only; native cancellation checked separately'}}
