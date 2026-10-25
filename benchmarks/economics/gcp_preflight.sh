@@ -8,6 +8,11 @@ if [[ -z "$project" || "$project" == "(unset)" ]]; then
 fi
 
 echo "project=$project"
+billing=$(gcloud billing projects describe "$project" --format='value(billingEnabled)')
+if [[ "$billing" != True && "$billing" != true ]]; then
+  echo "ERROR: billing is not enabled for this project." >&2
+  exit 3
+fi
 echo
 echo "Running instances (these already incur compute charges):"
 instances="$(gcloud compute instances list --project "$project" \
@@ -32,4 +37,13 @@ echo
 echo "Reserved addresses (may continue billing while unused):"
 gcloud compute addresses list --project "$project" --format='table(name,region,status,address,users)'
 echo
-echo "Preflight passed. This script did not create, stop, or delete any resource."
+if [[ "${1:-}" == --estimate-config && -n "${2:-}" && "$#" == 2 ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/estimate_session_cost.py" "$2"
+  echo "Inventory and supplied price/time estimate passed. No resources were mutated."
+elif [[ "$#" == 0 ]]; then
+  echo "Inventory check only: price/time/budget estimate NOT RUN."
+  echo "Before a session rerun with --estimate-config CONFIG.json; no resources were mutated."
+else
+  echo "Usage: $0 [--estimate-config CONFIG.json]" >&2
+  exit 2
+fi
