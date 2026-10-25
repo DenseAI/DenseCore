@@ -353,9 +353,11 @@ TEST(NextNGraph, TargetCaptureIsOutputNormalizedAndKeepsEveryPromptRow) {
         EXPECT_NEAR(data[row * 2], a * inverse * 2, 1e-5f);
         EXPECT_NEAR(data[row * 2 + 1], b * inverse * 3, 1e-5f);
     }
-    const auto* logits = static_cast<float*>(output->data);
-    EXPECT_NEAR(logits[0], data[2], 1e-6f);
-    EXPECT_NEAR(logits[1], data[3], 1e-6f);
+    for (int row = 0; row < 2; ++row) {
+        const auto* output_row = reinterpret_cast<const float*>(static_cast<const char*>(output->data) + row*output->nb[1]);
+        EXPECT_NEAR(output_row[0], data[row*2], 1e-6f);
+        EXPECT_NEAR(output_row[1], data[row*2+1], 1e-6f);
+    }
     ggml_free(ctx); ClearCurrentBatch(); SetCurrentWorkContext(nullptr);
     cache->block_manager->Free(blocks);
 }
