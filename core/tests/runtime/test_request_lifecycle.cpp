@@ -995,3 +995,56 @@ TEST_F(RequestLifecycleTest, ConfiguredGraceLetsActiveRequestCompleteAndRejectsN
     ASSERT_EQ(callback.final_texts.size(),1u);
     EXPECT_TRUE(callback.final_texts[0].empty());
 }
+
+TEST_F(RequestLifecycleTest, FinalTeardownWaitsForBorrowedModelPreparationBeforeDestroyingOwners) {
+    auto* state=static_cast<EngineState*>(engine_);
+    CallbackState rejected,warmup;
+    EngineCloseGuard close_before_callback{&engine_};
+    // Worker startup itself queries model policy under construction_mu. Finish
+    // one request before deliberately holding that mutex across shutdown.
+    ASSERT_GT(SubmitRequestWithSamplingConstraintsCallbackEx(engine_,"startup-ready",1,nullptr,0,1,1,1,
+                         nullptr,0,nullptr,0,0,nullptr,0,LifecycleCallbackEx,&warmup),0);
+    ASSERT_TRUE(warmup.WaitForFinal());
+    std::unique_lock<std::mutex> construction(state->construction_mu);
+    auto* entry=state->GetDefaultModel();
+    ASSERT_NE(entry,nullptr);
+    ASSERT_NE(entry->model,nullptr);
+    auto* borrowed_model=entry->model.get();
+    auto* prepared=AcquireBoundedTextRequest(state,"borrowed-preparation",0,2);
+    RequestGuard prepared_guard(state,prepared);
+    prepared->max_tokens=2;
+    prepared->callback_ex=LifecycleCallbackEx;
+    prepared->user_data=&rejected;
+    std::thread shutdown([&]{BeginEngineShutdown(engine_);});
+    const auto deadline=EngineShutdownClock::now()+5s;
+    while (!state->construction_teardown_waiting_for_test.load(std::memory_order_acquire) &&
+           EngineShutdownClock::now()<deadline) std::this_thread::yield();
+    const bool blocked=state->construction_teardown_waiting_for_test.load(std::memory_order_acquire);
+    if (blocked) {
+        // The signal comes after both joins and a contended lock attempt. The
+        // borrowed owner is therefore protected at the exact old race boundary.
+        EXPECT_EQ(state->status.load(),EngineStatus::STOPPED);
+        EXPECT_TRUE(state->result_producers_done.load());
+        EXPECT_EQ(state->GetDefaultModel(),entry);
+        EXPECT_EQ(entry->model.get(),borrowed_model);
+        prepared->tokens=Tokenizer::Tokenize(borrowed_model,"borrowed-preparation",false);
+    }
+    construction.unlock();
+    const int published=PublishPreparedRequest(state,prepared,prepared_guard,"preparation finished during shutdown");
+    shutdown.join();
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(published,DENSECORE_STATUS_ENGINE_STOPPED);
+    EXPECT_EQ(rejected.callback_count,0);
+    EXPECT_TRUE(state->pending_requests.Empty());
+    EXPECT_EQ(state->GetDefaultModel(),nullptr);
+}
+
+TEST_F(RequestLifecycleTest, StoppedEngineRejectsModelPreparationAndKeepsReadQueriesSafe) {
+    BeginEngineShutdown(engine_);
+    EXPECT_EQ(LoadModel(engine_,"late-model","mock",2),DENSECORE_STATUS_ENGINE_STOPPED);
+    DenseCoreRuntimeOptimizationState runtime{};
+    EXPECT_EQ(DenseCoreGetRuntimeOptimizationState(engine_,&runtime),DENSECORE_STATUS_OK);
+    EXPECT_EQ(GetDetailedMetrics(engine_).kv_cache_total_blocks,0);
+    DenseCoreTensor tensor{};
+    EXPECT_EQ(DenseCoreSetWeight(engine_,"missing-weight",&tensor),DENSECORE_STATUS_MODEL_LOAD_FAILED);
+}

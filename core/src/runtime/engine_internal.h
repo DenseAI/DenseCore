@@ -1777,6 +1777,7 @@ struct EngineState {
     std::atomic<bool> fail_pending_publication_for_test{false};
     std::atomic<bool> fail_worker_for_test{false};
     std::atomic<bool> fail_result_publication_for_test{false};
+    std::atomic<bool> construction_teardown_waiting_for_test{false};
 #endif
 
     // Worker thread
@@ -2567,6 +2568,19 @@ struct EngineState {
             callback_thread.join();
         }
 
+        // Request preparation borrows model/tokenizer owners under this mutex.
+        // Wait only after worker/callback joins: callbacks may themselves need
+        // construction_mu, and builders must be allowed to reject publication
+        // against STOPPED before their shared owners are destroyed.
+        std::unique_lock<std::mutex> construction_barrier(construction_mu,std::defer_lock);
+#ifdef DENSECORE_TEST_BUILD
+        if (!construction_barrier.try_lock()) {
+            construction_teardown_waiting_for_test.store(true,std::memory_order_release);
+            construction_barrier.lock();
+        }
+#else
+        construction_barrier.lock();
+#endif
         // Graph contexts may borrow model tensors and prepared weight buffers.
         // Retire graph-owned userdata before releasing their model/backend owners.
         FreeGraphCache();

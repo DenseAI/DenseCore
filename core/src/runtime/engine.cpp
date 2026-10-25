@@ -789,6 +789,7 @@ int DenseCoreGetRuntimeOptimizationState(DenseCoreHandle handle, DenseCoreRuntim
     out->struct_size = static_cast<int>(sizeof(DenseCoreRuntimeOptimizationState));
 
     EngineState* state = static_cast<EngineState*>(handle);
+    std::lock_guard<std::mutex> construction_lock(state->construction_mu);
     const ModelEntry* entry = state->GetDefaultModel();
     const TransformerModel* model = (entry && entry->model) ? entry->model.get() : nullptr;
     const auto& config = state->fast_path_config;
@@ -1252,6 +1253,7 @@ DENSECORE_API int DenseCoreSetWeight(DenseCoreHandle engine, const char* name, c
     }
 
     EngineState* state = (EngineState*)engine;
+    std::lock_guard<std::mutex> construction_lock(state->construction_mu);
     ModelEntry* entry = state->GetDefaultModel();
     if (!entry || !entry->model) {
         SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCoreSetWeight: no model loaded");
@@ -1523,6 +1525,7 @@ DetailedMetrics GetDetailedMetrics(DenseCoreHandle handle) {
     }
 
     // KV Cache metrics
+    std::lock_guard<std::mutex> construction_lock(state->construction_mu);
     ModelEntry* entry = state->GetDefaultModel();
     if (entry && entry->kv_cache && entry->kv_cache->block_manager) {
         m.kv_cache_total_blocks = entry->kv_cache->block_manager->num_blocks;
@@ -1591,11 +1594,16 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
         }
 
         EngineState* state = (EngineState*)handle;
-        // Explicit MTP owns one validated target/head and its checkpoint bank.
+        std::lock_guard<std::mutex> construction_lock(state->construction_mu);
+        if (state->status.load(std::memory_order_acquire) != EngineStatus::RUNNING) {
+            SetError(DENSECORE_STATUS_ENGINE_STOPPED, "LoadModel: engine is stopping");
+            return DENSECORE_STATUS_ENGINE_STOPPED;
+        }
+        // MTP owns one validated target/head and its checkpoint bank.
         // Additional models would bypass that initialization contract.
         if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP) {
             SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
-                     "LoadModel: explicit MTP does not support additional models");
+                     "LoadModel: MTP does not support additional models");
             return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
         }
         std::string canonical_model_path;
@@ -1643,8 +1651,13 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
         auto entry = MakeModelEntry(model_id, canonical_model_path, std::move(model_owner),
                                     std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation));
 
-        // Add to pool
+        // Add to pool only if shutdown did not begin while loading.
         {
+            std::lock_guard<std::mutex> admission_lock(state->admission_mu);
+            if (state->status.load(std::memory_order_acquire)!=EngineStatus::RUNNING) {
+                SetError(DENSECORE_STATUS_ENGINE_STOPPED,"LoadModel: engine stopped during preparation");
+                return DENSECORE_STATUS_ENGINE_STOPPED;
+            }
             std::lock_guard<std::mutex> lock(state->models_mu);
             state->models[model_id] = std::move(entry);
 
@@ -1686,6 +1699,7 @@ int UnloadModel(DenseCoreHandle handle, const char* model_id) {
     }
 
     EngineState* state = (EngineState*)handle;
+    std::lock_guard<std::mutex> construction_lock(state->construction_mu);
 
     std::lock_guard<std::mutex> lock(state->models_mu);
     auto it = state->models.find(model_id);
@@ -1749,6 +1763,7 @@ int SetDefaultModel(DenseCoreHandle handle, const char* model_id) {
     }
 
     EngineState* state = (EngineState*)handle;
+    std::lock_guard<std::mutex> construction_lock(state->construction_mu);
     std::lock_guard<std::mutex> lock(state->models_mu);
 
     if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP &&
