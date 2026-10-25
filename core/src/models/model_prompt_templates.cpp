@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <sstream>
 #include <stdexcept>
 
@@ -12,6 +13,63 @@
 
 namespace densecore::models {
 namespace {
+
+std::string GptOssCurrentDate(const CanonicalChatRenderOptions& options) {
+#ifdef DENSECORE_TEST_BUILD
+    if (!options.test_current_date.empty()) return options.test_current_date;
+#else
+    (void)options;
+#endif
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    if (localtime_s(&local, &now) != 0) throw std::runtime_error("gpt-oss current date is unavailable");
+#else
+    if (!localtime_r(&now, &local)) throw std::runtime_error("gpt-oss current date is unavailable");
+#endif
+    char date[11]{};
+    if (!std::strftime(date, sizeof(date), "%Y-%m-%d", &local)) {
+        throw std::runtime_error("gpt-oss current date could not be formatted");
+    }
+    return date;
+}
+
+std::string RenderGptOssTextMessages(const std::vector<CanonicalChatMessage>& messages,
+                                    const CanonicalChatRenderOptions& options) {
+    // Text-only rendering of the pinned GGUF template. Client instructions are
+    // developer content; the model's channel/reasoning system block is mandatory.
+    std::string rendered = "<|start|>system<|message|>"
+        "You are ChatGPT, a large language model trained by OpenAI.\n"
+        "Knowledge cutoff: 2024-06\nCurrent date: " + GptOssCurrentDate(options) +
+        "\n\nReasoning: medium\n\n"
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>";
+    size_t first = 0;
+    if (!messages.empty() && (messages.front().role == "system" || messages.front().role == "developer")) {
+        const auto& instructions = messages.front().content;
+        if (!instructions.empty()) {
+            rendered += "<|start|>developer<|message|># Instructions\n\n" + instructions + "\n\n<|end|>";
+        }
+        first = 1;
+    }
+    for (size_t i = first; i < messages.size(); ++i) {
+        const auto& message = messages[i];
+        if (message.role != "user" && message.role != "assistant") {
+            throw std::invalid_argument("gpt-oss text chat requires user/assistant roles after initial instructions");
+        }
+        if (message.role == "assistant") {
+            for (const auto* text : {&message.content, &message.reasoning_content}) {
+                if (text->find("<|channel|>analysis<|message|>") != std::string::npos ||
+                    text->find("<|channel|>final<|message|>") != std::string::npos) {
+                    throw std::invalid_argument("gpt-oss assistant fields must not contain Harmony channel headers");
+                }
+            }
+        }
+        rendered += "<|start|>" + message.role;
+        if (message.role == "assistant") rendered += "<|channel|>final";
+        rendered += "<|message|>" + message.content + "<|end|>";
+    }
+    return rendered + "<|start|>assistant";
+}
 
 bool HasTokenLiteral(const TransformerModel* model, const char* token) {
     return model && token && model->token_to_id.find(token) != model->token_to_id.end();
@@ -524,7 +582,7 @@ std::string ApplyModelAutoChatTemplate(const TransformerModel* model, const std:
 
     const PromptTemplateProfile profile = ResolveModelPromptTemplateProfile(model);
     if (profile.kind == PromptTemplateKind::HARMONY) {
-        return "<|start|>user<|message|>" + prompt + "<|end|><|start|>assistant";
+        return RenderModelChatMessages(model, {{"user", prompt, "", ""}}, {});
     }
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string wrapped;
@@ -610,19 +668,7 @@ std::string RenderModelChatMessages(const TransformerModel* model, const std::ve
     }
 
     if (profile.kind == PromptTemplateKind::HARMONY) {
-        std::string rendered;
-        for (const auto& message : messages) {
-            if (message.role != "system" && message.role != "developer" && message.role != "user" &&
-                message.role != "assistant") {
-                throw std::invalid_argument("gpt-oss text chat supports system/developer/user/assistant roles");
-            }
-            rendered += "<|start|>" + message.role;
-            if (message.role == "assistant") rendered += "<|channel|>final";
-            rendered += "<|message|>" + message.content + "<|end|>";
-        }
-        // Official pinned template leaves the generation header open. The
-        // response parser consumes the channel/header before emitting content.
-        return rendered + "<|start|>assistant";
+        return RenderGptOssTextMessages(messages, options);
     }
     if (profile.kind == PromptTemplateKind::CHATML) {
         std::string rendered;

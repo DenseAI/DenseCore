@@ -38,6 +38,9 @@ struct CanonicalChatMessage {
 struct CanonicalChatRenderOptions {
     int enable_thinking = -1;    // -1 = auto
     int preserve_thinking = -1;  // -1 = auto
+#ifdef DENSECORE_TEST_BUILD
+    std::string test_current_date;  // Deterministic pinned-template oracle only.
+#endif
 };
 
 PromptTemplateProfile ResolveModelPromptTemplateProfile(const TransformerModel* model);

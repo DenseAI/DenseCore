@@ -2582,6 +2582,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_u32("ffn_intermediate_size", model->hparams.n_ff);
     if (model->arch == ModelArch::GPT_OSS) {
         uint32_t window = 0, pattern = 2;
+        const int pattern_key = find_prefixed_key("attention.sliding_window_pattern");
+        if (pattern_key >= 0 && gguf_get_kv_type(ctx_gguf, pattern_key) == GGUF_TYPE_ARRAY) {
+            return fail_load("gpt-oss per-layer sliding-window patterns are not enabled");
+        }
         get_u32("attention.sliding_window", window);
         get_u32("attention.sliding_window_pattern", pattern);
         if (window == 0 || window > INT32_MAX || pattern < 2 || pattern > INT32_MAX) {
@@ -2734,6 +2738,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_f32("rope.freq_base", model->hparams.rope_freq_base);
     get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
     if (model->arch == ModelArch::GPT_OSS) {
+        float sliding_rope_base = model->hparams.rope_freq_base;
+        get_f32("rope.freq_base_swa", sliding_rope_base);
+        if (!std::isfinite(sliding_rope_base) || sliding_rope_base != model->hparams.rope_freq_base) {
+            return fail_load("gpt-oss distinct sliding-window RoPE base is not enabled");
+        }
         const std::string scaling = get_exact_string("gpt-oss.rope.scaling.type");
         if (!scaling.empty() && scaling != "yarn" && scaling != "none") {
             return fail_load("gpt-oss unsupported RoPE scaling: " + scaling);
@@ -2745,6 +2754,8 @@ TransformerModel* LoadGGUFModel(const char* path) {
             get_f32("rope.scaling.yarn_beta_fast", model->gpt_oss_yarn_beta_fast);
             get_f32("rope.scaling.yarn_beta_slow", model->gpt_oss_yarn_beta_slow);
             if (!std::isfinite(factor) || factor < 1.0f || model->gpt_oss_rope_original_context == 0 ||
+                model->gpt_oss_rope_original_context > INT32_MAX ||
+                !std::isfinite(model->gpt_oss_yarn_beta_slow) || !std::isfinite(model->gpt_oss_yarn_beta_fast) ||
                 model->gpt_oss_yarn_beta_slow <= 0.0f || model->gpt_oss_yarn_beta_fast <= 0.0f) {
                 return fail_load("gpt-oss invalid YaRN scaling configuration");
             }
@@ -5109,6 +5120,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
             return t && t->type == type && t->ne[0] == a && t->ne[1] == b && t->ne[2] == c && t->ne[3] == 1;
         };
         for (const auto& layer : model->layers) {
+            for (const auto& keys : {std::pair<const char*, const char*>{model_keys::kAttnQWeight, model_keys::kAttnQBias},
+                                     {model_keys::kAttnKWeight, model_keys::kAttnKBias},
+                                     {model_keys::kAttnVWeight, model_keys::kAttnVBias}}) {
+                const auto* weight = layer.Get(keys.first);
+                if (!weight || !shape(layer.Get(keys.second), GGML_TYPE_F32, weight->ne[1])) {
+                    return fail_load(std::string("gpt-oss invalid/missing attention projection bias: ") + keys.second);
+                }
+            }
             if (!shape(layer.Get(model_keys::kAttnOBias), GGML_TYPE_F32, embedding) ||
                 !shape(layer.Get("attn_sinks.weight"), GGML_TYPE_F32, model->hparams.n_head) ||
                 !shape(layer.Get("ffn_gate_inp.bias"), GGML_TYPE_F32, experts) ||

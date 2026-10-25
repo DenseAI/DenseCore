@@ -124,13 +124,40 @@ TEST(ModelDescriptorTest, GptOssHarmonyRenderKeepsFinalHistoryAndOpenAssistantHe
     const std::vector<densecore::models::CanonicalChatMessage> messages = {
         {"system", "Be concise", "", ""}, {"user", "Hi", "", ""},
         {"assistant", "Hello", "Do not replay this reasoning", ""}, {"user", "Next", "", ""}};
-    const auto rendered = densecore::models::RenderModelChatMessages(&model, messages, {});
-    EXPECT_EQ(rendered, "<|start|>system<|message|>Be concise<|end|>"
-                        "<|start|>user<|message|>Hi<|end|>"
-                        "<|start|>assistant<|channel|>final<|message|>Hello<|end|>"
-                        "<|start|>user<|message|>Next<|end|><|start|>assistant");
-    EXPECT_EQ(densecore::models::ApplyModelAutoChatTemplate(&model, "Hi"),
-              "<|start|>user<|message|>Hi<|end|><|start|>assistant");
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.test_current_date = "2026-10-25";
+    const auto rendered = densecore::models::RenderModelChatMessages(&model, messages, options);
+    // Golden bytes rendered by the pinned GGUF Jinja template, tools disabled.
+#include "fixtures/gpt_oss_harmony_prompt.inl"
+    EXPECT_EQ(rendered, kGptOssCanonicalPromptOracle);
+    const auto automatic = densecore::models::ApplyModelAutoChatTemplate(&model, "Hi");
+    EXPECT_EQ(automatic.find("<|start|>system<|message|>You are ChatGPT"), 0u);
+    EXPECT_NE(automatic.find("Reasoning: medium\n\n# Valid channels:"), std::string::npos);
+    const std::string suffix = "<|start|>user<|message|>Hi<|end|><|start|>assistant";
+    ASSERT_GE(automatic.size(), suffix.size());
+    EXPECT_EQ(automatic.substr(automatic.size() - suffix.size()), suffix);
+}
+
+
+TEST(ModelDescriptorTest, GptOssHarmonyAcceptsInitialDeveloperAndRejectsUnsupportedHistory) {
+    TransformerModel model{};
+    model.arch = ModelArch::GPT_OSS;
+    model.variant = ModelVariant::GPT_OSS;
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.test_current_date = "2026-10-25";
+    using Message = densecore::models::CanonicalChatMessage;
+    auto render = [&](std::vector<Message> messages) {
+        return densecore::models::RenderModelChatMessages(&model, messages, options);
+    };
+    EXPECT_EQ(render({{"system", "Rules", "", ""}, {"user", "Hi", "", ""}}),
+              render({{"developer", "Rules", "", ""}, {"user", "Hi", "", ""}}));
+    EXPECT_THROW(render({{"user", "Hi", "", ""}, {"system", "Late", "", ""}}), std::invalid_argument);
+    EXPECT_THROW(render({{"tool", "Result", "", ""}}), std::invalid_argument);
+    for (const char* channel : {"analysis", "final"}) {
+        const auto header = std::string("<|channel|>") + channel + "<|message|>";
+        EXPECT_THROW(render({{"assistant", header, "", ""}}), std::invalid_argument);
+        EXPECT_THROW(render({{"assistant", "Answer", header, ""}}), std::invalid_argument);
+    }
 }
 
 
@@ -184,6 +211,9 @@ std::unique_ptr<TransformerModel> MakeGptOssTinyGraph() {
     layer.Set(model_keys::kAttnKWeight, tensor(32, 32));
     layer.Set(model_keys::kAttnVWeight, identity());
     layer.Set(model_keys::kAttnOWeight, identity());
+    layer.Set(model_keys::kAttnQBias, tensor(32, 1));
+    layer.Set(model_keys::kAttnKBias, tensor(32, 1));
+    layer.Set(model_keys::kAttnVBias, tensor(32, 1));
     layer.Set(model_keys::kAttnOBias, tensor(32, 1, 0.125f));
     layer.Set("attn_sinks.weight", tensor(1, 1));
     layer.Set(model_keys::kMoeGate, tensor(32, 2));
@@ -248,6 +278,110 @@ TEST(GptOssGraphTest, NativeQuantizedLayerMatchesIndependentFirstTokenLogits) {
     for (size_t i = 0; i < logits.size(); ++i) EXPECT_NEAR(logits[i], expected[i], 2e-5f);
 }
 
+TEST(GptOssGraphTest, NonzeroProjectionBiasesYarnAndSinkMatchIndependentLogits) {
+    auto model = MakeGptOssTinyGraph();
+    model->hparams.rope_freq_base = 150000.0f;
+    model->hparams.rope_freq_scale = 1.0f / 32.0f;
+    model->gpt_oss_rope_original_context = 4096;
+    model->gpt_oss_yarn_ext_factor = 1.0f;
+    auto& layer = model->layers[0];
+    for (const char* key : {model_keys::kAttnQWeight, model_keys::kAttnKWeight}) {
+        auto* values = static_cast<float*>(layer.Get(key)->data);
+        for (int i = 0; i < 32; ++i) values[i * 32 + i] = 1.0f;
+    }
+    std::vector<double> qb(32), kb(32), vb(32);
+    for (int i = 0; i < 32; ++i) {
+        qb[i] = static_cast<float>(0.025 * (i - 12));
+        kb[i] = static_cast<float>(0.031 * (17 - i));
+        vb[i] = static_cast<float>(0.017 * (i - 8));
+        static_cast<float*>(layer.Get(model_keys::kAttnQBias)->data)[i] = qb[i];
+        static_cast<float*>(layer.Get(model_keys::kAttnKBias)->data)[i] = kb[i];
+        static_cast<float*>(layer.Get(model_keys::kAttnVBias)->data)[i] = vb[i];
+    }
+    static_cast<float*>(layer.Get("attn_sinks.weight")->data)[0] = 0.7f;
+    // Independent double-precision equations for the pinned llama GPT-OSS
+    // contract: NEOX split-half YaRN, a learned sink without a value, then OAI
+    // SwiGLU with all biases. Do not call the production RoPE/MoE helpers here.
+    auto norm = [](std::vector<double> values) {
+        double squares = 0;
+        for (double x : values) squares += x * x;
+        const double scale = 1.0 / std::sqrt(squares / values.size() + 1e-5);
+        for (double& x : values) x *= scale;
+        return values;
+    };
+    auto rotate = [](std::vector<double> values, int position) {
+        constexpr double pi = 3.14159265358979323846, base = 150000.0, scale = 1.0 / 32.0;
+        const double low = std::max(0.0, std::floor(32 * std::log(4096 / (32 * 2 * pi)) / (2 * std::log(base))));
+        const double high = std::min(31.0, std::ceil(32 * std::log(4096 / (2 * pi)) / (2 * std::log(base))));
+        const double magnitude = 1 + 0.1 * std::log(1 / scale);
+        for (int i = 0; i < 16; ++i) {
+            const double ramp = 1 - std::clamp((i - low) / std::max(0.001, high - low), 0.0, 1.0);
+            const double angle = position * std::pow(base, -2.0 * i / 32) * (scale * (1 - ramp) + ramp);
+            const double x = values[i], y = values[i + 16];
+            values[i] = magnitude * (x * std::cos(angle) - y * std::sin(angle));
+            values[i + 16] = magnitude * (x * std::sin(angle) + y * std::cos(angle));
+        }
+        return values;
+    };
+    const std::vector<int32_t> tokens = {0, 1, 0, 1, 1, 0};
+    std::vector<std::vector<double>> keys, values;
+    std::vector<float> expected;
+    for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
+        std::vector<double> residual(32, 0);
+        residual[0] = tokens[pos] ? 0.5 : 1.0;
+        residual[1] = tokens[pos] ? 1.0 : 0.5;
+        auto q = norm(residual), k = q, v = q;
+        for (int i = 0; i < 32; ++i) { q[i] += qb[i]; k[i] += kb[i]; v[i] += vb[i]; }
+        q = rotate(q, pos);
+        keys.push_back(rotate(k, pos));
+        values.push_back(v);
+        std::vector<double> scores;
+        const int first = std::max(0, pos - 3); // Window 4 includes query.
+        double maximum = 0.7;
+        for (int key = first; key <= pos; ++key) {
+            double score = 0;
+            for (int i = 0; i < 32; ++i) score += q[i] * keys[key][i];
+            scores.push_back(score / std::sqrt(32.0));
+            maximum = std::max(maximum, scores.back());
+        }
+        double denominator = std::exp(0.7 - maximum);
+        for (double score : scores) denominator += std::exp(score - maximum);
+        for (int i = 0; i < 32; ++i) {
+            double attention = 0;
+            for (size_t j = 0; j < scores.size(); ++j) {
+                attention += std::exp(scores[j] - maximum) / denominator * values[first + j][i];
+            }
+            residual[i] += attention + 0.125;
+        }
+        const auto ffn = norm(residual);
+        for (int i = 0; i < 32; ++i) {
+            const double gate = std::min(7.0, ffn[i] + 0.25);
+            const double up = std::clamp(ffn[i] - 0.5, -7.0, 7.0);
+            residual[i] += gate / (1 + std::exp(-1.702 * gate)) * (up + 1) + 0.0625;
+        }
+        const auto result = norm(residual);
+        expected.push_back(result[0]); expected.push_back(result[1]);
+    }
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(), 1, 8, GGML_TYPE_F32, -1));
+    ASSERT_NE(cache, nullptr);
+    BatchSpec batch{};
+    batch.num_seqs = 1; batch.tokens = tokens; batch.seq_id = {0, 0, 0, 0, 0, 0};
+    batch.pos = {0, 1, 2, 3, 4, 5}; batch.block_tables = {{0}}; batch.n_past = {0};
+    const auto actual = densecore::testing::ExecuteTransformerGraphForTest(model.get(), cache.get(), batch, 2);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 2e-4f) << i;
+    std::unique_ptr<PagedKVCache> decode_cache(InitPagedKVCache(model.get(), 1, 8, GGML_TYPE_F32, -1));
+    ASSERT_NE(decode_cache, nullptr);
+    for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
+        batch.tokens = {tokens[pos]}; batch.seq_id = {0}; batch.pos = {pos}; batch.n_past = {pos};
+        const auto decoded = densecore::testing::ExecuteTransformerGraphForTest(model.get(), decode_cache.get(), batch, 2);
+        ASSERT_EQ(decoded.size(), 2u);
+        for (int token = 0; token < 2; ++token) {
+            EXPECT_NEAR(decoded[token], expected[pos * 2 + token], 2e-4f) << pos << ":" << token;
+        }
+    }
+}
+
 TEST(GptOssGraphTest, QuantizedPrefillLastLogitsMatchSequentialDecode) {
     auto model = MakeGptOssTinyGraph();
     std::unique_ptr<PagedKVCache> prefill_cache(InitPagedKVCache(model.get(), 1, 8, GGML_TYPE_F32, -1));
@@ -279,7 +413,8 @@ TEST(GptOssGraphTest, TinyGgufLoaderPreservesBiasesSlidingAndHarmonyStops) {
     ggml_set_name(fixture->output, "output.weight");
     auto& layer = fixture->layers[0];
     for (const char* key : {model_keys::kAttnNorm, model_keys::kAttnQWeight, model_keys::kAttnKWeight,
-                            model_keys::kAttnVWeight, model_keys::kAttnOWeight, model_keys::kAttnOBias}) {
+                            model_keys::kAttnVWeight, model_keys::kAttnOWeight, model_keys::kAttnQBias,
+                            model_keys::kAttnKBias, model_keys::kAttnVBias, model_keys::kAttnOBias}) {
         ggml_set_name(layer.Get(key), (std::string("blk.0.") + key).c_str());
     }
     ggml_set_name(layer.Get(model_keys::kFfnNorm), "blk.0.attn_post_norm.weight");
@@ -302,6 +437,11 @@ TEST(GptOssGraphTest, TinyGgufLoaderPreservesBiasesSlidingAndHarmonyStops) {
     gguf_set_val_u32(gguf, "gpt-oss.expert_count", 2);
     gguf_set_val_u32(gguf, "gpt-oss.expert_used_count", 1);
     gguf_set_val_u32(gguf, "gpt-oss.expert_feed_forward_length", 32);
+    gguf_set_val_str(gguf, "gpt-oss.rope.scaling.type", "yarn");
+    gguf_set_val_f32(gguf, "gpt-oss.rope.scaling.factor", 32.0f);
+    gguf_set_val_u32(gguf, "gpt-oss.rope.scaling.original_context_length", 4096);
+    gguf_set_val_f32(gguf, "gpt-oss.rope.scaling.yarn_beta_fast", 32.0f);
+    gguf_set_val_f32(gguf, "gpt-oss.rope.scaling.yarn_beta_slow", 1.0f);
     gguf_set_val_str(gguf, "tokenizer.ggml.model", "gpt2");
     gguf_set_val_str(gguf, "tokenizer.ggml.pre", "gpt-4o");
     const char* vocab[] = {"a", "b", "<|return|>", "<|end|>", "<|call|>"};
@@ -323,6 +463,36 @@ TEST(GptOssGraphTest, TinyGgufLoaderPreservesBiasesSlidingAndHarmonyStops) {
     std::unique_ptr<TransformerModel> unsupported(LoadGGUFModel(path));
     EXPECT_EQ(unsupported, nullptr);
     gguf_set_val_str(gguf, "tokenizer.ggml.pre", "gpt-4o");
+    for (const char* omitted : {"blk.0.attn_q.bias", "blk.0.attn_k.bias", "blk.0.attn_v.bias"}) {
+        auto* incomplete = gguf_init_empty();
+        gguf_set_kv(incomplete, gguf);
+        for (auto* tensor = ggml_get_first_tensor(fixture->ctx_w); tensor;
+             tensor = ggml_get_next_tensor(fixture->ctx_w, tensor)) {
+            if (ggml_get_name(tensor)[0] && !tensor->view_src && std::strcmp(ggml_get_name(tensor), omitted)) {
+                gguf_add_tensor(incomplete, tensor);
+            }
+        }
+        ASSERT_TRUE(gguf_write_to_file(incomplete, path, false));
+        std::unique_ptr<TransformerModel> missing_bias(LoadGGUFModel(path));
+        EXPECT_EQ(missing_bias, nullptr) << omitted;
+        gguf_free(incomplete);
+    }
+    const bool layer_pattern[] = {false};
+    gguf_set_arr_data(gguf, "gpt-oss.attention.sliding_window_pattern", GGUF_TYPE_BOOL, layer_pattern, 1);
+    ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
+    std::unique_ptr<TransformerModel> unsupported_pattern(LoadGGUFModel(path));
+    EXPECT_EQ(unsupported_pattern, nullptr);
+    gguf_remove_key(gguf, "gpt-oss.attention.sliding_window_pattern");
+    gguf_set_val_f32(gguf, "gpt-oss.rope.scaling.yarn_beta_fast", std::numeric_limits<float>::quiet_NaN());
+    ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
+    std::unique_ptr<TransformerModel> invalid_yarn(LoadGGUFModel(path));
+    EXPECT_EQ(invalid_yarn, nullptr);
+    gguf_set_val_f32(gguf, "gpt-oss.rope.scaling.yarn_beta_fast", 32.0f);
+    gguf_set_val_f32(gguf, "gpt-oss.rope.freq_base_swa", 50000.0f);
+    ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
+    std::unique_ptr<TransformerModel> unsupported_swa_rope(LoadGGUFModel(path));
+    EXPECT_EQ(unsupported_swa_rope, nullptr);
+    gguf_remove_key(gguf, "gpt-oss.rope.freq_base_swa");
     ASSERT_TRUE(gguf_write_to_file(gguf, path, false));
     gguf_free(gguf);
     std::unique_ptr<TransformerModel> loaded(LoadGGUFModel(path));
@@ -330,6 +500,10 @@ TEST(GptOssGraphTest, TinyGgufLoaderPreservesBiasesSlidingAndHarmonyStops) {
     ASSERT_NE(loaded, nullptr);
     EXPECT_EQ(loaded->arch, ModelArch::GPT_OSS);
     EXPECT_EQ(loaded->gpt_oss_sliding_window, 4);
+    EXPECT_EQ(loaded->gpt_oss_rope_original_context, 4096u);
+    EXPECT_FLOAT_EQ(loaded->hparams.rope_freq_scale, 1.0f / 32.0f);
+    EXPECT_FLOAT_EQ(loaded->gpt_oss_yarn_beta_fast, 32.0f);
+    EXPECT_FLOAT_EQ(loaded->gpt_oss_yarn_beta_slow, 1.0f);
     EXPECT_FALSE(loaded->tokenizer_add_bos);
     EXPECT_NE(loaded->layers[0].Get(model_keys::kAttnOBias), nullptr);
     EXPECT_NE(loaded->layers[0].Get(model_keys::kFfnNorm), nullptr);
