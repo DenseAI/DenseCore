@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-EVALUATOR_VERSION = "final-answer-complete-v4"
+EVALUATOR_VERSION = "final-answer-complete-v5"
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -104,6 +104,12 @@ def evaluate_case(url: str, case: dict[str, Any], timeout_s: float, enable_think
         evaluation_content = before + after if closing else ""
     if "</think>" in evaluation_content:
         evaluation_content = evaluation_content.rsplit("</think>", 1)[1]
+    # Protocol markers in the public content channel are a serving defect.
+    # Preserve the raw response for audit and fail the gate instead of salvaging
+    # a correct word from a malformed or unfinished Gemma thought stream.
+    if any(marker in visible_content for marker in ("<|channel>", "<channel|>", "<|be_thought_out|>")):
+        evaluation_content = ""
+        error = error or "Gemma channel control token leaked into final content"
     normalized = evaluation_content.casefold()
     expected = [str(value) for value in case["expected_all"]]
     missing = [value for value in expected if value.casefold() not in normalized]

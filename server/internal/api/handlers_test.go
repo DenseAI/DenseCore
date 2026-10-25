@@ -577,8 +577,8 @@ func TestSplitGemma4ReasoningResponseStripsMalformedLeadingChannelFromContent(t 
 		"gemma4",
 		"<|channel>thought\nreasoning<channel|><|channel>롬\nSeoul",
 	)
-	if content != "Seoul" {
-		t.Fatalf("expected malformed channel prelude stripped from content, got %q", content)
+	if content != "" {
+		t.Fatalf("expected unknown channel to remain hidden, got %q", content)
 	}
 	if reasoning != "reasoning" {
 		t.Fatalf("expected reasoning preserved, got %q", reasoning)
@@ -609,8 +609,8 @@ func TestSplitGemma4ReasoningResponseStripsBareThoughtPrelude(t *testing.T) {
 		"gemma4",
 		"thought\n think silently.\n\nParis is the capital of France.",
 	)
-	if content != "Paris is the capital of France." || reasoning != "" {
-		t.Fatalf("expected bare Gemma thought prelude stripped, got content=%q reasoning=%q", content, reasoning)
+	if content != "thought\n think silently.\n\nParis is the capital of France." || reasoning != "" {
+		t.Fatalf("expected plain text preserved without guessing a channel, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
@@ -642,8 +642,8 @@ func TestSplitGemma4ReasoningResponseTreatsBareThinkingBodyAsReasoningWhenEnable
 	enableThinking := true
 	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
 	content, reasoning := splitGemma4ReasoningResponse(req, "gemma4", "The user asks for the capital.")
-	if content != "" || reasoning != "The user asks for the capital." {
-		t.Fatalf("expected bare thinking body to route to reasoning, got content=%q reasoning=%q", content, reasoning)
+	if content != "The user asks for the capital." || reasoning != "" {
+		t.Fatalf("expected unmarked output to remain final text, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 
@@ -658,15 +658,15 @@ func TestGemma4StreamFilterSanitizesIncrementally(t *testing.T) {
 	}
 }
 
-func TestGemma4StreamFilterFlushesUnclosedThoughtChannelAsContent(t *testing.T) {
+func TestGemma4StreamFilterNeverPromotesUnclosedThoughtChannel(t *testing.T) {
 	filter := newGemma4StreamFilter()
 	var out strings.Builder
 	for _, token := range []string{"<|channel>thought\n", "CPU ", "MoE ", "answer"} {
 		out.WriteString(filter.Filter(token))
 	}
 	out.WriteString(filter.Flush())
-	if got := out.String(); got != "CPU MoE answer" {
-		t.Fatalf("expected terminal flush to preserve visible content, got %q", got)
+	if got := out.String(); got != "" {
+		t.Fatalf("expected terminal flush to withhold unfinished thought, got %q", got)
 	}
 	if got := filter.Flush(); got != "" {
 		t.Fatalf("second flush should be empty, got %q", got)
@@ -680,10 +680,10 @@ func TestGemma4StreamFilterPassesPlainText(t *testing.T) {
 	}
 }
 
-func TestSplitGemma4ReasoningResponseKeepsBareChannelParityToken(t *testing.T) {
+func TestSplitGemma4ReasoningResponseHidesIncompleteChannelToken(t *testing.T) {
 	content, reasoning := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "gemma4", "<|channel>")
-	if content != "<|channel>" || reasoning != "" {
-		t.Fatalf("expected bare channel token to remain content, got content=%q reasoning=%q", content, reasoning)
+	if content != "" || reasoning != "" {
+		t.Fatalf("expected incomplete channel token hidden, got content=%q reasoning=%q", content, reasoning)
 	}
 }
 

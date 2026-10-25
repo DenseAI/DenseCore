@@ -110,6 +110,16 @@ class QualityEvaluationTest(unittest.TestCase):
                     result = quality.evaluate_case("unused", case, 1, enable_thinking=True)
                 self.assertFalse(result["passed"])
 
+    def test_gemma_channel_leaks_never_qualify_or_hide_raw_response(self):
+        for visible in ["<|channel>thought\nParis", "<|channel>analysis\nParis<channel|>London", "Paris<channel|>"]:
+            with self.subTest(visible=visible):
+                with patch.object(quality, "request_visible_content", return_value=(200, visible, "", None)):
+                    result = quality.evaluate_case("unused", {"expected_all": ["Paris"]}, 1)
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["visible_content"], visible)
+                self.assertEqual(result["final_content"], "")
+                self.assertIn("control token leaked", result["error"])
+
     def test_final_answer_can_pass_after_embedded_thinking(self):
         with patch.object(quality, "request_visible_content", return_value=(200, "<think>London?</think>Paris", "", None)):
             result = quality.evaluate_case("unused", {"expected_all": ["Paris"], "forbidden_any": ["London"]}, 1)

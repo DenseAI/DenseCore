@@ -313,81 +313,101 @@ func (h *Handler) reasoningModelHint(req domain.ChatCompletionRequest) string {
 	return apiFirstNonEmpty(req.Model, current)
 }
 
+// Gemma channel control tokens can arrive split across arbitrary token callbacks.
+// A thought channel is never promoted to visible content, including at EOS.
 type gemma4StreamFilter struct {
-	pending     string
-	started     bool
-	channelMode bool
+	pending string
+	channel string
+	header  bool
+	stopped bool
 }
 
-func newGemma4StreamFilter() *gemma4StreamFilter {
-	return &gemma4StreamFilter{}
-}
+func newGemma4StreamFilter() *gemma4StreamFilter { return &gemma4StreamFilter{} }
 
 func (f *gemma4StreamFilter) Filter(token string) string {
-	if f == nil || token == "" {
-		return token
-	}
-	if f.started {
-		if !f.channelMode {
-			return token
-		}
-		return stripGemma4StreamMarkers(token)
-	}
-
-	f.pending += token
-	trimmed := strings.TrimLeft(f.pending, " \t\r\n")
-	const marker = "<|channel>"
-	if strings.HasPrefix(marker, trimmed) {
-		return ""
-	}
-	if !strings.HasPrefix(trimmed, marker) {
-		out := f.pending
-		f.pending = ""
-		f.started = true
-		return out
-	}
-
-	const bodyMarker = "<channel|>"
-	bodyStart := strings.Index(trimmed, bodyMarker)
-	if bodyStart < 0 {
-		return ""
-	}
-	body := strings.TrimLeft(trimmed[bodyStart+len(bodyMarker):], " \t\r\n")
-	f.pending = ""
-	f.started = true
-	f.channelMode = true
-	return stripGemma4StreamMarkers(body)
-}
-
-func (f *gemma4StreamFilter) Flush() string {
-	if f == nil || f.started || f.pending == "" {
-		return ""
-	}
-	pending := f.pending
-	f.pending = ""
-	f.started = true
-	content, _ := splitGemma4ReasoningResponse(domain.ChatCompletionRequest{}, "gemma4", pending)
+	content, _ := f.FilterDelta(token)
 	return content
 }
 
-func stripGemma4StreamMarkers(token string) string {
-	const marker = "<|channel>"
-	const bodyMarker = "<channel|>"
-	if token == "" {
-		return ""
+func (f *gemma4StreamFilter) FilterDelta(token string) (string, string) {
+	if f == nil {
+		return token, ""
 	}
-	if idx := strings.Index(token, marker); idx >= 0 {
-		prefix := token[:idx]
-		rest := token[idx+len(marker):]
-		if bodyIdx := strings.Index(rest, bodyMarker); bodyIdx >= 0 {
-			return prefix + strings.TrimLeft(rest[bodyIdx+len(bodyMarker):], " \t\r\n")
+	f.pending += token
+	return f.drain(false)
+}
+
+func (f *gemma4StreamFilter) Flush() string {
+	content, _ := f.FlushDelta()
+	return content
+}
+
+func (f *gemma4StreamFilter) FlushDelta() (string, string) {
+	if f == nil {
+		return "", ""
+	}
+	return f.drain(true)
+}
+
+func (f *gemma4StreamFilter) drain(flush bool) (string, string) {
+	const open = "<|channel>"
+	const close = "<channel|>"
+	const stop = "<|be_thought_out|>"
+	var content, reasoning strings.Builder
+	emit := func(text string) {
+		switch f.channel {
+		case "thought", "analysis":
+			reasoning.WriteString(text)
+		case "", "final", "answer":
+			content.WriteString(text)
 		}
-		return prefix
 	}
-	if idx := strings.Index(token, bodyMarker); idx >= 0 {
-		return strings.TrimLeft(token[idx+len(bodyMarker):], " \t\r\n")
+	for f.pending != "" && !f.stopped {
+		if f.header {
+			newline := strings.IndexByte(f.pending, '\n')
+			if newline < 0 {
+				break
+			}
+			f.channel = strings.TrimSpace(f.pending[:newline])
+			f.pending = f.pending[newline+1:]
+			f.header = false
+			continue
+		}
+		index, marker := len(f.pending), ""
+		for _, candidate := range []string{open, close, stop} {
+			if i := strings.Index(f.pending, candidate); i >= 0 && i < index {
+				index, marker = i, candidate
+			}
+		}
+		if marker != "" {
+			emit(f.pending[:index])
+			f.pending = f.pending[index+len(marker):]
+			switch marker {
+			case open:
+				f.header = true
+			case close:
+				f.channel = "final"
+			case stop:
+				f.stopped = true
+			}
+			continue
+		}
+		keep := 0
+		for _, candidate := range []string{open, close, stop} {
+			if n := longestSuffixPrefixLen(f.pending, candidate); n > keep {
+				keep = n
+			}
+		}
+		emit(f.pending[:len(f.pending)-keep])
+		f.pending = f.pending[len(f.pending)-keep:]
+		break
 	}
-	return token
+	if flush {
+		// An incomplete control token/header has no answer text to flush.
+		f.pending = ""
+		f.stopped = true
+	}
+	return content.String(), reasoning.String()
 }
 
 func splitQwenThinkResponse(text string) (string, string) {
@@ -541,164 +561,10 @@ func splitGemma4ReasoningResponse(req domain.ChatCompletionRequest, modelHint, t
 	if !isGemma4ModelHint(modelHint) {
 		return text, ""
 	}
-	if !strings.Contains(text, "<|channel>thought") {
-		if strings.HasPrefix(text, "<channel|>") {
-			return sanitizeGemma4VisibleContent(strings.TrimPrefix(text, "<channel|>")), ""
-		}
-		if gemma4ReasoningEnabled(req, modelHint) {
-			return "", sanitizeGemma4VisibleContent(text)
-		}
-		return sanitizeGemma4VisibleContent(text), ""
-	}
-
-	const marker = "<|channel>"
-	const bodyMarker = "<channel|>"
-	var content strings.Builder
-	var reasoning strings.Builder
-	offset := 0
-
-	for {
-		idx := strings.Index(text[offset:], marker)
-		if idx < 0 {
-			if offset < len(text) {
-				content.WriteString(text[offset:])
-			}
-			break
-		}
-		idx += offset
-		if idx > offset {
-			content.WriteString(text[offset:idx])
-		}
-
-		channelStart := idx + len(marker)
-		nextIdx := strings.Index(text[channelStart:], marker)
-		segmentEnd := len(text)
-		if nextIdx >= 0 {
-			segmentEnd = channelStart + nextIdx
-		}
-		segment := text[channelStart:segmentEnd]
-		newline := strings.IndexByte(segment, '\n')
-		channel := strings.TrimSpace(segment)
-		body := ""
-		if newline >= 0 {
-			channel = strings.TrimSpace(segment[:newline])
-			body = segment[newline+1:]
-		}
-		bodyBeforeClose := body
-		bodyAfterClose := ""
-		if closeIdx := strings.Index(body, bodyMarker); closeIdx >= 0 {
-			bodyBeforeClose = body[:closeIdx]
-			bodyAfterClose = body[closeIdx+len(bodyMarker):]
-		}
-
-		switch channel {
-		case "thought", "analysis":
-			reasoning.WriteString(bodyBeforeClose)
-			content.WriteString(bodyAfterClose)
-		case "final", "answer":
-			content.WriteString(bodyAfterClose)
-		default:
-			content.WriteString(marker)
-			content.WriteString(segment)
-		}
-		offset = segmentEnd
-	}
-
-	if reasoning.Len() == 0 {
-		return sanitizeGemma4VisibleContent(text), ""
-	}
-	if content.Len() == 0 {
-		if !gemma4ReasoningEnabled(req, modelHint) {
-			return sanitizeGemma4VisibleContent(reasoning.String()), ""
-		}
-		return "", sanitizeGemma4VisibleContent(reasoning.String())
-	}
-	return sanitizeGemma4VisibleContent(content.String()), sanitizeGemma4VisibleContent(reasoning.String())
-}
-
-func gemma4ReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) bool {
-	if !isGemma4ModelHint(modelHint) {
-		return false
-	}
-	if req.ChatTemplateKwargs != nil && req.ChatTemplateKwargs.EnableThinking != nil {
-		return *req.ChatTemplateKwargs.EnableThinking
-	}
-	if value, ok := os.LookupEnv("DENSECORE_GEMMA4_ENABLE_THINKING"); ok {
-		return parseTruthyEnv(value)
-	}
-	return false
-}
-
-func sanitizeGemma4VisibleContent(text string) string {
-	text = stripGemma4BareThoughtPrelude(text)
-	text = stripGemma4MalformedLeadingChannel(text)
-	cut := len(text)
-	for _, marker := range []string{
-		"<|be_thought_out|>",
-		"<|channel>thought",
-		"<|channel>analysis",
-		"<|channel>final",
-		"<|channel>answer",
-		"<channel|>",
-	} {
-		if idx := strings.Index(text, marker); idx > 0 && idx < cut {
-			cut = idx
-		}
-	}
-	return strings.TrimSpace(text[:cut])
-}
-
-func stripGemma4MalformedLeadingChannel(text string) string {
-	trimmed := strings.TrimSpace(text)
-	const marker = "<|channel>"
-	if !strings.HasPrefix(trimmed, marker) {
-		return text
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
-	if idx := strings.Index(rest, "<channel|>"); idx >= 0 {
-		return strings.TrimSpace(rest[idx+len("<channel|>"):])
-	}
-	if idx := strings.IndexByte(rest, '\n'); idx >= 0 {
-		return strings.TrimSpace(rest[idx+1:])
-	}
-	return trimmed
-}
-
-func stripGemma4BareThoughtPrelude(text string) string {
-	trimmed := strings.TrimSpace(text)
-	lower := strings.ToLower(trimmed)
-	for _, channel := range []string{
-		"<|channel>thought",
-		"<|channel>analysis",
-		"<|channel>final",
-		"<|channel>answer",
-	} {
-		if !strings.HasPrefix(lower, channel) {
-			continue
-		}
-		body := strings.TrimSpace(trimmed[len(channel):])
-		if strings.HasPrefix(body, "<channel|>") {
-			body = strings.TrimSpace(strings.TrimPrefix(body, "<channel|>"))
-		}
-		if newline := strings.IndexByte(body, '\n'); newline == 0 {
-			body = strings.TrimSpace(body[1:])
-		}
-		return body
-	}
-	for _, prefix := range []string{"thought\r\n", "thought\n"} {
-		if strings.HasPrefix(lower, prefix) {
-			trimmed = strings.TrimSpace(trimmed[len(prefix):])
-			lower = strings.ToLower(trimmed)
-			break
-		}
-	}
-	for _, prefix := range []string{"think silently.\r\n", "think silently.\n", "think silently."} {
-		if strings.HasPrefix(lower, prefix) {
-			trimmed = strings.TrimSpace(trimmed[len(prefix):])
-			break
-		}
-	}
-	return trimmed
+	decoder := newGemma4StreamFilter()
+	content, reasoning := decoder.FilterDelta(text)
+	tail, thoughtTail := decoder.FlushDelta()
+	return strings.TrimSpace(content + tail), strings.TrimSpace(reasoning + thoughtTail)
 }
 
 func isGemma4ModelHint(modelHint string) bool {

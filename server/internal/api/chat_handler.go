@@ -168,7 +168,13 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 				lastCallbackMS = elapsedMS
 				token := event.Token
 				if gemma4Filter != nil {
-					token = gemma4Filter.Filter(token)
+					var reasoning string
+					token, reasoning = gemma4Filter.FilterDelta(token)
+					if reasoning != "" {
+						if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, "", reasoning); err != nil {
+							return
+						}
+					}
 				}
 				if lfm2Filter != nil && token != "" {
 					token = lfm2Filter.Filter(token)
@@ -199,7 +205,13 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 			}
 			if event.Terminal {
 				if gemma4Filter != nil {
-					if token := gemma4Filter.Flush(); token != "" {
+					token, reasoning := gemma4Filter.FlushDelta()
+					if reasoning != "" {
+						if err := h.writeChatStreamDelta(streamWriter, id, created, req.Model, "", reasoning); err != nil {
+							return
+						}
+					}
+					if token != "" {
 						elapsedMS := serviceDurationMillis(time.Since(streamStart))
 						if firstCallbackMS == 0 {
 							firstCallbackMS = elapsedMS
