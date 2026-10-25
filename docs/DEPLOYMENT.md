@@ -148,7 +148,7 @@ Important server variables include:
 | `DENSECORE_MAX_NUM_SEQS` | active sequence bound |
 | `DENSECORE_MAX_SEQ_LEN` | context override |
 | `DENSECORE_KV_TARGET_MB` | KV memory override |
-| `DENSECORE_SERVER_INFLIGHT` | server admission bound |
+| `DENSECORE_SERVER_INFLIGHT` | maximum requests waiting in the Go dispatch queue |
 | `REQUEST_TIMEOUT` | request deadline |
 | `SHUTDOWN_TIMEOUT` | graceful shutdown deadline used by the DenseCloud runner |
 | `AUTH_ENABLED`, `API_KEYS` | local authentication |
@@ -157,6 +157,22 @@ Important server variables include:
 | `GRPC_TLS_ENABLED` | gRPC TLS |
 | `METRICS_ENABLED`, `METRICS_PATH` | Prometheus endpoint |
 | `CORS_ENABLED`, `CORS_ALLOWED_ORIGINS` | explicit browser-origin allowlist |
+
+`DENSECORE_SERVER_INFLIGHT` bounds the priority queue before native submission.
+A full queue returns HTTP 503 with `service_busy` and `Retry-After: 1`, including
+streaming requests before SSE starts. Go workers submit asynchronously, so the
+queue can empty while generation remains active. This setting does not bound
+the sum of active requests and native pending requests; reducing
+`DENSECORE_GO_WORKERS` does not serialize complete generations.
+
+`DENSECORE_MAX_NUM_SEQS` bounds requests holding execution state, including KV
+and hybrid recurrent state. Requests waiting for an execution slot remain in
+the native pending queue without recurrent state; cancellation can bypass a
+full execution budget. Pending request objects and their prompt payloads still
+consume memory, and the native pending queue currently has no independent
+count or byte cap. Use bounded client concurrency and request deadlines when
+controlling that memory. A configured sequence bound of eight does not prove
+that a physical batch of eight was executed.
 
 Do not hard-code a universal KV or context budget. Model size, quantization,
 context length, active sequences, and available host memory all affect the safe
