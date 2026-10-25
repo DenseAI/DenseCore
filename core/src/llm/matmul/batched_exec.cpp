@@ -224,19 +224,21 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                                       input_contig && (!callback_batch || callback_batch->lora_map.empty()) &&
                                       !ud->require_q4k_true_batched && !ud->qwen36_ssm_q8_repacked_batched &&
                                       !ud->qwen36_ssm_q8_direct_batched && !ud->qwen38_q4k_8x8_weight;
-    const bool qwen35_ssm_q5_columns = ud->qwen35_ssm_qkv_canonical_q5k_columns && ud->work_ctx &&
+    const bool qwen35_ssm_columns = (ud->qwen35_ssm_qkv_canonical_q5k_columns ||
+                                     ud->qwen35_ssm_gate_out_canonical_q4k_columns) && ud->work_ctx &&
         callback_batch && GetInferenceWorkContextBatch(ud->work_ctx) == callback_batch &&
         GetInferenceWorkContextPhase(ud->work_ctx) == InferenceExecutionPhase::Decode &&
         GetInferenceWorkContextModelVariant(ud->work_ctx) == ModelVariant::QWEN35 &&
         callback_batch->num_seqs == M && callback_batch->tokens.size() == static_cast<size_t>(M) &&
         input_contig && callback_batch->lora_map.empty() && !ud->require_q4k_true_batched &&
         !ud->qwen36_ssm_q8_repacked_batched && !ud->qwen36_ssm_q8_direct_batched && !ud->qwen38_q4k_8x8_weight;
-    const bool canonical_q4k = (ud->gemma4_canonical_q4k_columns || qwen35_dense_columns) && weight_type == GGML_TYPE_Q4_K &&
+    const bool canonical_q4k = (ud->gemma4_canonical_q4k_columns || qwen35_dense_columns ||
+                                 (qwen35_ssm_columns && ud->qwen35_ssm_gate_out_canonical_q4k_columns)) && weight_type == GGML_TYPE_Q4_K &&
                                ud->input_quant_type == GGML_TYPE_Q8_K;
     const bool canonical_ple_f32 = ud->gemma4_canonical_ple_f32_columns && weight_type == GGML_TYPE_F32 &&
                                    ud->input_quant_type == GGML_TYPE_F32 && input_contig &&
                                    (!callback_batch || callback_batch->lora_map.empty());
-    const bool canonical_q5k = qwen35_ssm_q5_columns && weight_type == GGML_TYPE_Q5_K &&
+    const bool canonical_q5k = qwen35_ssm_columns && ud->qwen35_ssm_qkv_canonical_q5k_columns && weight_type == GGML_TYPE_Q5_K &&
                                ud->input_quant_type == GGML_TYPE_Q8_K;
     if ((canonical_q4k || canonical_q5k || canonical_ple_f32) && output_contig &&
         callback_phase == InferenceExecutionPhase::Decode &&

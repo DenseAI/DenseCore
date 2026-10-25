@@ -419,6 +419,15 @@ std::vector<float> RunSsmGateOutQ4(TransformerModel* model,ggml_tensor* owned,
         options.no_context||options.no_batch||options.mixed_tokens||options.mixed_seqs||options.metadata_excluded||
         options.phase!=InferenceExecutionPhase::Decode;
     if(columns>1&&excluded)EXPECT_EQ(profile->gemv_custom_total_ops.load(),0);
+    if(columns>1&&!excluded){
+        EXPECT_EQ(profile->gemv_custom_total_ops.load(),columns);
+        const bool contiguous=weight->nb[1]==ggml_row_size(GGML_TYPE_Q4_K,n);
+        if(options.mode==densecore::env::RuntimeToggleMode::Off||!contiguous||
+           densecore::kernels::Q4KRepackedGemvCacheLimitBytes()==0)
+            EXPECT_EQ(profile->q4k_repacked_gemv_used_ops.load(),0);
+        else if(densecore::kernels::Q4KRealPackedGemvKernelAvailable())
+            EXPECT_GT(profile->q4k_repacked_gemv_used_ops.load(),0);
+    }
     std::vector<float> result(k*columns);
     for(int c=0;c<columns;++c)std::memcpy(result.data()+c*k,static_cast<char*>(output->data)+c*output->nb[1],k*sizeof(float));
     return result;

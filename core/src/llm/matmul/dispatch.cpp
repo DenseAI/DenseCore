@@ -1265,6 +1265,32 @@ static bool IsQwen35OrdinaryDenseQ4KProjection(const TransformerModel* model, co
     return false;
 }
 
+// Separate from ordinary dense projections: only the real registered SSM
+// gate/output matrices have this singleton-arithmetic qualification candidate.
+static bool IsQwen35SsmGateOutQ4KProjection(const TransformerModel* model, const ggml_tensor* weight,
+                                           const ggml_tensor* input, const SmartMatmulDispatchState& dispatch) {
+    if (!densecore::runtime::IsQwen35Point8B(model) || !weight || !input || model->output == weight ||
+        model->arch_flags.is_glm_moe || model->layers.size() != 24 ||
+        dispatch.semantic_op != densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer ||
+        weight->type != GGML_TYPE_Q4_K || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        weight->nb[0] != ggml_type_size(GGML_TYPE_Q4_K) ||
+        input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) ||
+        input->ne[1] < 2 || input->ne[1] > 8 || input->ne[2] != 1 || input->ne[3] != 1) return false;
+    const bool gate = dispatch.tensor_role == densecore::runtime::DenseCoreTensorRole::HybridSSMGate &&
+                      weight->ne[0] == 1024 && weight->ne[1] == 2048;
+    const bool output = dispatch.tensor_role == densecore::runtime::DenseCoreTensorRole::SSMOut &&
+                        weight->ne[0] == 2048 && weight->ne[1] == 1024;
+    if ((!gate && !output) || input->ne[0] != weight->ne[0] ||
+        input->nb[1] < static_cast<size_t>(weight->ne[0]) * sizeof(float) ||
+        weight->nb[1] < ggml_row_size(GGML_TYPE_Q4_K, weight->ne[0])) return false;
+    for (const auto& layer : model->layers)
+        if (layer.is_moe || !layer.experts.empty()) return false;
+    const char* key = gate ? model_keys::kAttnGate : model_keys::kSSMOut;
+    for (size_t layer = 0; layer < model->layers.size(); ++layer)
+        if (model->IsHybridSSMLayer(static_cast<int>(layer)) && model->layers[layer].Get(key) == weight) return true;
+    return false;
+}
+
 // The real Point8 SSM QKV matrix has a maintained Q5_K singleton primitive.
 // Require model ownership and its contract, not a filename or dimensions alone.
 static bool IsQwen35SsmQkvQ5KProjection(const TransformerModel* model, const ggml_tensor* weight,
@@ -1328,6 +1354,8 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const T
                                                   !ud->require_q4k_true_batched &&
                                                   !ud->qwen36_ssm_q8_repacked_batched &&
                                                   !ud->qwen36_ssm_q8_direct_batched;
+    ud->qwen35_ssm_gate_out_canonical_q4k_columns = IsQwen35SsmGateOutQ4KProjection(model, weight, input, dispatch) &&
+        !ud->require_q4k_true_batched && !ud->qwen36_ssm_q8_repacked_batched && !ud->qwen36_ssm_q8_direct_batched;
     // Graph construction can classify a batched projection as decode-shaped
     // even though the callback executes during prefill. Prepare the immutable
     // model-owned alias from the batch shape; the callback still gates use on
