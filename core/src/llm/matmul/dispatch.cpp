@@ -78,8 +78,8 @@ static bool CanUseGemma4FloatProjection(const TransformerModel* model, const ggm
            (weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_BF16 ||
             (weight->type == GGML_TYPE_F32 &&
              (input->ne[1] > kMaxSmallBatchColsHard ||
-              weight->nb[1] != static_cast<size_t>(weight->ne[0]) * sizeof(float) ||
-              input->nb[1] != static_cast<size_t>(input->ne[0]) * sizeof(float)))) &&
+              (input->ne[1] == 1 &&
+               weight->nb[1] != static_cast<size_t>(weight->ne[0]) * sizeof(float))))) &&
            weight->ne[0] == input->ne[0] && input->ne[0] > 0 && input->ne[1] > 0 && weight->ne[1] > 0 &&
            weight->ne[2] == 1 && weight->ne[3] == 1 && input->ne[2] == 1 && input->ne[3] == 1 &&
            weight->nb[0] == ggml_type_size(weight->type) && input->nb[0] == sizeof(float);
