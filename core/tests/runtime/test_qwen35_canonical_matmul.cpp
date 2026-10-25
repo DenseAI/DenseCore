@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include "densecore/exceptions.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "densecore/models/model_types.h"
@@ -18,6 +19,7 @@
 
 namespace densecore::testing {
 ggml_tensor* SmartMulMatWithPhaseTest(ggml_context*,ggml_tensor*,ggml_tensor*,TransformerModel*,int);
+bool IsQwen35SsmQkvQ5KProjectionForTest(const TransformerModel*,const ggml_tensor*,const ggml_tensor*);
 bool IsQwen35OrdinaryDenseQ4KProjectionForTest(const TransformerModel*,const ggml_tensor*,const ggml_tensor*);
 }
 namespace {
@@ -170,8 +172,14 @@ TEST(Qwen35CanonicalMatmulTest, AdmissionRequiresActualOrdinaryOwnershipAndExclu
 
 namespace {
 constexpr int kSsmQ5Input = 1024, kSsmQ5Output = 6144;
+struct SsmQ5Options {
+    InferenceExecutionPhase phase=InferenceExecutionPhase::Decode;
+    bool lora=false, reference=false, legacy=false, required=false;
+    bool fused_repacked=false, fused_direct=false, amx=false;
+    bool no_context=false, no_batch=false, mixed_tokens=false, wrong_context_model=false;
+};
 std::vector<float> RunSsmQ5(TransformerModel* model, ggml_tensor* weight,
-                            const std::vector<float>& values, int columns, int first, int threads, bool padded) {
+                            const std::vector<float>& values, int columns, int first, int threads, bool padded, SsmQ5Options options={}) {
     std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(
         CreateInferenceWorkContext(), DestroyInferenceWorkContext);
     struct Restore { InferenceWorkContext* previous; ~Restore(){SetCurrentWorkContext(previous);} } restore{GetCurrentWorkContext()};
@@ -192,9 +200,40 @@ std::vector<float> RunSsmQ5(TransformerModel* model, ggml_tensor* weight,
     if(output->op!=GGML_OP_CUSTOM)throw std::runtime_error("SSM Q5 fixture lost native custom callback");
     std::memcpy(&params,output->op_params,sizeof(params));
     if(columns==1)EXPECT_EQ(params.fun,cb_gemv_custom); // Protect the untouched old singleton selector.
+    if(params.fun==cb_gemv_batched_custom) {
+        auto* ud=static_cast<GemvBatchedUserData*>(params.userdata);
+        EXPECT_TRUE(ud->qwen35_ssm_qkv_canonical_q5k_columns);
+        if(options.legacy)ud->qwen35_ssm_qkv_canonical_q5k_columns=false;
+        ud->force_reference_scalar=options.reference;
+        ud->require_q4k_true_batched=options.required;
+        ud->qwen36_ssm_q8_repacked_batched=options.fused_repacked;
+        ud->qwen36_ssm_q8_direct_batched=options.fused_direct;
+        if(options.amx)ud->qwen38_q4k_8x8_weight=weight;
+        if(options.no_context)ud->work_ctx=nullptr;
+    }
+    if(options.lora)batch.lora_map[nullptr]={0};
+    if(options.mixed_tokens)batch.tokens.push_back(0);
+    if(options.no_batch)BindInferenceWorkContextBatch(work.get(),nullptr);
+    if(options.wrong_context_model)work->model_variant=ModelVariant::QWEN36;
+    SetCurrentExecutionPhase(options.phase);
+    const bool excluded=options.legacy || options.reference || options.required || options.lora ||
+        options.fused_repacked || options.fused_direct || options.amx || options.no_context || options.no_batch ||
+        options.mixed_tokens || options.wrong_context_model || options.phase!=InferenceExecutionPhase::Decode;
+    if(options.required) {
+        // The original Q5 path explicitly rejects a Q4-only required kernel.
+        // Direct invocation keeps that exception on this test's C++ stack.
+        EXPECT_THROW(params.fun(output,0,1,params.userdata),densecore::InvalidArgumentException);
+        EXPECT_EQ(GetInferenceWorkContextProfile(work.get())->gemv_custom_total_ops.load(),0);
+        return {};
+    }
     params.tasks=threads;std::memcpy(output->op_params,&params,sizeof(params));
     auto* graph=ggml_new_graph_custom(ctx.get(),128,false);ggml_build_forward_expand(graph,output);
     EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,threads),GGML_STATUS_SUCCESS);
+    if(columns>1) {
+        const auto calls=GetInferenceWorkContextProfile(work.get())->gemv_custom_total_ops.load();
+        if(excluded)EXPECT_EQ(calls,0);
+        else EXPECT_EQ(calls,static_cast<uint64_t>(columns));
+    }
     std::vector<float> result(kSsmQ5Output*columns);
     for(int c=0;c<columns;++c)
         std::memcpy(result.data()+c*kSsmQ5Output,static_cast<char*>(output->data)+c*output->nb[1],kSsmQ5Output*sizeof(float));
@@ -204,9 +243,9 @@ std::vector<float> RunSsmQ5(TransformerModel* model, ggml_tensor* weight,
 
 TEST(Qwen35CanonicalMatmulTest, SsmQ5ProjectionMatchesInitializedCpuPrimitiveAndOwnedOldM1Bits) {
     std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({16*1024*1024,nullptr,false}),ggml_free);
-    ASSERT_NE(ctx,nullptr); // Initializes the GGML scalar/FP16 conversion tables before quantization.
+    ASSERT_NE(ctx,nullptr); // Base GGML initialization must precede any reference conversion.
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(),ggml_backend_free);
-    ASSERT_NE(cpu,nullptr);
+    ASSERT_NE(cpu,nullptr); // The CPU-traits oracle requires CPU initialization, not just base GGML.
     const auto* q5=ggml_get_type_traits_cpu(GGML_TYPE_Q5_K);
     const auto* q8=ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     ASSERT_NE(q5,nullptr);ASSERT_NE(q8,nullptr);ASSERT_NE(q5->vec_dot,nullptr);ASSERT_NE(q8->from_float,nullptr);
@@ -249,5 +288,71 @@ TEST(Qwen35CanonicalMatmulTest, SsmQ5ProjectionMatchesInitializedCpuPrimitiveAnd
             for(int c=0;c<columns;++c)
                 EXPECT_EQ(std::memcmp(actual.data()+c*kSsmQ5Output,expected[c].data(),kSsmQ5Output*sizeof(float)),0)<<"column="<<c;
         }
+        for(int exclusion=0;exclusion<13;++exclusion) {
+            SCOPED_TRACE(exclusion);
+            SsmQ5Options options;
+            if(exclusion==0)options.phase=InferenceExecutionPhase::Prefill;
+            if(exclusion==1)options.phase=InferenceExecutionPhase::Unknown;
+            options.lora=exclusion==2;options.reference=exclusion==3;options.required=exclusion==4;
+            options.fused_repacked=exclusion==5;options.fused_direct=exclusion==6;options.amx=exclusion==7;
+            options.no_context=exclusion==8;options.no_batch=exclusion==9;options.mixed_tokens=exclusion==10;
+            options.wrong_context_model=exclusion==11;options.legacy=exclusion==12;
+            const auto current=RunSsmQ5(model.get(),weight,values,4,0,5,true,options);
+            options.legacy=true;
+            const auto previous=RunSsmQ5(model.get(),weight,values,4,0,5,true,options);
+            ASSERT_EQ(current.size(),previous.size());
+            if(!current.empty())EXPECT_EQ(std::memcmp(current.data(),previous.data(),current.size()*sizeof(float)),0);
+        }
     }
+}
+
+TEST(Qwen35CanonicalMatmulTest, SsmQ5AdmissionRequiresExactRegisteredPoint8NonMoeQkv) {
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({1024*1024,nullptr,true}),ggml_free);
+    ASSERT_NE(ctx,nullptr);
+    auto model=MakePoint8B();
+    auto* input=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1024,4);
+    auto* weight=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q5_K,1024,6144);
+    auto* foreign=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q5_K,1024,6144);
+    ggml_set_name(weight,"blk.0.attn_qkv.weight");ggml_set_name(foreign,weight->name);
+    model->layers[0].Set(model_keys::kAttnQkvWeight,weight);
+    const auto admitted=[&](ggml_tensor* w,ggml_tensor* x=nullptr){
+        return densecore::testing::IsQwen35SsmQkvQ5KProjectionForTest(model.get(),w,x?x:input);
+    };
+    EXPECT_TRUE(admitted(weight));EXPECT_FALSE(admitted(foreign));
+    model->layers[0].Set(model_keys::kAttnQkvWeight,nullptr);
+    model->layers[3].Set(model_keys::kAttnQkvWeight,weight);EXPECT_FALSE(admitted(weight)); // Attention layer.
+    model->layers[3].Set(model_keys::kAttnQkvWeight,nullptr);
+    model->layers[0].Set(model_keys::kAttnQWeight,weight);EXPECT_FALSE(admitted(weight));
+    model->layers[0].Set(model_keys::kAttnQWeight,nullptr);
+    model->layers[0].Set(model_keys::kAttnGate,weight);EXPECT_FALSE(admitted(weight));
+    model->layers[0].Set(model_keys::kAttnGate,nullptr);
+    model->layers[0].Set(model_keys::kSSMOut,weight);EXPECT_FALSE(admitted(weight));
+    model->layers[0].Set(model_keys::kSSMOut,nullptr);
+    model->layers[0].Set(model_keys::kAttnQkvWeight,weight);
+    model->output=weight;EXPECT_FALSE(admitted(weight));model->output=nullptr;
+    for(auto variant:{ModelVariant::QWEN36,ModelVariant::QWEN38,ModelVariant::GEMMA4}) {
+        model->variant=variant;EXPECT_FALSE(admitted(weight));
+    }
+    model->variant=ModelVariant::QWEN35;
+    model->hparams.n_experts=2;EXPECT_FALSE(admitted(weight));model->hparams.n_experts=0;
+    model->layers[0].is_moe=true;EXPECT_FALSE(admitted(weight));model->layers[0].is_moe=false;
+    model->layers[1].experts.resize(1);EXPECT_FALSE(admitted(weight));model->layers[1].experts.clear();
+    model->arch_flags.is_glm_moe=true;EXPECT_FALSE(admitted(weight));model->arch_flags.is_glm_moe=false;
+    model->arch_flags.is_hybrid_ssm=false;EXPECT_FALSE(admitted(weight));model->arch_flags.is_hybrid_ssm=true;
+    model->hparams.n_embd=2048;EXPECT_FALSE(admitted(weight));model->hparams.n_embd=1024;
+    model->hparams.n_layer=32;EXPECT_FALSE(admitted(weight));model->hparams.n_layer=24;
+    for(auto type:{GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,GGML_TYPE_F32}) {
+        auto* wrong=ggml_new_tensor_2d(ctx.get(),type,1024,6144);ggml_set_name(wrong,weight->name);
+        model->layers[0].Set(model_keys::kAttnQkvWeight,wrong);EXPECT_FALSE(admitted(wrong));
+    }
+    auto* wrong_shape=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q5_K,1024,6136);ggml_set_name(wrong_shape,weight->name);
+    model->layers[0].Set(model_keys::kAttnQkvWeight,wrong_shape);EXPECT_FALSE(admitted(wrong_shape));
+    auto* fused=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q5_K,1024,8192);ggml_set_name(fused,"qwen35_ssm_qkv_gate_fused_proj");
+    model->layers[0].Set(model_keys::kAttnQkvWeight,fused);EXPECT_FALSE(admitted(fused));
+    model->layers[0].Set(model_keys::kAttnQkvWeight,weight);
+    EXPECT_FALSE(admitted(weight,ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,1024,4)));
+    EXPECT_FALSE(admitted(weight,ggml_transpose(ctx.get(),ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,4,1024))));
+    EXPECT_FALSE(admitted(weight,ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,1024,4,2)));
+    EXPECT_FALSE(admitted(weight,ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,1024,16)));
+    EXPECT_TRUE(admitted(weight));
 }

@@ -1265,6 +1265,28 @@ static bool IsQwen35OrdinaryDenseQ4KProjection(const TransformerModel* model, co
     return false;
 }
 
+// The real Point8 SSM QKV matrix has a maintained Q5_K singleton primitive.
+// Require model ownership and its contract, not a filename or dimensions alone.
+static bool IsQwen35SsmQkvQ5KProjection(const TransformerModel* model, const ggml_tensor* weight,
+                                       const ggml_tensor* input, const SmartMatmulDispatchState& dispatch) {
+    if (!densecore::runtime::IsQwen35Point8B(model) || !weight || !input || model->output == weight ||
+        model->arch_flags.is_glm_moe || model->layers.size() != 24 ||
+        dispatch.tensor_role != densecore::runtime::DenseCoreTensorRole::HybridSSMQkv ||
+        dispatch.semantic_op != densecore::runtime::DenseCoreSemanticOp::HybridSsmMixer ||
+        weight->type != GGML_TYPE_Q5_K || weight->ne[0] != 1024 || weight->ne[1] != 6144 ||
+        weight->ne[2] != 1 || weight->ne[3] != 1 || weight->nb[0] != ggml_type_size(GGML_TYPE_Q5_K) ||
+        weight->nb[1] < ggml_row_size(GGML_TYPE_Q5_K, 1024) ||
+        input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[0] != 1024 ||
+        input->ne[1] < 2 || input->ne[1] > 8 || input->ne[2] != 1 || input->ne[3] != 1 ||
+        input->nb[1] < 1024 * sizeof(float)) return false;
+    for (const auto& layer : model->layers)
+        if (layer.is_moe || !layer.experts.empty()) return false;
+    for (size_t layer = 0; layer < model->layers.size(); ++layer)
+        if (model->IsHybridSSMLayer(static_cast<int>(layer)) &&
+            model->layers[layer].Get(model_keys::kAttnQkvWeight) == weight) return true;
+    return false;
+}
+
 static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const TransformerModel* model,
                                                 const ggml_tensor* weight, const ggml_tensor* input, const SmartMatmulDispatchState& dispatch,
                                                 const SmartMatmulPrefillProjectionPlan& prefill,
@@ -1302,6 +1324,10 @@ static void ConfigureSmartMatmulBatchedUserData(GemvBatchedUserData* ud, const T
                                                !ud->require_q4k_true_batched &&
                                                !ud->qwen36_ssm_q8_repacked_batched &&
                                                !ud->qwen36_ssm_q8_direct_batched;
+    ud->qwen35_ssm_qkv_canonical_q5k_columns = IsQwen35SsmQkvQ5KProjection(model, weight, input, dispatch) &&
+                                                  !ud->require_q4k_true_batched &&
+                                                  !ud->qwen36_ssm_q8_repacked_batched &&
+                                                  !ud->qwen36_ssm_q8_direct_batched;
     // Graph construction can classify a batched projection as decode-shaped
     // even though the callback executes during prefill. Prepare the immutable
     // model-owned alias from the batch shape; the callback still gates use on
@@ -1716,6 +1742,12 @@ struct ggml_tensor* smart_mul_mat(struct ggml_context* ctx, struct ggml_tensor* 
 namespace densecore::testing {
 bool IsGemma4PleF32ProjectionForTest(const TransformerModel* model, const ggml_tensor* weight) {
     return ::IsGemma4PleF32Projection(model, weight);
+}
+bool IsQwen35SsmQkvQ5KProjectionForTest(const TransformerModel* model, const ggml_tensor* weight,
+                                       const ggml_tensor* input) {
+    const auto dispatch = ResolveSmartMatmulDispatchState(model, weight, input, weight,
+        InferenceExecutionPhase::Decode, false, false);
+    return ::IsQwen35SsmQkvQ5KProjection(model, weight, input, dispatch);
 }
 bool IsQwen35OrdinaryDenseQ4KProjectionForTest(const TransformerModel* model, const ggml_tensor* weight,
                                              const ggml_tensor* input) {
