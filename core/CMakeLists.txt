@@ -1402,6 +1402,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_sampling_range.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_speculative_verification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_nextn_moe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_mtp_qualification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_sampling_and_moe_trace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_normalization.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_ops.cpp
