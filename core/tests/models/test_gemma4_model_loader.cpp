@@ -13,6 +13,10 @@
 #include <vector>
 
 #include <ggml.h>
+#include <ggml-cpu.h>
+#include <ggml-alloc.h>
+#include <cstring>
+#include "llm/weights/internal.h"
 
 #include "densecore/runtime/inference.h"
 #include "densecore/backend/flash_attention.h"
@@ -463,5 +467,117 @@ TEST(Gemma4ModelLoaderTest, LoadedTextSoftcapControlsNativeAttentionAndGreedyLog
                 }
             }
         }
+    }
+}
+
+namespace densecore::testing {
+bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel*, size_t*, size_t*, int);
+}
+
+namespace {
+struct GemmaRepackFixture {
+    std::unique_ptr<TransformerModel> model = std::make_unique<TransformerModel>();
+    std::vector<std::vector<uint8_t>> old_fused_inputs;
+    GemmaRepackFixture(int layers = 3, int rows = 8, ggml_type type = GGML_TYPE_Q4_0) {
+        model->arch_flags.is_gemma4 = true;
+        model->hparams.n_layer = layers;
+        model->backend = ggml_backend_cpu_init();
+        model->cpu_backend = model->backend;
+        model->ctx_w = ggml_init({4*1024*1024,nullptr,false});
+        model->layers.resize(layers);
+        const auto* traits = ggml_get_type_traits_cpu(type);
+        for (int layer = 0; layer < layers; ++layer) {
+            std::vector<ggml_tensor*> source;
+            for (int part = 0; part < 5; ++part) {
+                auto* tensor = ggml_new_tensor_2d(model->ctx_w,type,64,rows);
+                std::vector<float> values(static_cast<size_t>(64*rows));
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = .3f*std::sin(static_cast<float>(i+13*part+41*layer)*.071f);
+                if (type == GGML_TYPE_F32) std::memcpy(tensor->data,values.data(),values.size()*sizeof(float));
+                else traits->from_float(values.data(),tensor->data,values.size());
+                const char* keys[] = {"attn_q.weight","attn_k.weight","attn_v.weight","ffn_gate.weight","ffn_up.weight"};
+                model->layers[layer].Set(keys[part],tensor);
+                source.push_back(tensor);
+            }
+            for (const auto& indexes : {std::vector<int>{0,1,2},std::vector<int>{3,4}}) {
+                std::vector<uint8_t> fused;
+                for (int i : indexes) {
+                    const auto* bytes = static_cast<const uint8_t*>(source[i]->data);
+                    fused.insert(fused.end(),bytes,bytes+ggml_nbytes(source[i]));
+                }
+                old_fused_inputs.push_back(std::move(fused));
+            }
+        }
+    }
+};
+std::vector<float> GemmaRepackOutput(ggml_tensor* weight) {
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({1024*1024,nullptr,false}),ggml_free);
+    auto* input = ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,weight->ne[0],3);
+    auto* data = static_cast<float*>(input->data);
+    for (int64_t i = 0; i < ggml_nelements(input); ++i) data[i] = .2f*std::cos(static_cast<float>(i)*.03f);
+    auto* output = ggml_mul_mat(ctx.get(),weight,input);
+    auto* graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph,output);
+    EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,2),GGML_STATUS_SUCCESS);
+    const auto* result = static_cast<const float*>(output->data);
+    return {result,result+ggml_nelements(output)};
+}
+}
+
+TEST(Gemma4RepackStaging, MultipleAliasesMatchPriorPackedBytesAndOutputWithOneAliasPeak) {
+    GemmaRepackFixture fixture;
+    auto bufts = densecore::llm::weights::FindCpuRepackBufferTypes(fixture.model->backend);
+    ASSERT_NE(bufts.cpu_repack,nullptr);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> expected(ggml_init({1024*1024,nullptr,true}),ggml_free);
+    std::vector<ggml_tensor*> expected_aliases;
+    for (size_t i = 0; i < fixture.old_fused_inputs.size(); ++i)
+        expected_aliases.push_back(ggml_new_tensor_2d(expected.get(),GGML_TYPE_Q4_0,64,i%2 ? 16 : 24));
+    std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(expected.get(),bufts.cpu_repack),ggml_backend_buffer_free);
+    ASSERT_NE(buffer,nullptr);
+    for (size_t i = 0; i < expected_aliases.size(); ++i)
+        ggml_backend_tensor_set(expected_aliases[i],fixture.old_fused_inputs[i].data(),0,fixture.old_fused_inputs[i].size());
+    size_t peak = 0,live = 0;
+    ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
+    EXPECT_EQ(live,0u);
+    const auto largest = std::max_element(fixture.old_fused_inputs.begin(),fixture.old_fused_inputs.end(),
+        [](const auto& a,const auto& b) { return a.size() < b.size(); })->size();
+    EXPECT_LE(peak,largest);
+    EXPECT_GT(peak,0u);
+    for (size_t i = 0; i < expected_aliases.size(); ++i) {
+        auto* alias = fixture.model->layers[i/2].Get(i%2 ? "ffn_gate_up.cpu_repack_fused" : "attn_qkv.cpu_repack_fused");
+        ASSERT_NE(alias,nullptr);
+        ASSERT_NE(alias->extra,nullptr);
+        EXPECT_EQ(ggml_nbytes(alias),fixture.old_fused_inputs[i].size());
+        EXPECT_EQ(std::memcmp(alias->data,expected_aliases[i]->data,ggml_nbytes(alias)),0);
+        EXPECT_EQ(GemmaRepackOutput(alias),GemmaRepackOutput(expected_aliases[i]));
+    }
+}
+
+TEST(Gemma4RepackStaging, FailedMaterializationReleasesStagingAndLeavesNoPublishedAliases) {
+    for (int fail_after : {0,1,3}) {
+        GemmaRepackFixture fixture;
+        size_t peak = 0,live = 0;
+        EXPECT_FALSE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,fail_after));
+        EXPECT_EQ(live,0u);
+        EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
+        EXPECT_TRUE(fixture.model->prepared_weights.host_buffers.empty());
+        for (auto& layer : fixture.model->layers) {
+            EXPECT_EQ(layer.Get("attn_qkv.cpu_repack_fused"),nullptr);
+            EXPECT_EQ(layer.Get("ffn_gate_up.cpu_repack_fused"),nullptr);
+        }
+    }
+}
+
+TEST(Gemma4RepackStaging, NoAliasAndUnsupportedRowsDoNotStageOrRetainBuffers) {
+    for (int mode : {0,1,2}) {
+        GemmaRepackFixture fixture(2,mode == 2 ? 3 : 8,mode == 1 ? GGML_TYPE_F32 : GGML_TYPE_Q4_0);
+        if (mode == 0) fixture.model->arch_flags.is_gemma4 = false;
+        size_t peak = 0,live = 0;
+        EXPECT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
+        EXPECT_EQ(peak,0u);
+        EXPECT_EQ(live,0u);
+        EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
+        EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_aliases.empty());
     }
 }

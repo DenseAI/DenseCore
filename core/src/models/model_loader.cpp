@@ -1313,6 +1313,37 @@ void PrepareGenericCpuFastMatmulAliases(TransformerModel* model) {
 #endif
 }
 
+#ifdef DENSECORE_TEST_BUILD
+struct Gemma4RepackStagingProbe {
+    size_t live = 0;
+    size_t peak = 0;
+    int fail_after = -1;
+};
+thread_local Gemma4RepackStagingProbe* gemma4_repack_staging_probe = nullptr;
+template<class T> struct Gemma4StagingAllocator {
+    using value_type = T;
+    Gemma4StagingAllocator() = default;
+    template<class U> Gemma4StagingAllocator(const Gemma4StagingAllocator<U>&) noexcept {}
+    T* allocate(size_t n) {
+        auto* probe = gemma4_repack_staging_probe;
+        if (probe && probe->fail_after == 0) throw std::bad_alloc();
+        if (probe && probe->fail_after > 0) --probe->fail_after;
+        T* ptr = std::allocator<T>{}.allocate(n);
+        if (probe) { probe->live += n*sizeof(T); probe->peak = std::max(probe->peak,probe->live); }
+        return ptr;
+    }
+    void deallocate(T* ptr, size_t n) noexcept {
+        if (auto* probe = gemma4_repack_staging_probe) probe->live -= n*sizeof(T);
+        std::allocator<T>{}.deallocate(ptr,n);
+    }
+    template<class U> bool operator==(const Gemma4StagingAllocator<U>&) const noexcept { return true; }
+    template<class U> bool operator!=(const Gemma4StagingAllocator<U>&) const noexcept { return false; }
+};
+template<class T> using Gemma4StagingVector = std::vector<T,Gemma4StagingAllocator<T>>;
+#else
+template<class T> using Gemma4StagingVector = std::vector<T>;
+#endif
+
 void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     if (!model || !model->arch_flags.is_gemma4 || model->layers.empty()) {
         return;
@@ -1333,14 +1364,14 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     struct PendingAlias {
         ggml_tensor* source = nullptr;
         ggml_tensor* alias = nullptr;
-        std::vector<uint8_t> bytes;
+        Gemma4StagingVector<uint8_t> bytes;
         bool use_kleidiai = false;
     };
     struct PendingFusedAlias {
         TransformerLayer* layer = nullptr;
         ggml_tensor* alias = nullptr;
         std::string key;
-        std::vector<uint8_t> bytes;
+        Gemma4StagingVector<uint8_t> bytes;
         bool use_kleidiai = false;
     };
     std::vector<PendingAlias> pending;
@@ -1421,7 +1452,7 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
     }
 
     auto register_alias = [&](ggml_tensor* source, ggml_tensor* alias, const char* suffix,
-                              std::vector<uint8_t> bytes = {}) -> bool {
+                              Gemma4StagingVector<uint8_t> bytes = {}) -> bool {
         if (!source || !alias) {
             return false;
         }
@@ -1527,8 +1558,8 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
         if (!alias) {
             return false;
         }
-        std::vector<uint8_t> converted(ggml_nbytes(alias));
-        std::vector<float> row(static_cast<size_t>(ne0), 0.0f);
+        Gemma4StagingVector<uint8_t> converted(ggml_nbytes(alias));
+        Gemma4StagingVector<float> row(static_cast<size_t>(ne0), 0.0f);
         const size_t dst_row_size = ggml_row_size(GGML_TYPE_Q8_0, ne0);
         for (int64_t expert = 0; expert < ne2; ++expert) {
             for (int64_t row_idx = 0; row_idx < ne1; ++row_idx) {
@@ -1896,6 +1927,23 @@ void PrepareGemma4CpuRepackAliases(TransformerModel* model) {
               << ", fused_aliases=" << fused_supported << ", bytes=" << (bytes / 1024 / 1024) << " MiB" << std::endl;
 }
 }  // namespace
+
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::testing {
+bool PrepareGemma4CpuRepackAliasesForTest(TransformerModel* model, size_t* peak, size_t* live, int fail_after) {
+    Gemma4RepackStagingProbe probe;
+    probe.fail_after = fail_after;
+    auto* previous = gemma4_repack_staging_probe;
+    gemma4_repack_staging_probe = &probe;
+    struct Restore { Gemma4RepackStagingProbe* previous; ~Restore() { gemma4_repack_staging_probe = previous; } } restore{previous};
+    bool completed = true;
+    try { PrepareGemma4CpuRepackAliases(model); } catch (const std::bad_alloc&) { completed = false; }
+    if (peak) *peak = probe.peak;
+    if (live) *live = probe.live;
+    return completed;
+}
+}
+#endif
 
 bool ResolveModelLoadMemoryPlan(size_t weight_tensor_count, size_t layer_count, size_t moe_layer_count,
                                 size_t expert_count, ModelLoadMemoryPlan* plan, std::string* error) {
