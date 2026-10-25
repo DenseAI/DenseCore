@@ -543,12 +543,12 @@ TEST_F(RequestLifecycleTest, AutoEmbeddingRejectsUnsupportedMetadataBeforeAdmiss
         entry->model->gguf_pooling_type = 4; // GGUF rank pooling is not a sentence vector.
     }
     EmbeddingCallbackState rejected;
+    EmbeddingCallbackState explicit_last;
     EngineCloseGuard close_before_callback_state{&engine_};
     EXPECT_EQ(SubmitEmbeddingRequestEx(engine_, "unsupported-auto", -1, 1, EmbeddingLifecycleCallback, &rejected),
               DENSECORE_STATUS_INVALID_ARGUMENT);
     EXPECT_NE(std::string(DenseCoreGetLastError()).find("pooling metadata"), std::string::npos);
     EXPECT_EQ(rejected.callback_count, 0);
-    EmbeddingCallbackState explicit_last;
     ASSERT_GT(SubmitEmbeddingRequestEx(engine_, "explicit-last", 2, 1, EmbeddingLifecycleCallback, &explicit_last), 0);
     ASSERT_TRUE(explicit_last.Wait(15s));
     EXPECT_EQ(explicit_last.callback_count, 1);
