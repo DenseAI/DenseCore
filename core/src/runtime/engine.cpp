@@ -1553,6 +1553,13 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
         }
 
         EngineState* state = (EngineState*)handle;
+        // Explicit MTP owns one validated target/head and its checkpoint bank.
+        // Additional models would bypass that initialization contract.
+        if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP) {
+            SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
+                     "LoadModel: explicit MTP does not support additional models");
+            return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
+        }
         std::string canonical_model_path;
         if (!ValidateModelPathArg(model_path, "LoadModel", "model_path", &canonical_model_path)) {
             return DENSECORE_STATUS_INVALID_ARGUMENT;
@@ -1698,6 +1705,13 @@ int SetDefaultModel(DenseCoreHandle handle, const char* model_id) {
 
     EngineState* state = (EngineState*)handle;
     std::lock_guard<std::mutex> lock(state->models_mu);
+
+    if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP &&
+        state->default_model_id != model_id) {
+        SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
+                 "SetDefaultModel: explicit MTP cannot switch its validated target");
+        return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
+    }
 
     if (state->models.find(model_id) == state->models.end()) {
         SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "SetDefaultModel: model not found");
