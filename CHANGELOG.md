@@ -9,6 +9,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### v0.2 candidates (qualification in progress)
+
+- Add common Linux resource budgeting, context-preserving automatic concurrency,
+  versioned initialization/runtime diagnostics and embedding pooling AUTO.
+- Isolate request RNG; retain prefix snapshot/KV ownership through restoration;
+  terminate failed worker requests and fix native thread-pool generation races.
+- Add NextN loading and an explicit sequential MTP correctness reference.
+  Batched verification/SSM integration and automatic speed qualification remain pending.
+- Add Gemma native float-projection and GPT-OSS native packed-expert/Harmony
+  candidates; real-model and final-package gates are tracked separately.
+- Verify model downloads and cached bytes before publication, and add native
+  image-profile, limited-pod, drain and reproducible CPU comparison gates.
+
+See [v0.2 release gates](docs/V0_2_RELEASE_GATES.md) for incomplete checks;
+these entries are not a released model-support or performance announcement.
+
 ### Changed
 
 - **Environment-variable surface reduced to the supported set.** The C++ core read
