@@ -6,8 +6,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -602,6 +604,48 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         }
     };
 
+    // Observe the already selected raw greedy result. This path returns before
+    // the adjusted-distribution logger below; diagnostics must not route it
+    // through that different sampling implementation merely to print scores.
+    auto debug_dump_raw_greedy = [&](int sampled_token) {
+        if constexpr (!densecore::env::kDiagnosticEnvEnabled) return;
+        const char* watch = densecore::env::GetDiagnosticEnv("DENSECORE_DEBUG_SAMPLE_WATCH_IDS");
+        if (debug_top_n <= 0 && (!watch || !*watch)) return;
+        std::fprintf(stderr,
+            "[SAMPLE_TOP] stage=argmax_raw request_id=%d output_token_index=%d idx=%d sampled=%d\n",
+            params.request_id, params.output_token_index, idx, sampled_token);
+        if (debug_top_n > 0) {
+            const auto top = capture_raw_top_candidates();
+            for (size_t i = 0; i < std::min(top.size(), static_cast<size_t>(debug_top_n)); ++i) {
+                std::fprintf(stderr, "  [TOP] token=%d raw=%.9g effective=1%s\n", top[i].token_id,
+                             static_cast<double>(top[i].pre_penalty_logit),
+                             top[i].token_id == sampled_token ? " <sampled>" : "");
+            }
+        }
+        while (watch && *watch) {
+            const char* comma = std::strchr(watch, ',');
+            char* end = nullptr;
+            const long parsed = std::strtol(watch, &end, 10);
+            if (end != watch && end == (comma ? comma : watch + std::strlen(watch)) &&
+                parsed >= std::numeric_limits<int>::min() && parsed <= std::numeric_limits<int>::max()) {
+                const int token = static_cast<int>(parsed);
+                const bool in_vocab = token >= 0 && token < n_vocab;
+                const bool in_range = token >= range_start && token < range_end;
+                const bool allowed = is_allowed(token);
+                const bool disallowed = is_disallowed(token);
+                const float raw = in_vocab ? last_logits[token] : NAN;
+                const bool finite = std::isfinite(raw);
+                const bool effective = in_range && allowed && !disallowed && finite;
+                std::fprintf(stderr,
+                    "  [WATCH] token=%d raw=%.9g in_vocab=%d in_range=%d allowed=%d disallowed=%d finite=%d "
+                    "effective=%d effective_logit=%.9g%s\n", token, static_cast<double>(raw), in_vocab, in_range,
+                    allowed, disallowed, finite, effective, static_cast<double>(effective ? raw : -INFINITY),
+                    token == sampled_token ? " <sampled>" : "");
+            }
+            watch = comma ? comma + 1 : nullptr;
+        }
+    };
+
     const bool has_history = params.token_history && !params.token_history->empty();
     const bool has_penalty = has_history && (params.repetition_penalty != 1.0f || params.frequency_penalty != 0.0f ||
                                              params.presence_penalty != 0.0f);
@@ -609,6 +653,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         const int token = finite_argmax_raw();
         maybe_record_raw_sampling_trace(token);
         debug_log_sample(token);
+        debug_dump_raw_greedy(token);
         return point_mass(token);
     }
 

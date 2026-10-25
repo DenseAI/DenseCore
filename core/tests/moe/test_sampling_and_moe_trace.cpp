@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1592,4 +1595,134 @@ TEST(SamplingRequestIsolation, SeededStreamsIgnoreInterleavingAndPoolReuse) {
             EXPECT_EQ(SampleTokenWithRng(logits, 0, b.sampling_params, b.SamplingRng()), expected[i]);
     }
     ggml_free(ctx);
+}
+
+
+namespace {
+class RawGreedyDiagnosticEnvironment {
+public:
+    RawGreedyDiagnosticEnvironment() {
+        for (const auto* name : names_) {
+            const char* value = std::getenv(name);
+            existed_.push_back(value != nullptr);
+            previous_.emplace_back(value ? value : "");
+            unsetenv(name);
+        }
+    }
+    ~RawGreedyDiagnosticEnvironment() {
+        for (size_t i = 0; i < previous_.size(); ++i) {
+            if (existed_[i]) setenv(names_[i], previous_[i].c_str(), 1);
+            else unsetenv(names_[i]);
+        }
+    }
+    void Enable(const char* watches = "0,1,2,3,4,-1,99") {
+        setenv("DENSECORE_DEBUG_SAMPLE_TOP", "2", 1);
+        setenv("DENSECORE_DEBUG_SAMPLE_WATCH_IDS", watches, 1);
+    }
+private:
+    const char* names_[4] = {"DENSECORE_DEBUG_SAMPLE_TOP", "DENSECORE_DEBUG_SAMPLE_WATCH_IDS",
+                            "DENSECORE_DEBUG_SAMPLE", "DENSECORE_DEBUG_SAMPLER_TRACE"};
+    std::vector<bool> existed_;
+    std::vector<std::string> previous_;
+};
+
+std::string RawGreedyWatchLine(const std::string& text, int id) {
+    const auto start = text.find("[WATCH] token=" + std::to_string(id) + " ");
+    if (start == std::string::npos) return {};
+    return text.substr(start, text.find('\n', start) - start);
+}
+}
+
+TEST(SamplingRawGreedyDiagnostic, OffOnPreservesRowChoiceDistributionRngAndLogits) {
+    RawGreedyDiagnosticEnvironment environment;
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 5, 2);
+    const float values[] = {100, 0, 0, 0, 0, 1, 9, 3, NAN, INFINITY};
+    std::memcpy(logits->data, values, sizeof(values));
+    std::vector<int> blocked{1};
+    SamplingParams params;
+    params.temperature = 0;
+    params.repetition_penalty = 1;
+    params.disallowed_token_ids = &blocked;
+    params.request_id = 9;
+    params.output_token_index = 50;
+    ::testing::internal::CaptureStderr();
+    const auto off = BuildSamplingDistribution(logits, 1, params);
+    EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
+    std::mt19937 a(123), b(123);
+    const int off_token = SampleTokenWithRng(logits, 1, params, a);
+    environment.Enable();
+    ::testing::internal::CaptureStderr();
+    const auto on = BuildSamplingDistribution(logits, 1, params);
+    const int on_token = SampleTokenWithRng(logits, 1, params, b);
+    const auto text = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(off, on);
+    EXPECT_EQ(on, (std::vector<double>{0, 0, 1, 0, 0}));
+    EXPECT_EQ(off_token, on_token);
+    EXPECT_EQ(on_token, 2);
+    EXPECT_EQ(a, b);
+    EXPECT_EQ(std::memcmp(logits->data, values, sizeof(values)), 0);
+    EXPECT_NE(text.find("request_id=9 output_token_index=50 idx=1 sampled=2"), std::string::npos);
+    EXPECT_NE(text.find("[TOP] token=2 raw=3 effective=1"), std::string::npos);
+    EXPECT_NE(text.find("[TOP] token=0 raw=1 effective=1"), std::string::npos);
+    EXPECT_EQ(text.find("[TOP] token=1 "), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 1).find("allowed=1 disallowed=1 finite=1 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 3).find("finite=0 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 4).find("finite=0 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 99).find("in_vocab=0 in_range=0"), std::string::npos);
+}
+
+TEST(SamplingRawGreedyDiagnostic, ReportsRawScoresOutsideActionRangeAndAllowlist) {
+    RawGreedyDiagnosticEnvironment environment;
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 5, 1);
+    const float values[] = {100, 20, 4, 4, NAN};
+    std::memcpy(logits->data, values, sizeof(values));
+    std::vector<int> allowed{0, 2, 3}, blocked{3};
+    SamplingParams params;
+    params.temperature = 0;
+    params.repetition_penalty = 1;
+    params.allowed_token_ids = &allowed;
+    params.disallowed_token_ids = &blocked;
+    params.action_token_start = 1;
+    params.action_token_count = 3;
+    const auto off = BuildSamplingDistribution(logits, 0, params);
+    environment.Enable();
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(BuildSamplingDistribution(logits, 0, params), off);
+    const auto text = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(off, (std::vector<double>{0, 0, 1, 0, 0}));
+    EXPECT_NE(RawGreedyWatchLine(text, 0).find("raw=100 in_vocab=1 in_range=0 allowed=1 disallowed=0 finite=1 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 1).find("raw=20 in_vocab=1 in_range=1 allowed=0 disallowed=0 finite=1 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 3).find("allowed=1 disallowed=1 finite=1 effective=0"), std::string::npos);
+    EXPECT_NE(RawGreedyWatchLine(text, 2).find("effective=1 effective_logit=4"), std::string::npos);
+}
+
+TEST(SamplingRawGreedyDiagnostic, WatchOnlyKeepsTieAndAllNonfiniteFallbackIdentical) {
+    RawGreedyDiagnosticEnvironment environment;
+    ggml_init_params init{16384, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(init), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 3, 1);
+    SamplingParams params;
+    params.temperature = 0;
+    params.repetition_penalty = 1;
+    for (bool nonfinite : {false, true}) {
+        const float values[] = {nonfinite ? NAN : 4, nonfinite ? INFINITY : 4, NAN};
+        std::memcpy(logits->data, values, sizeof(values));
+        unsetenv("DENSECORE_DEBUG_SAMPLE_WATCH_IDS");
+        const auto off = BuildSamplingDistribution(logits, 0, params);
+        setenv("DENSECORE_DEBUG_SAMPLE_WATCH_IDS", "0,1,2", 1);
+        ::testing::internal::CaptureStderr();
+        EXPECT_EQ(BuildSamplingDistribution(logits, 0, params), off);
+        const auto text = ::testing::internal::GetCapturedStderr();
+        EXPECT_EQ(off, (std::vector<double>{1, 0, 0}));
+        EXPECT_NE(text.find("stage=argmax_raw"), std::string::npos);
+        EXPECT_EQ(text.find("  [TOP]"), std::string::npos);
+        EXPECT_NE(RawGreedyWatchLine(text, 0).find(nonfinite ? "effective=0" : "effective=1"), std::string::npos);
+    }
 }
