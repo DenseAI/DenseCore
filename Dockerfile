@@ -158,6 +158,18 @@ RUN apt-get update && \
         libnuma1 \
         libhwloc15 && \
     rm -rf /var/lib/apt/lists/*
+# Normalize the native library closure so the final stage has no architecture-
+# specific COPY paths. Each profile is built and tested on its native runner.
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) triplet=x86_64-linux-gnu ;; \
+      arm64) triplet=aarch64-linux-gnu ;; \
+      *) echo "unsupported runtime architecture" >&2; exit 1 ;; \
+    esac; \
+    mkdir /runtime-closure; \
+    for library in libstdc++.so.6 libgomp.so.1 libhwloc.so.15 libnuma.so.1 libudev.so.1 libcap.so.2 libgcc_s.so.1; do \
+      cp -L "/usr/lib/$triplet/$library" /runtime-closure/; \
+    done
 
 # ============================================
 # Stage 5: Minimal runtime (Debian 13 glibc, no package manager or OpenSSL)
@@ -185,15 +197,7 @@ COPY --from=builder /app/build/libdensecore_decision.so* /app/lib/
 COPY --from=builder /app/build/libggml*.so* /app/lib/
 COPY --from=builder /tmp/densecore-licenses /app/licenses
 
-# DenseCore is release-qualified on linux/amd64. Copy only the dynamic runtime
-# libraries required by the portable C++ and NUMA-enabled build.
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libstdc++.so.6* /app/lib/
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libgomp.so.1* /app/lib/
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libhwloc.so.15* /app/lib/
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libnuma.so.1* /app/lib/
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libudev.so.1* /app/lib/
-COPY --from=runtime-libs /usr/lib/x86_64-linux-gnu/libcap.so.2* /app/lib/
-COPY --from=runtime-libs /lib/x86_64-linux-gnu/libgcc_s.so.1 /app/lib/
+COPY --from=runtime-libs /runtime-closure/ /app/lib/
 
 # Set library path
 ENV LD_LIBRARY_PATH=/app/lib

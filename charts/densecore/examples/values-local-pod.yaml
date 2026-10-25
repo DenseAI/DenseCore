@@ -1,0 +1,36 @@
+# Small pinned model on a limited CPU pod. The downloader publishes only after SHA verification.
+dense-base:
+  image:
+    repository: densecore
+    tag: local
+    pullPolicy: Never
+  model:
+    source: emptyDir
+    path: /models
+    filename: main_model.gguf
+    emptyDir:
+      sizeLimit: 2Gi
+  initContainers:
+    - name: model-download
+      image: densecore-downloader:local
+      imagePullPolicy: Never
+      env:
+        - {name: MODEL_REPO, value: lmstudio-community/Qwen3.5-0.8B-GGUF}
+        - {name: MODEL_FILE, value: Qwen3.5-0.8B-Q4_K_M.gguf}
+        - {name: MODEL_REVISION, value: 7925ccdc665d4efdb1034791e6b553e11128e6f8}
+        - {name: MODEL_SHA256, value: f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec}
+      volumeMounts:
+        - {name: model-volume, mountPath: /models}
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {cpu: '1', memory: 512Mi}
+  resources:
+    requests: {cpu: '1', memory: 2Gi}
+    limits: {cpu: '2', memory: 4Gi}
+  extraEnv:
+    - {name: THREADS, value: '0'}
+    - {name: SHUTDOWN_TIMEOUT, value: 30s}
+  lifecycle:
+    preStopSleepSeconds: 0
+  terminationGracePeriodSeconds: 40
+  affinity: {}

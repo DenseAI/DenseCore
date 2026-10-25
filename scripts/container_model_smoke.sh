@@ -26,6 +26,7 @@ trap cleanup EXIT
 
 docker run --detach \
   --name "$container_name" \
+  --cpus "${DENSECORE_SMOKE_CPUS:-2}" --memory "${DENSECORE_SMOKE_MEMORY:-4g}" \
   --publish "127.0.0.1:$port:8080" \
   --mount "type=bind,src=$(realpath "$model"),dst=/models/release-smoke.gguf,readonly" \
   --env MAIN_MODEL_PATH=/models/release-smoke.gguf \
@@ -99,7 +100,15 @@ if not "".join(visible).strip():
     raise SystemExit("streaming response content is empty")
 PY
 
-docker stop --time 30 "$container_name" >/dev/null
+python3 "$(dirname "$0")/active_drain_smoke.py" --url "$base_url" \
+  --output "$tmp_dir/drain.json" --timeout 30 -- docker kill --signal TERM "$container_name"
+
+# Bound the process exit independently from the request drain timeout.
+for _ in $(seq 1 35); do
+  [[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" == false ]] && break
+  sleep 1
+done
+[[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" == false ]] || { echo "process exceeded shutdown deadline" >&2; exit 1; }
 exit_code=$(docker wait "$container_name")
 if [ "$exit_code" != "0" ]; then
   docker logs "$container_name" >&2 || true
@@ -109,5 +118,23 @@ fi
 
 docker logs "$container_name" >"$tmp_dir/container.log" 2>&1
 docker rm "$container_name" >/dev/null
+container_name=""
+# Model weights may fit while the explicit context/concurrency plan cannot.
+# A kernel OOM kill is a failure, not proof of a safe initialization rejection.
+container_name="densecore-memory-reject-$$"
+docker run --detach --name "$container_name" --cpus 1 --memory "${DENSECORE_SMOKE_REJECT_MEMORY:-1g}" \
+  --mount "type=bind,src=$(realpath "$model"),dst=/models/release-smoke.gguf,readonly" \
+  --env MAIN_MODEL_PATH=/models/release-smoke.gguf \
+  --env DENSECORE_MAX_SEQ_LEN=32768 --env DENSECORE_MAX_NUM_SEQS=8 "$image" > /dev/null
+for _ in $(seq 1 60); do
+  [[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" == false ]] && break
+  sleep 1
+done
+[[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" == false ]] || { echo "insufficient-memory initialization did not reject configuration" >&2; exit 1; }
+[[ "$(docker inspect --format '{{.State.OOMKilled}}' "$container_name")" == false ]] || { echo "initialization was OOM-killed instead of safely rejecting" >&2; exit 1; }
+[[ "$(docker wait "$container_name")" != 0 ]] || { echo "unsafe memory configuration initialized successfully" >&2; exit 1; }
+docker logs "$container_name" > "$tmp_dir/memory-reject.log" 2>&1
+grep -Eq 'resource plan required_bytes=[0-9]+ available_bytes=[0-9]+' "$tmp_dir/memory-reject.log" || { cat "$tmp_dir/memory-reject.log" >&2; echo "missing explicit memory plan rejection" >&2; exit 1; }
+docker rm "$container_name" > /dev/null
 container_name=""
 echo "real-model container smoke passed: $image"

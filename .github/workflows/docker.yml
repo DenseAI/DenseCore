@@ -67,135 +67,146 @@ jobs:
           fi
 
   docker:
-    name: Build, scan, and publish Docker image
-    runs-on: ubuntu-latest
+    name: Validate ${{ matrix.profile }} on native ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     needs: [verify-main]
     if: always() && (needs.verify-main.result == 'success' || needs.verify-main.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {profile: portable-amd64, target: portable, arch: amd64, runner: ubuntu-24.04}
+          - {profile: portable-arm64, target: portable, arch: arm64, runner: ubuntu-24.04-arm}
+          - {profile: amd64-v3, target: amd64-v3, arch: amd64, runner: ubuntu-24.04}
+          - {profile: arm64, target: arm64, arch: arm64, runner: ubuntu-24.04-arm}
     permissions:
       contents: read
       security-events: write
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           ref: ${{ inputs.source_ref || github.ref }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Check release version metadata
-        run: bash scripts/check_version_consistency.sh "${{ inputs.version }}"
-
-      - name: Validate release CPU target mappings
+      - name: Record actual source revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Check release version and CPU profile
         run: |
-          set -euo pipefail
-          for target in portable amd64-v3 arm64; do
-            bash scripts/resolve_release_cpu_target.sh "$target"
-          done
-          if bash scripts/resolve_release_cpu_target.sh native; then
-            echo "native must not be accepted as a publishable Docker CPU target" >&2
-            exit 1
-          fi
-
-      - name: Build local amd64 image for blocking scan
-        # All published CPU profiles use the same source revision, runtime base,
-        # and package/dependency closure. The profile changes only deterministic
-        # compiler ISA flags, so this representative image owns the shared Trivy gate.
+          bash scripts/check_version_consistency.sh "${{ inputs.version }}"
+          bash scripts/resolve_release_cpu_target.sh "${{ matrix.target }}"
+      - name: Build native image
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           load: true
           push: false
           tags: densecore:scan
           build-args: |
             VERSION=${{ inputs.version }}
-            COMMIT_SHA=${{ github.sha }}
-            DENSECORE_CPU_TARGET=portable
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run blocking Trivy image scan
+            COMMIT_SHA=${{ steps.source.outputs.sha }}
+            DENSECORE_CPU_TARGET=${{ matrix.target }}
+          cache-from: type=gha,scope=${{ matrix.profile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.profile }}
+      - name: Scan native image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: densecore:scan
-          format: 'sarif'
-          output: 'trivy-image-results.sarif'
+          format: sarif
+          output: trivy-image-results.sarif
           exit-code: '1'
-          severity: 'CRITICAL,HIGH'
-
-      - name: Verify container runtime payload
+          severity: CRITICAL,HIGH
+      - name: Verify payload
         run: docker run --rm densecore:scan --help
-
-      - name: Download pinned release smoke model
+      - name: Download pinned smoke model
         run: |
-          curl --fail --location --retry 3 \
-            --output /tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
+          curl --fail --location --retry 3 --output /tmp/Qwen3.5-0.8B-Q4_K_M.gguf \
             https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/7925ccdc665d4efdb1034791e6b553e11128e6f8/Qwen3.5-0.8B-Q4_K_M.gguf
-          echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' \
-            | sha256sum --check --strict
-
-      - name: Run real-model container serving and shutdown smoke
+          echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' | sha256sum --check --strict
+      - name: Real-model serving, limits and active drain
         run: bash scripts/container_model_smoke.sh densecore:scan /tmp/Qwen3.5-0.8B-Q4_K_M.gguf 18080
-
-      - name: Upload Trivy scan results
+      - name: Build downloader and test installed chart on kind
+        if: matrix.profile == 'portable-amd64'
+        run: |
+          set -euo pipefail
+          docker tag densecore:scan densecore:local
+          docker build -f docker/downloader/Dockerfile -t densecore-downloader:local docker/downloader
+          command -v helm
+          command -v kubectl
+          if ! command -v kind; then
+            curl --fail --location --retry 3 -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            export PATH="/tmp:$PATH"
+          fi
+          DENSECORE_SMOKE_ARTIFACTS=/tmp/kind-smoke bash scripts/kind_model_smoke.sh
+      - name: Preserve kind evidence
+        if: always() && matrix.profile == 'portable-amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-smoke
+          path: /tmp/kind-smoke
+          if-no-files-found: warn
+      - name: Upload native scan
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: 'trivy-image-results.sarif'
-
-      - name: Require Docker Hub credentials for publishing
+          sarif_file: trivy-image-results.sarif
+          category: ${{ matrix.profile }}
+      - name: Require registry credentials
         if: inputs.publish
-        run: |
-          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
-            echo "Docker Hub credentials are required for publishing" >&2
-            exit 1
-          fi
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
+        run: test -n "$DOCKERHUB_USERNAME" && test -n "$DOCKERHUB_TOKEN"
+      - uses: docker/login-action@v4
         if: inputs.publish
-        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ inputs.version }}
-            type=raw,value=latest,enable=${{ inputs.publish && !contains(inputs.version, '-') }}
-            type=sha,prefix={{branch}}-
-
-      - name: Build and push qualified amd64 image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: ${{ inputs.publish }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            VERSION=${{ inputs.version }}
-            COMMIT_SHA=${{ github.sha }}
-            DENSECORE_CPU_TARGET=portable
-
-      - name: Update Docker Hub description
+      - name: Publish tested image by immutable digest
         if: inputs.publish
-        uses: peter-evans/dockerhub-description@v5
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag densecore:scan "$IMAGE_NAME:staging-${{ steps.source.outputs.sha }}-${{ matrix.profile }}"
+          docker push "$IMAGE_NAME:staging-${{ steps.source.outputs.sha }}-${{ matrix.profile }}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_NAME:staging-${{ steps.source.outputs.sha }}-${{ matrix.profile }}")
+          mkdir -p /tmp/digests
+          printf '%s\n' "$digest" > /tmp/digests/${{ matrix.profile }}.txt
+      - uses: actions/upload-artifact@v4
+        if: inputs.publish
+        with:
+          name: image-digest-${{ matrix.profile }}
+          path: /tmp/digests/*.txt
+          if-no-files-found: error
+
+  manifest:
+    name: Assemble tested native image manifests
+    needs: [docker]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ env.IMAGE_NAME }}
-          short-description: ${{ github.event.repository.description }}
-          readme-filepath: ./README.md
-        continue-on-error: true
+      - name: Publish portable and distinct CPU profile tags
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE_NAME:$VERSION" \
+            "$(cat /tmp/digests/portable-amd64.txt)" "$(cat /tmp/digests/portable-arm64.txt)"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$VERSION-amd64-v3" "$(cat /tmp/digests/amd64-v3.txt)"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$VERSION-arm64" "$(cat /tmp/digests/arm64.txt)"
+          if [[ "$VERSION" != *-* ]]; then
+            docker buildx imagetools create --tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$VERSION"
+          fi

@@ -90,7 +90,8 @@ dense-base:
   terminationGracePeriodSeconds: 60
 
   lifecycle:
-    preStopSleepSeconds: 5
+    # The distroless runtime has no /bin/sh. SIGTERM starts server drain.
+    preStopSleepSeconds: 0
 
   tmpVolume:
     enabled: true
