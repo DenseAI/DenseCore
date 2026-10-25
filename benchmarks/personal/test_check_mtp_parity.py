@@ -1,6 +1,9 @@
 import unittest
 import threading
-from check_mtp_parity import compare_native, validate_native, wait_for_first_token, extract_mtp_counters
+import json
+import tempfile
+from pathlib import Path
+from check_mtp_parity import compare_native, validate_native, wait_for_first_token, extract_mtp_counters, load_c1_baseline
 
 
 def sample(ids=(10, 20)):
@@ -66,3 +69,24 @@ class MtpCounterEvidenceTest(unittest.TestCase):
         self.assertEqual(rows['accepted'], 3)
         self.assertEqual(rows['rejected'], 2)
         self.assertEqual(rows['target_rollbacks'], 3)
+
+class BaselineReuseGateTest(unittest.TestCase):
+    def test_reuse_requires_exact_artifacts_and_valid_c1_pair(self):
+        provenance = {key: value for key, value in (
+            ('model_sha256', 'm'), ('library_sha256', 'l'), ('dependencies', {'l':'sha'}),
+            ('sampling', {'temperature':0}), ('draft_n_max',2), ('cpu_affinity',[0]), ('cpu_profile',['cpu']))}
+        baseline = dict(provenance, passed=True, native=[group('none',1), group('mtp',1)])
+        for row in baseline['native']:
+            row['runtime_plan'].update(effective_context=2048, effective_threads=8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'baseline.json'
+            path.write_text(json.dumps(baseline))
+            self.assertEqual(len(load_c1_baseline(path, provenance, 2048, 8)), 2)
+            with self.assertRaisesRegex(ValueError, 'thread mismatch'):
+                load_c1_baseline(path, provenance, 2048, 4)
+            with self.assertRaisesRegex(ValueError, 'model_sha256'):
+                load_c1_baseline(path, dict(provenance, model_sha256='different'), 2048, 8)
+            baseline['native'][1]['requests'][0]['token_ids'] = [99,20]
+            path.write_text(json.dumps(baseline))
+            with self.assertRaisesRegex(ValueError, 'native evidence invalid'):
+                load_c1_baseline(path, provenance, 2048, 8)

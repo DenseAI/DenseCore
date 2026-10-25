@@ -71,6 +71,32 @@ def validate_native(row):
         raise ValueError('structured callback token count differs from authoritative native count')
 
 
+def load_c1_baseline(path, manifest, context, threads):
+    baseline = json.loads(Path(path).read_text())
+    if baseline.get('passed') is not True:
+        raise ValueError('baseline summary did not pass its original gate')
+    for key in ('model_sha256', 'library_sha256', 'dependencies', 'sampling', 'draft_n_max',
+                'cpu_affinity', 'cpu_profile'):
+        if key not in baseline or baseline[key] != manifest.get(key):
+            raise ValueError(f'baseline provenance mismatch: {key}')
+    if manifest.get('cmake_cache_sha256') != baseline.get('cmake_cache_sha256'):
+        raise ValueError('baseline provenance mismatch: cmake_cache_sha256')
+    if manifest.get('server_sha256') != baseline.get('server_sha256'):
+        raise ValueError('baseline provenance mismatch: server_sha256')
+    groups = [row for row in baseline.get('native', []) if row.get('concurrency') == 1]
+    if {(row.get('mode'), row.get('concurrency')) for row in groups} != {('none', 1), ('mtp', 1)} or len(groups) != 2:
+        raise ValueError('baseline must contain exactly one none/mtp c1 pair')
+    for row in groups:
+        plan = row.get('runtime_plan', {})
+        if plan.get('effective_context') != context or plan.get('effective_threads') != threads:
+            raise ValueError('baseline context/thread mismatch')
+        row['evidence_source'] = str(Path(path).resolve())
+    failures = compare_native(groups)
+    if failures:
+        raise ValueError('baseline native evidence invalid: ' + '; '.join(failures))
+    return groups
+
+
 def compare_native(rows):
     baseline = {}
     failures = []
@@ -334,6 +360,7 @@ def parent(args):
         'library_sha256': digest(library), 'host': platform.uname()._asdict(),
         'cpu_affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
         'greedy': True, 'native_seed_api': False, 'draft_n_max': args.draft, 'native': [], 'http': []}
+    manifest['harness_sha256'] = digest(Path(__file__).resolve())
     manifest['dependencies'] = {str(path): digest(path) for path in sorted({
         entry.resolve() for entry in library.parent.glob('lib*.so*') if entry.is_file()})}
     cache = library.parent / 'CMakeCache.txt'
@@ -343,6 +370,13 @@ def parent(args):
         manifest['cpu_profile'] = [line for line in cpuinfo.read_text().split('\n\n')[0].splitlines()
                                    if line.startswith(('model name', 'flags', 'CPU implementer', 'CPU part', 'Features'))]
     if args.server: manifest['server_sha256'] = digest(args.server)
+    if args.baseline_summary:
+        if 1 in args.concurrency:
+            raise ValueError('--baseline-summary requires only new concurrency cells, excluding c1')
+        manifest['native'] = load_c1_baseline(args.baseline_summary, manifest, args.context, args.threads)
+        manifest['baseline_summary'] = {'path': str(args.baseline_summary.resolve()),
+                                        'sha256': digest(args.baseline_summary)}
+
     write(out / 'summary.json', manifest)
     environment = dict(os.environ, DENSECORE_MAX_SEQ_LEN=str(args.context),
         DENSECORE_MAX_NUM_SEQS=str(max(args.concurrency)), DENSECORE_PREFIX_CACHE_REUSE='0',
@@ -420,6 +454,7 @@ def main():
     parser.add_argument('--server', type=Path)
     parser.add_argument('--build-lock', type=Path, help='Hold the existing build/model flock throughout verification (Linux)')
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--baseline-summary', type=Path, help='reuse passed c1 native pair with identical model/binary/profile provenance')
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--context', type=int, default=2048)
     parser.add_argument('--concurrency', type=int, nargs='+', choices=(1, 2, 4, 8), default=[1, 2, 4])
