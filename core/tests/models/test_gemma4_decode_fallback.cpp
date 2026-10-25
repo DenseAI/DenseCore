@@ -1265,3 +1265,62 @@ TEST(Gemma4FallbackDecodeTest, PerLayerSliceBroadcastUsesTwoDimensionalTokenLayo
                      densecore::InvalidArgumentException);
     }
 }
+
+TEST(Gemma4FallbackDecodeTest, CompactedPerLayerInputSelectsTheSameFinalPromptToken) {
+    constexpr int hidden = 256, layers = 35, tokens = 26;
+    ggml_init_params params{8 * 1024 * 1024, nullptr, false};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    ggml_tensor* source = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hidden, layers, tokens);
+    for (int t = 0; t < tokens; ++t) {
+        for (int layer = 0; layer < layers; ++layer) {
+            for (int i = 0; i < hidden; ++i) {
+                static_cast<float*>(source->data)[(t * layers + layer) * hidden + i] = static_cast<float>(100 * t + layer);
+            }
+        }
+    }
+    for (int layer : {0, 17, 34}) {
+        ggml_tensor* selected = densecore::llm::graph::detail::Gemma4LayerInputView(ctx.get(), source, layer, tokens - 1, 1);
+        ASSERT_EQ(selected->ne[1], 1);
+        for (int i = 0; i < hidden; ++i) EXPECT_FLOAT_EQ(static_cast<float*>(selected->data)[i], 100.0f * (tokens - 1) + layer);
+    }
+    EXPECT_THROW(densecore::llm::graph::detail::Gemma4LayerInputView(ctx.get(), source, layers, 0, 1), densecore::InvalidArgumentException);
+    EXPECT_THROW(densecore::llm::graph::detail::Gemma4LayerInputView(ctx.get(), source, 0, tokens, 1), densecore::InvalidArgumentException);
+}
+
+TEST(Gemma4FallbackDecodeTest, PerLayerPrefillCompactionMatchesFinalTokenDecodeAndPreservesEmbeddings) {
+    auto model = MakeBaseGemma4GraphModel(1);
+    model->variant = ModelVariant::GEMMA4;
+    model->gemma4_hidden_size_per_layer_input = kTinyGraphDim;
+    auto vector = [&](std::vector<float> values) {
+        ggml_tensor* tensor = ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, values.size());
+        SetTensorData(tensor, values);
+        return tensor;
+    };
+    auto matrix = [&](int in, int out, std::vector<float> values) {
+        ggml_tensor* tensor = ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_F32, in, out);
+        SetTensorData(tensor, values);
+        return tensor;
+    };
+    SetTensorData(model->tok_embeddings, {0.8f, 0.2f, 0.4f, 1.2f});
+    model->gemma4_per_layer_model_projection = matrix(2, 2, {0, 0, 0, 0});
+    model->gemma4_per_layer_projection_norm = vector({1, 1});
+    model->gemma4_per_layer_token_embeddings = matrix(2, 2, {0.6f, -0.2f, -0.3f, 0.7f});
+    model->layers[0].Set(model_keys::kGemma4PerLayerInputGate, matrix(2, 2, {1, 0, 0, 1}));
+    model->layers[0].Set(model_keys::kGemma4PerLayerProjection, matrix(2, 2, {1, 0, 0, 1}));
+    model->layers[0].Set(model_keys::kGemma4PostPerLayerInputNorm, vector({1, 1}));
+    auto prefill_cache = MakeTinyGraphCache(model.get());
+    auto decode_cache = MakeTinyGraphCache(model.get());
+    ASSERT_NE(prefill_cache, nullptr);
+    ASSERT_NE(decode_cache, nullptr);
+    ASSERT_GE(prefill_cache->block_manager->AllocateSingle(), 0);
+    const int decode_block = decode_cache->block_manager->AllocateSingle();
+    ASSERT_GE(decode_block, 0);
+    const BatchSpec prefill = MakeSingleSequencePrefillBatch({0, 0, 1});
+    auto prefill_logits = densecore::testing::ExecuteTransformerGraphForTest(model.get(), prefill_cache.get(), prefill, 4);
+    auto decode_logits = densecore::testing::ExecuteTransformerGraphForTest(model.get(), decode_cache.get(), MakeSingleTokenDecodeBatch(1, 0, decode_block), 1);
+    ASSERT_EQ(prefill_logits.size(), 2u);
+    ASSERT_EQ(decode_logits.size(), 2u);
+    for (size_t i = 0; i < prefill_logits.size(); ++i) EXPECT_NEAR(prefill_logits[i], decode_logits[i], 1e-5);
+    auto embeddings = densecore::testing::ExecuteTransformerGraphEmbeddingsForTest(model.get(), prefill_cache.get(), prefill, 4);
+    EXPECT_EQ(embeddings.size(), 3u * kTinyGraphDim);
+}

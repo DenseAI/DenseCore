@@ -375,6 +375,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                      decode_only_batch_layout ? 1 : 0);
     }
     for (int il = 0; il < n_layer; ++il) {
+        bool last_layer_prefill_compacted = false;
         auto& layer = model->layers[il];
         const densecore::models::DecoderLayerSpec* layer_spec = decoder_spec_view.Layer(il);
         auto* attn_norm = layer.Get(model_keys::kAttnNorm);
@@ -2061,8 +2062,9 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 cur = apply_weighted_rms_norm(cur, post_attn_norm, "post_attention_norm", il);
             }
 
-            if (il == static_cast<int>(model->layers.size()) - 1 &&
+            if (!embedding_mode && il == static_cast<int>(model->layers.size()) - 1 &&
                 !(overrides && overrides->full_normalized_hidden) && ShouldUsePrefillLastLogitsOnly(model, batch, N)) {
+                last_layer_prefill_compacted = true;
                 const size_t last_token_offset = static_cast<size_t>(N - 1) * static_cast<size_t>(cur->nb[1]);
                 cur = ggml_view_2d(ctx_c, cur, cur->ne[0], 1, cur->nb[1], last_token_offset);
                 cur = ggml_cont(ctx_c, cur);
@@ -2833,9 +2835,13 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             auto* post_per_layer_norm = model->layers[il].Get(model_keys::kGemma4PostPerLayerInputNorm);
             if (per_layer_gate && per_layer_proj && post_per_layer_norm) {
                 const int hidden_per_layer = model->gemma4_hidden_size_per_layer_input;
+                const int selected_tokens = last_layer_prefill_compacted ? 1 : N;
+                const int selected_start = last_layer_prefill_compacted ? N - 1 : 0;
+                if (cur->ne[1] != selected_tokens || gemma4_per_layer_inputs->ne[0] != hidden_per_layer) {
+                    throw densecore::InvalidArgumentException("Gemma4 per-layer input token selection mismatch");
+                }
                 struct ggml_tensor* per_layer_input =
-                    ggml_view_2d(ctx_c, gemma4_per_layer_inputs, hidden_per_layer, N, gemma4_per_layer_inputs->nb[2],
-                                 static_cast<size_t>(il) * gemma4_per_layer_inputs->nb[1]);
+                    Gemma4LayerInputView(ctx_c, gemma4_per_layer_inputs, il, selected_start, selected_tokens);
                 struct ggml_tensor* per_layer_delta = smart_mul_mat(ctx_c, per_layer_gate, cur, model);
                 per_layer_delta = ggml_gelu(ctx_c, per_layer_delta);
                 per_layer_delta = checked_mul(ctx_c, per_layer_delta, per_layer_input, "gemma4 per-layer input gate");
