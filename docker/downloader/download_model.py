@@ -187,6 +187,12 @@ def main() -> int:
                         repo_id=model_repo, filename=model_file, local_dir=Path(staging),
                         token=hf_token, revision=revision,
                     )
+                # A Hub client/cache may return a symlink into its staging cache.
+                # Materialize it before the staging directory is removed.
+                if downloaded_path.is_symlink():
+                    regular = Path(staging) / "materialized-model.gguf"
+                    shutil.copyfile(downloaded_path, regular)
+                    downloaded_path = regular
                 verify_sha256(downloaded_path, expected)
                 model_file_path.parent.mkdir(parents=True, exist_ok=True)
                 downloaded_path.replace(model_file_path)

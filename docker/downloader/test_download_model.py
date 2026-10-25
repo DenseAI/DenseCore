@@ -57,6 +57,20 @@ class DownloadIntegrityTest(unittest.TestCase):
             with self.subTest(key=key), patch.dict(os.environ, {key: value}):
                 self.assertEqual(downloader.main(), 1)
 
+    def test_hub_symlink_is_materialized_before_staging_cleanup(self):
+        def fetch(**kwargs):
+            cache = kwargs['local_dir'] / 'cached-bytes'
+            cache.write_bytes(self.payload)
+            path = kwargs['local_dir'] / 'model.gguf'
+            path.symlink_to(cache)
+            return path
+        with patch.object(downloader, 'download_with_retry', side_effect=fetch):
+            self.assertEqual(downloader.main(), 0)
+        published = (self.root / downloader.MAIN_MODEL_NAME).resolve()
+        self.assertTrue(published.is_file())
+        self.assertFalse(published.is_symlink())
+        self.assertEqual(published.read_bytes(), self.payload)
+
     def test_new_revision_cannot_overwrite_previous_verified_artifact(self):
         def fetch(**kwargs):
             path = kwargs['local_dir'] / 'model.gguf'
