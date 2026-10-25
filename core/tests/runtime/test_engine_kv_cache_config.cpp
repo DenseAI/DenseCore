@@ -737,7 +737,7 @@ TEST(EngineKVCacheConfig, SafeBudgetRejectsWhenEvenOneSequenceCannotFit) {
     ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "128");
     ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "4096");
     ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
-    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "2048");
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "1024");
     auto model = MakeModel(128, 16, 8);
     model.hparams.n_ctx = 4096;
     try {
