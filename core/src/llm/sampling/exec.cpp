@@ -997,10 +997,12 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     float sum_exp = 0.0f;
     int best_token = range_start;
     bool found_finite = false;
+    size_t finite_candidate_count = 0;
 
     for (int i = 0; i < active_vocab; ++i) {
         const float v = adjusted_logit_at(i);
         if (!std::isfinite(v)) continue;
+        ++finite_candidate_count;
         const int token_id = range_start + i;
         if (!found_finite) {
             max_logit = v;
@@ -1148,7 +1150,14 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     }
 
     if (params.top_p < 1.0f && !candidates.empty()) {
-        const float cutoff_mass = params.top_p * sum_exp;
+        // Nucleus sampling conditions on support left by top-k/min-p. Keep
+        // the original reduction when neither filter removed a candidate.
+        float surviving_mass = sum_exp;
+        if (candidates.size() < finite_candidate_count) {
+            surviving_mass = 0.0f;
+            for (const auto& candidate : candidates) surviving_mass += candidate.mass;
+        }
+        const float cutoff_mass = params.top_p * surviving_mass;
         float cumulative_mass = 0.0f;
         size_t cutoff = 0;
         for (size_t i = 0; i < candidates.size(); ++i) {
