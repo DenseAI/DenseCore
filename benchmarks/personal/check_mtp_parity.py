@@ -284,7 +284,8 @@ def parent(args):
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     library, model = args.library.resolve(), args.model.resolve()
-    manifest = {'model': str(model), 'model_sha256': digest(model), 'library': str(library),
+    manifest = {'sampling': {'temperature': 0, 'top_p': 1, 'top_k': 0, 'repetition_penalty': 1, 'kv_type': 'FP16'},
+        'model': str(model), 'model_sha256': digest(model), 'library': str(library),
         'library_sha256': digest(library), 'host': platform.uname()._asdict(),
         'cpu_affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
         'greedy': True, 'native_seed_api': False, 'draft_n_max': args.draft, 'native': [], 'http': []}
@@ -350,6 +351,7 @@ def main():
     parser.add_argument('--library', type=Path, required=True)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--server', type=Path)
+    parser.add_argument('--build-lock', type=Path, help='Hold the existing build/model flock throughout verification (Linux)')
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--context', type=int, default=2048)
@@ -371,6 +373,11 @@ def main():
     if 1 not in args.concurrency: parser.error('concurrency must include 1 for the isolation baseline')
     args.concurrency = sorted(set(args.concurrency))
     try:
+        if args.build_lock:
+            import fcntl
+            with args.build_lock.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                return parent(args)
         return parent(args)
     except Exception as error:
         path = args.out.resolve() / 'summary.json'
