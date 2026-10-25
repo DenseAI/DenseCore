@@ -232,7 +232,9 @@ TEST(ChatTemplateTest, Qwen3DefaultsToThinkingWhenEnvIsUnset) {
     unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
     const std::string wrapped = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "hello");
 
-    EXPECT_TRUE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_EQ(wrapped, "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n");
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(wrapped));
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, wrapped));
 }
 
 TEST(ChatTemplateTest, Qwen3NoThinkingMatchesPinnedGgufGenerationCue) {
@@ -948,4 +950,42 @@ TEST(LFM2TextBlocklistTest, BlocksSpecialAndChatControlTokens) {
     EXPECT_FALSE(is_blocked(0));
     EXPECT_FALSE(is_blocked(5));
     EXPECT_FALSE(is_blocked(6));
+}
+
+TEST(ChatTemplateTest, OfficialQwenGenerationCuePreservesActualThinkingBoundaryWithoutPriming) {
+    TransformerModel model{};
+    model.arch = ModelArch::QWEN3;
+    model.variant = ModelVariant::QWEN3;
+    model.token_to_id["<think>"] = 10;
+    model.token_to_id["</think>"] = 11;
+    const std::string cue = "<|im_start|>user\nCalculate 6 * 7.<|im_end|>\n<|im_start|>assistant\n";
+    setenv("DENSECORE_QWEN3_ENABLE_THINKING", "true", 1);
+    EXPECT_FALSE(DenseCoreTestOnlyPromptStartsInThinkBlock(cue));
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, cue));
+    const auto allowed = DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(&model, cue);
+    EXPECT_TRUE(allowed.empty());
+    const std::string disabled = cue + "<think>\n\n</think>\n\n";
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, disabled));
+    const auto blocked = DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(&model, disabled);
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 10), blocked.end());
+    EXPECT_NE(std::find(blocked.begin(), blocked.end(), 11), blocked.end());
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, cue + "<think>\n"));
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, cue + "Answer: "));
+    setenv("DENSECORE_QWEN3_ENABLE_THINKING", "false", 1);
+    // A rendered thinking cue is authoritative even against process defaults;
+    // a disabled request carries the closed scaffold and stays suppressed.
+    EXPECT_FALSE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, cue));
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, disabled));
+    const auto automatic_disabled = DenseCoreTestOnlyApplyAutoChatTemplate(&model, "Calculate 6 * 7.");
+    EXPECT_EQ(automatic_disabled, disabled);
+    EXPECT_TRUE(DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(&model, automatic_disabled));
+    densecore::models::CanonicalChatMessage message{};
+    message.role = "user";
+    message.content = "Calculate 6 * 7.";
+    densecore::models::CanonicalChatRenderOptions options{};
+    options.enable_thinking = 1;
+    bool enabled = false;
+    EXPECT_EQ(densecore::models::RenderModelChatMessages(&model, {message}, options, &enabled), cue);
+    EXPECT_TRUE(enabled);
+    unsetenv("DENSECORE_QWEN3_ENABLE_THINKING");
 }

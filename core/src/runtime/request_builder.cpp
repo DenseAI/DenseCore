@@ -322,7 +322,7 @@ bool PromptEndsInsideTaggedBlock(const std::string& prompt, const char* open_tag
     return last_close == std::string::npos || last_close < last_open;
 }
 
-void InitializePromptSuppressionState(Request* req) {
+void InitializePromptSuppressionState(Request* req, const TransformerModel* model = nullptr) {
     if (!req) {
         return;
     }
@@ -333,6 +333,19 @@ void InitializePromptSuppressionState(Request* req) {
     req->in_tool_call_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_call>", "</tool_call>");
     req->in_tool_response_block = PromptEndsInsideTaggedBlock(req->prompt, "<tool_response>", "</tool_response>");
     req->suppress_reasoning_tags = !req->in_think_block;
+    // Official Qwen Jinja can leave the generation cue at assistant newline:
+    // the model then generates its own <think> and </think>. Preserve those
+    // actual boundaries for thinking-enabled requests without altering input.
+    constexpr const char* assistant_cue = "<|im_start|>assistant\n";
+    const size_t cue = req->prompt.rfind(assistant_cue);
+    if (model && cue != std::string::npos &&
+        req->prompt.find_first_not_of(" \t\r\n", cue + std::strlen(assistant_cue)) == std::string::npos) {
+        const auto profile = densecore::models::ResolveModelPromptTemplateProfile(model);
+        if (profile.kind == densecore::models::PromptTemplateKind::CHATML &&
+            profile.supports_thinking) {
+            req->suppress_reasoning_tags = false;
+        }
+    }
 }
 
 void DebugPrintPromptTokens(const TransformerModel* model, const std::vector<int>& tokens, const char* tag) {
@@ -377,10 +390,9 @@ bool DenseCoreTestOnlySuppressesReasoningTagsForPrompt(const std::string& prompt
 }
 
 bool DenseCoreTestOnlySuppressesReasoningTagsForModelPrompt(const TransformerModel* model, const std::string& prompt) {
-    (void)model;
     Request req{};
     req.prompt = prompt;
-    InitializePromptSuppressionState(&req);
+    InitializePromptSuppressionState(&req, model);
     return req.suppress_reasoning_tags;
 }
 
@@ -394,7 +406,7 @@ std::vector<int> DenseCoreTestOnlyQwenReasoningBlocklistForPrompt(const Transfor
                                                                   const std::string& prompt) {
     Request req{};
     req.prompt = prompt;
-    InitializePromptSuppressionState(&req);
+    InitializePromptSuppressionState(&req, model);
     ConfigureQwenReasoningTokenBlocklist(model, &req);
     return req.disallowed_token_ids;
 }
@@ -481,7 +493,7 @@ void PrepareTextRequest(TransformerModel* model, Request* req, const char* promp
     const std::string before_priming = trace ? req->prompt : std::string{};
     MaybePrimeQwenNoThinkingPromptText(model, &req->prompt);
     if (trace) req->parity_debug_text_primed = (req->prompt != before_priming);
-    InitializePromptSuppressionState(req);
+    InitializePromptSuppressionState(req, model);
     req->tokens = Tokenizer::Tokenize(model, req->prompt, ResolveAddBosForPrompt(model, req->prompt));
     if (trace) {
         const std::vector<int> before = req->tokens;
@@ -908,7 +920,7 @@ static int SubmitRequestIdsWithSamplingConstraintsImpl(
                 // request for prompt-state decisions, but never re-template or
                 // re-tokenize it here.
                 req->prompt = rendered_prompt;
-                InitializePromptSuppressionState(req);
+                InitializePromptSuppressionState(req, model_entry->model.get());
                 req->parity_debug_template_applied = false;
                 req->parity_debug_text_primed = false;
             }

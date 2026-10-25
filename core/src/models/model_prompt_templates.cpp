@@ -290,6 +290,11 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
         return;
     }
     const auto& descriptor = DescribeModel(model);
+    if (descriptor.variant == ModelVariant::QWEN3) {
+        // Its GGUF template lets the model generate the thinking channel.
+        if (!thinking_enabled) out->append("<think>\n\n</think>\n\n");
+        return;
+    }
     if (descriptor.variant == ModelVariant::QWEN36 || descriptor.variant == ModelVariant::QWEN38) {
         if (thinking_enabled) {
             out->append("<think>\n");
@@ -300,7 +305,7 @@ void AppendQwenAssistantGenerationCue(const TransformerModel* model, bool thinki
     }
     if (thinking_enabled) {
         out->append("<think>\n");
-    } else if (descriptor.variant == ModelVariant::QWEN3 || descriptor.variant == ModelVariant::QWEN35) {
+    } else if (descriptor.variant == ModelVariant::QWEN35) {
         out->append("<think>\n\n</think>\n\n");
     }
 }

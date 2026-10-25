@@ -730,11 +730,11 @@ func TestSplitReasoningResponseQwen38ClosedThinkKeepsFinalContent(t *testing.T) 
 	}
 }
 
-func TestSplitReasoningResponseQwen38RecoversUnclosedFinalParagraph(t *testing.T) {
+func TestSplitReasoningResponseQwen38NeverPromotesUnclosedReasoning(t *testing.T) {
 	enableThinking := true
 	req := domain.ChatCompletionRequest{ChatTemplateKwargs: &domain.ChatTemplateKwargs{EnableThinking: &enableThinking}}
 	content, reasoning := splitReasoningResponse(req, "Qwen3.8-27B", "check the arithmetic\n\n\n2 + 2 equals 4.")
-	if content != "2 + 2 equals 4." || reasoning != "check the arithmetic" {
+	if content != "" || reasoning != "check the arithmetic\n\n\n2 + 2 equals 4." {
 		t.Fatalf("content=%q reasoning=%q", content, reasoning)
 	}
 }
@@ -756,14 +756,14 @@ func TestQwen38StreamFilterRoutesOpenThinkToReasoning(t *testing.T) {
 	}
 }
 
-func TestQwen38StreamFilterFlushRecoversUnclosedFinalParagraph(t *testing.T) {
+func TestQwen38StreamFilterFlushKeepsUnclosedReasoning(t *testing.T) {
 	filter := newQwen36StreamFilter()
 	content, reasoning := filter.Filter("internal plan\n\n\nFinal answer.")
 	if content != "" || reasoning != "" {
 		t.Fatalf("response should remain buffered, content=%q reasoning=%q", content, reasoning)
 	}
 	content, reasoning = filter.Flush()
-	if content != "Final answer." || reasoning != "internal plan" {
+	if content != "" || reasoning != "internal plan\n\n\nFinal answer." {
 		t.Fatalf("content=%q reasoning=%q", content, reasoning)
 	}
 }

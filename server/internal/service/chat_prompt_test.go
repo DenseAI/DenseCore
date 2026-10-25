@@ -340,7 +340,7 @@ func TestFormatChatPromptQwen3NoThinkingMatchesPinnedGgufCue(t *testing.T) {
 	}
 	enabled = true
 	prompt = FormatChatPrompt("/models/Qwen3-0.6B-Q8_0.gguf", []domain.Message{{Role: "user", Content: "hello"}}, &domain.ChatTemplateKwargs{EnableThinking: &enabled})
-	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n<think>\n") {
-		t.Fatalf("thinking opt-in changed: %q", prompt)
+	if !strings.HasSuffix(prompt, "<|im_start|>assistant\n") {
+		t.Fatalf("thinking cue must match pinned Qwen3 Jinja: %q", prompt)
 	}
 }

@@ -419,31 +419,15 @@ func splitQwenThinkResponse(text string) (string, string) {
 		return content, reasoning
 	}
 	text = strings.TrimPrefix(text, openTag)
-	if content, reasoning, ok := splitUnclosedQwenReasoning(text); ok {
-		return content, reasoning
-	}
-	// Qwen3.6 generation starts after the assistant-side `<think>\n` cue.
+	// Qwen generation starts after the assistant-side `<think>\n` cue.
 	// llama.cpp reports these tokens as reasoning_content until </think>.
 	return "", strings.TrimSpace(text)
 }
 
-func splitUnclosedQwenReasoning(text string) (string, string, bool) {
-	const finalBoundary = "\n\n\n"
-	idx := strings.LastIndex(text, finalBoundary)
-	if idx < 0 {
-		return "", "", false
-	}
-	reasoning := strings.TrimSpace(text[:idx])
-	content := strings.TrimSpace(text[idx+len(finalBoundary):])
-	if reasoning == "" || content == "" {
-		return "", "", false
-	}
-	return content, reasoning, true
-}
-
 type qwen36StreamFilter struct {
-	inReasoning bool
-	pending     string
+	inReasoning      bool
+	pending          string
+	trimContentStart bool
 }
 
 func newQwen36StreamFilter() *qwen36StreamFilter {
@@ -469,18 +453,18 @@ func (f *qwen36StreamFilter) filterReasoningPending(flush bool) (string, string)
 		reasoning := strings.TrimSpace(f.pending[:idx])
 		f.pending = strings.TrimLeft(f.pending[idx+len(closeTag):], " \t\r\n")
 		f.inReasoning = false
+		f.trimContentStart = true
 		content := f.flushContentPending(flush)
 		return content, reasoning
 	}
 	if !flush {
 		return "", ""
 	}
-	content, reasoning, recovered := splitUnclosedQwenReasoning(f.pending)
-	if !recovered {
-		reasoning = strings.TrimSpace(f.pending)
-	}
+	// Blank lines do not close a thought channel. At EOS, unfinished
+	// reasoning remains reasoning even when it contains an apparent answer.
+	reasoning := strings.TrimSpace(f.pending)
 	f.pending = ""
-	return content, reasoning
+	return "", reasoning
 }
 
 func (f *qwen36StreamFilter) Flush() (string, string) {
@@ -494,6 +478,12 @@ func (f *qwen36StreamFilter) Flush() (string, string) {
 }
 
 func (f *qwen36StreamFilter) flushContentPending(flush bool) string {
+	if f.trimContentStart {
+		f.pending = strings.TrimLeft(f.pending, " \t\r\n")
+		if f.pending != "" {
+			f.trimContentStart = false
+		}
+	}
 	if flush || !isSuffixOf(f.pending, "</think>") {
 		content := f.pending
 		f.pending = ""
@@ -516,6 +506,18 @@ func qwen36ReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) 
 	if req.ChatTemplateKwargs != nil && req.ChatTemplateKwargs.EnableThinking != nil {
 		return *req.ChatTemplateKwargs.EnableThinking
 	}
+	if isQwen3ModelHint(modelHint) {
+		if value, ok := os.LookupEnv("DENSECORE_QWEN3_ENABLE_THINKING"); ok {
+			return parseTruthyEnv(value)
+		}
+		return true
+	}
+	if isQwen35ModelHint(modelHint) {
+		if value, ok := os.LookupEnv("DENSECORE_QWEN35_ENABLE_THINKING"); ok {
+			return parseTruthyEnv(value)
+		}
+		return false
+	}
 	if value, ok := os.LookupEnv("DENSECORE_QWEN36_ENABLE_THINKING"); ok {
 		return parseTruthyEnv(value)
 	}
@@ -527,7 +529,7 @@ func qwen36ReasoningEnabled(req domain.ChatCompletionRequest, modelHint string) 
 
 func isQwenOpenThinkModelHint(modelHint string) bool {
 	lower := strings.ToLower(strings.TrimSpace(modelHint))
-	return strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen36") ||
+	return isQwen3ModelHint(lower) || isQwen35ModelHint(lower) || strings.Contains(lower, "qwen3.6") || strings.Contains(lower, "qwen36") ||
 		strings.Contains(lower, "qwen3.8") || strings.Contains(lower, "qwen38")
 }
 
@@ -591,5 +593,12 @@ func isQwen38ModelHint(modelHint string) bool {
 }
 
 func isQwenModelHint(modelHint string) bool {
-	return isQwen35ModelHint(modelHint) || isQwen36ModelHint(modelHint) || isQwen38ModelHint(modelHint)
+	return isQwen3ModelHint(modelHint) || isQwen35ModelHint(modelHint) || isQwen36ModelHint(modelHint) || isQwen38ModelHint(modelHint)
+}
+
+func isQwen3ModelHint(modelHint string) bool {
+	lower := strings.ToLower(strings.TrimSpace(modelHint))
+	return strings.Contains(lower, "qwen3") && !isQwen35ModelHint(lower) &&
+		!isQwen36ModelHint(lower) && !isQwen38ModelHint(lower) &&
+		!strings.Contains(lower, "qwen3next") && !strings.Contains(lower, "qwen3-next")
 }
