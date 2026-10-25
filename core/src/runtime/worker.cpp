@@ -46,6 +46,8 @@
 #include "llm/config/runtime_config.h"
 #include "llm/graph/cache.h"
 #include "llm/sampling/sampling_rng.h"
+#include "llm/speculative/reference_session.h"
+#include "llm/graph/build_internal.h"
 #include "runtime/engine_internal.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
@@ -1028,6 +1030,7 @@ void EngineLoop(EngineState* state) {
 
         // Mapping: scheduler seq_id -> Request*
         std::unordered_map<int, Request*> seq_to_request;
+        std::unordered_map<int, std::unique_ptr<densecore::llm::speculative::ReferenceSession>> mtp_sessions;
         using namespace densecore::llm::graph;
         GraphCache graph_cache;
         std::unordered_map<std::string, FlexibleGraphPoolSizing> flexible_graph_pool_sizing_cache;
@@ -1054,6 +1057,7 @@ void EngineLoop(EngineState* state) {
             state->metrics.active_requests.fetch_sub(static_cast<int>(finished_requests.size()),
                                                      std::memory_order_relaxed);
             for (Request* req : finished_requests) {
+                mtp_sessions.erase(req->id);
                 state->request_pool.Release(req);
             }
 
@@ -1381,6 +1385,9 @@ void EngineLoop(EngineState* state) {
                     EnsureRequestHybridSSMRuntimeState(current_model, req);
                     EnsureRequestLFM2RuntimeState(current_model, req);
                     InitializeRequestPrefixCacheState(req, current_model);
+                    if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                        req->prefix_cache_allowed = false; // reference head bootstrap needs full prompt hidden states
+                    }
                     LogDeterminismBoundary("after_tokenization", req, current_model,
                                            /*prefix_cache_allowed=*/req->prefix_cache_allowed,
                                            /*prefix_cache_hit=*/false,
@@ -1594,7 +1601,8 @@ void EngineLoop(EngineState* state) {
                 }
             }
 
-            const bool prefix_cache_allowed = IsPrefixCacheAllowedForModel(current_model);
+            const bool prefix_cache_allowed = IsPrefixCacheAllowedForModel(current_model) &&
+                                              state->speculation_selected.load(std::memory_order_acquire) != 2;
             std::unordered_set<int> determinism_prefix_hit_reqs;
             std::unordered_set<int> determinism_hybrid_restore_attempt_reqs;
             std::unordered_set<int> determinism_hybrid_restore_applied_reqs;
@@ -2580,6 +2588,7 @@ void EngineLoop(EngineState* state) {
             // =========================================================================
             struct ggml_cgraph* gf = nullptr;
             struct ggml_tensor* output = nullptr;
+            struct ggml_tensor* mtp_target_hidden = nullptr;
             struct ggml_tensor* embd_inp = nullptr;
             struct ggml_tensor* pos = nullptr;
             bool reused_decode_graph = false;
@@ -2592,8 +2601,15 @@ void EngineLoop(EngineState* state) {
                 [&](struct ggml_context* graph_ctx, struct ggml_cgraph* graph, struct ggml_tensor** graph_output,
                     struct ggml_tensor** graph_embd_inp, struct ggml_tensor** graph_pos) {
                     try {
-                        *graph_output = BuildTransformerGraph(current_model, current_kv_cache, graph_ctx, batch,
-                                                              is_embedding_batch, graph, graph_embd_inp, graph_pos);
+                        if (!is_embedding_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                            GraphAssemblyOverrides overrides;
+                            overrides.pre_output_norm_hidden = &mtp_target_hidden;
+                            *graph_output = BuildTransformerGraphInlineImpl(current_model, current_kv_cache, graph_ctx,
+                                                batch, false, graph, graph_embd_inp, graph_pos, &overrides);
+                        } else {
+                            *graph_output = BuildTransformerGraph(current_model, current_kv_cache, graph_ctx, batch,
+                                                                  is_embedding_batch, graph, graph_embd_inp, graph_pos);
+                        }
                         return true;
                     } catch (const densecore::DenseCoreException& e) {
                         if (is_decode_batch) {
@@ -2699,7 +2715,8 @@ void EngineLoop(EngineState* state) {
             const int decode_graph_cache_lru_size = std::max(1, DecodeGraphCacheLruSize());
             const bool decode_graph_cache_active =
                 IsDecodeGraphCacheEnabled() && current_kv_cache != nullptr && decode_graph_cache_lru_size > 0;
-            const bool force_disable_graph_cache = IsGraphCacheReuseDisabled();
+            const bool force_disable_graph_cache = IsGraphCacheReuseDisabled() ||
+                state->speculation_selected.load(std::memory_order_acquire) == 2;
             const auto& prefill_graph_cache_policy = state->fast_path_config.prefill_graph_cache;
             const int prefill_graph_cache_lru_size = std::max(1, prefill_graph_cache_policy.lru_size);
             const size_t prefill_graph_cache_max_bytes = prefill_graph_cache_policy.max_bytes;
@@ -5734,6 +5751,33 @@ void EngineLoop(EngineState* state) {
                 int processed_count = (i < static_cast<int>(batch_token_counts.size())) ? batch_token_counts[i] : 1;
 
                 int last_token_idx = token_offset + processed_count - 1;
+                if (!is_embedding_batch && state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                    try {
+                        if (!mtp_target_hidden || !mtp_target_hidden->data || mtp_target_hidden->type != GGML_TYPE_F32 ||
+                            mtp_target_hidden->ne[1] != static_cast<int64_t>(batch.tokens.size())) {
+                            throw std::runtime_error("MTP target hidden states unavailable");
+                        }
+                        auto& session = mtp_sessions[req->id];
+                        if (!session) {
+                            session = std::make_unique<densecore::llm::speculative::ReferenceSession>(
+                                *current_model, state->speculation_max_context, state->spec_draft_n_max.load(),
+                                req->sampling_params.seed, active_threads);
+                        }
+                        const auto* hidden = reinterpret_cast<const float*>(
+                            static_cast<const char*>(mtp_target_hidden->data) + token_offset * mtp_target_hidden->nb[1]);
+                        session->ObserveTarget(batch.tokens.data() + token_offset, hidden,
+                            mtp_target_hidden->nb[1] / sizeof(float), processed_count, req->is_prefill);
+                    } catch (const std::exception& e) {
+                        finalize_generation_error(req, DecodeFinishCause::GraphBuildFailed,
+                                                  std::string("Error: MTP execution failed: ") + e.what(), global_direct_callback);
+                        free_request_blocks(req);
+                        remove_request_from_scheduler(req, false);
+                        mtp_sessions.erase(req->id);
+                        token_offset += processed_count;
+                        continue;
+                    }
+                }
+
 
                 if (is_embedding_batch) {
                     float* data = (float*)output->data;
@@ -5953,7 +5997,23 @@ void EngineLoop(EngineState* state) {
                                                                      profile_work_ctx, static_cast<int>(output->ne[0]),
                                                                      &best_token, &precomputed_lfm2_argmax_value);
                     if (!can_use_precomputed_lfm2_argmax) {
-                        best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params, req->SamplingRng());
+                        if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
+                            try {
+                                best_token = mtp_sessions.at(req->id)->Sample(output, sampling_logits_idx, sampling_params,
+                                                       req->SamplingRng(), batch.deps, req->cancelled);
+                            } catch (const std::exception& e) {
+                                finalize_generation_error(req, req->cancelled.load() ? DecodeFinishCause::RequestCanceled
+                                                                                   : DecodeFinishCause::GraphBuildFailed,
+                                    std::string("Error: MTP execution failed: ") + e.what(), global_direct_callback);
+                                free_request_blocks(req);
+                                remove_request_from_scheduler(req, false);
+                                mtp_sessions.erase(req->id);
+                                token_offset += processed_count;
+                                continue;
+                            }
+                        } else {
+                            best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params, req->SamplingRng());
+                        }
                     }
                     LogRequestLifecyclePhase("sample_end", req, current_model, req->seq_id, batch.num_seqs,
                                              static_cast<int>(batch.tokens.size()), active_threads);

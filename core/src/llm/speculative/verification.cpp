@@ -39,6 +39,24 @@ int Argmax(const Distribution& p) {
 }
 }  // namespace
 
+TokenVerificationResult VerifyToken(int token, const Distribution& q, const Distribution& p, bool greedy,
+                                    std::mt19937& accept_rng, std::mt19937& target_rng) {
+    Validate(p, p.size()); Validate(q, p.size());
+    if (token < 0 || static_cast<size_t>(token) >= p.size() || q[token] <= 0) {
+        throw std::invalid_argument("draft token has no probability mass");
+    }
+    const bool accepted = greedy ? token == Argmax(p) :
+        std::generate_canonical<double, 53>(accept_rng) < std::min(1.0, p[token] / q[token]);
+    if (accepted) return {token, true};
+    if (greedy) return {Argmax(p), false};
+    Distribution residual(p.size());
+    double sum = 0;
+    for (size_t t = 0; t < p.size(); ++t) { residual[t] = std::max(0.0, p[t] - q[t]); sum += residual[t]; }
+    if (!(sum > 0) || !std::isfinite(sum)) throw std::runtime_error("empty speculative residual");
+    for (double& mass : residual) mass /= sum;
+    return {Draw(residual, target_rng), false};
+}
+
 VerificationResult Verify(const std::vector<int>& draft_tokens, const std::vector<Distribution>& draft,
                           const std::vector<Distribution>& target, bool greedy,
                           std::mt19937& accept_rng, std::mt19937& target_rng) {
@@ -58,33 +76,12 @@ VerificationResult Verify(const std::vector<int>& draft_tokens, const std::vecto
     VerificationResult result;
     result.tokens.reserve(k + 1);
     for (size_t i = 0; i < k; ++i) {
-        const int token = draft_tokens[i];
-        const auto& p = target[i];
-        const auto& q = draft[i];
-        const bool accepted = greedy ? token == Argmax(p) :
-            std::generate_canonical<double, 53>(accept_rng) < std::min(1.0, p[token] / q[token]);
-        if (accepted) {
-            result.tokens.push_back(token);
-            ++result.accepted_draft_tokens;
-            continue;
-        }
-        if (greedy) {
-            result.tokens.push_back(Argmax(p));
-        } else {
-            Distribution residual(vocab);
-            double sum = 0;
-            for (size_t t = 0; t < vocab; ++t) {
-                residual[t] = std::max(0.0, p[t] - q[t]);
-                sum += residual[t];
-            }
-            // A genuine rejection implies nonzero residual mass. Never replace
-            // it with p, which would change the target sampling distribution.
-            if (!(sum > 0) || !std::isfinite(sum)) throw std::runtime_error("empty speculative residual");
-            for (double& mass : residual) mass /= sum;
-            result.tokens.push_back(Draw(residual, target_rng));
-        }
-        return result;
+        const auto verification = VerifyToken(draft_tokens[i], draft[i], target[i], greedy, accept_rng, target_rng);
+        result.tokens.push_back(verification.token);
+        if (!verification.accepted) return result;
+        ++result.accepted_draft_tokens;
     }
+
     result.tokens.push_back(greedy ? Argmax(target[k]) : Draw(target[k], target_rng));
     return result;
 }

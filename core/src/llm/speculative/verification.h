@@ -14,6 +14,10 @@ namespace densecore::llm::speculative {
 // Indexed by vocabulary token ID, after every sampler transform (including
 // grammar). Draft and target must use the same transform order and vocabulary.
 using Distribution = std::vector<double>;
+struct TokenVerificationResult { int token; bool accepted; };
+TokenVerificationResult VerifyToken(int draft_token, const Distribution& draft, const Distribution& target,
+                                    bool greedy, std::mt19937& accept_rng, std::mt19937& target_rng);
+
 struct VerificationResult {
     size_t accepted_draft_tokens = 0;
     // Accepted draft prefix followed by one residual/target bonus token. Only

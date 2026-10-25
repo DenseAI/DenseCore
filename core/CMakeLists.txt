@@ -612,6 +612,7 @@ set(SOURCES
     src/llm/sampling/exec.cpp
     src/llm/speculative/verification.cpp
     src/llm/speculative/nextn_graph.cpp
+    src/llm/speculative/reference_session.cpp
     src/runtime/inference_context.cpp
     src/runtime/inference.cpp
     src/models/model_types.cpp

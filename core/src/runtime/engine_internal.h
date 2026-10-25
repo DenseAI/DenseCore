@@ -1558,9 +1558,11 @@ struct EngineState {
     // Internal policy codes match the additive init API: auto=0, none=1, mtp=2.
     // Automatic eligibility has no entries until model/CPU/concurrency evidence
     // is qualified; requested and selected policies must remain distinct.
-    int speculation_requested = 0;
-    int speculation_selected = 1;
-    int spec_draft_n_max = 2;
+    std::atomic<int> speculation_requested{0};
+    std::atomic<int> speculation_selected{1};
+    std::atomic<int> spec_draft_n_max{2};
+    int speculation_max_context = 0;
+    size_t speculation_reserved_bytes = 0;
     std::string speculation_reason = "no qualified automatic MTP profile";
 
     // Declared after op_registry so backends release their borrowed registry
