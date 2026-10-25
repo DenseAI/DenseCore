@@ -987,3 +987,40 @@ TEST(EngineKVCacheConfig, GemmaPagedDecodePlanFitsSnapshotResidualWithoutCutting
     EXPECT_GE(pool, 1536ULL * 1024 * 1024);
     EXPECT_LE(kv + repack + allocator + cache + pool, available_bytes);
 }
+
+namespace {
+struct PagedScratchPoolLifetimeProbe {
+    std::atomic<int> live{0}, constructed{0}, destroyed{0};
+};
+struct PagedScratchTlsLifetimeProbe {
+    std::shared_ptr<PagedScratchPoolLifetimeProbe> owner;
+    ~PagedScratchTlsLifetimeProbe() { if(owner){--owner->live;++owner->destroyed;} }
+};
+void ObserveGraphCallbackTlsOwner(ggml_tensor*,int,int,void* userdata) {
+    auto owner=*static_cast<std::shared_ptr<PagedScratchPoolLifetimeProbe>*>(userdata);
+    static thread_local PagedScratchTlsLifetimeProbe lifetime;
+    if(!lifetime.owner){lifetime.owner=std::move(owner);++lifetime.owner->live;++lifetime.owner->constructed;}
+}
+}
+TEST(EngineKVCacheConfig, ActualGgmlCallbackTlsLifetimeIsObservedAfterWorkerMasterJoin) {
+    // Exercise the exact backend/ggml/OpenMP path with no engine, model or
+    // inference. A ggml_threadpool pointer is not itself a TLS-ownership proof.
+    auto observed=std::make_shared<PagedScratchPoolLifetimeProbe>();
+    ggml_init_params params{1024*1024,nullptr,false};
+    auto* ctx=ggml_init(params);ASSERT_NE(ctx,nullptr);
+    auto* input=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,32);ggml_tensor* args[]={input};
+    auto* out=ggml_custom_4d(ctx,GGML_TYPE_F32,32,1,1,1,args,1,ObserveGraphCallbackTlsOwner,4,&observed);
+    auto* graph=ggml_new_graph_custom(ctx,128,false);ggml_build_forward_expand(graph,out);
+    auto* backend=ggml_backend_cpu_init();ASSERT_NE(backend,nullptr);
+    auto pool_params=ggml_threadpool_params_default(4);auto* pool=ggml_threadpool_new(&pool_params);ASSERT_NE(pool,nullptr);
+    ggml_backend_cpu_set_threadpool(backend,pool);ggml_backend_cpu_set_n_threads(backend,4);
+    ggml_status status=GGML_STATUS_FAILED;
+    std::thread master([&]{status=ggml_backend_graph_compute(backend,graph);});master.join();
+    EXPECT_EQ(status,GGML_STATUS_SUCCESS);EXPECT_EQ(observed->constructed.load(),4);
+    std::cout<<"[GraphCallbackTlsLifetime] after_master_join live="<<observed->live.load()
+             <<" constructed="<<observed->constructed.load()<<" destroyed="<<observed->destroyed.load()<<std::endl;
+    ggml_backend_free(backend);ggml_threadpool_free(pool);ggml_free(ctx);
+    std::cout<<"[GraphCallbackTlsLifetime] after_ggml_pool_free live="<<observed->live.load()
+             <<" destroyed="<<observed->destroyed.load()<<std::endl;
+    EXPECT_EQ(observed->live.load(),0) << "An engine-local lease cannot be released while actual callback TLS survives";
+}
