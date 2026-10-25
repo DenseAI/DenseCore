@@ -35,6 +35,15 @@ using densecore::llm::runtime::ResolveHardwareTopology;
 using densecore::llm::runtime::ResolveInferenceConfig;
 using densecore::llm::runtime::SpinPause;
 
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::testing {
+static std::atomic<bool> fail_next_paged_shared_pointer_allocation{false};
+void FailNextPagedSharedPointerAllocationForTest() {
+    fail_next_paged_shared_pointer_allocation.store(true, std::memory_order_relaxed);
+}
+}
+#endif
+
 static void ComputePagedAttentionScalarHeads(const PagedAttentionUserData* ud, const std::vector<int>& block_table,
                                              int context_len, const KVRetentionSpan& retained_span,
                                              const KVRetentionSpan& mask_span, int current_pos, float scale,
@@ -648,12 +657,27 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
         if (ith == 0) {
             ud->shared_k_block_ptrs->clear();
             ud->shared_v_block_ptrs->clear();
-            const int seq_idx = batch->seq_id[0];
-            if (seq_idx >= 0 && seq_idx < batch->num_seqs && seq_idx < static_cast<int>(batch->block_tables.size())) {
-                const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
-                ud->cache->FillBlockPtrsForLayer(block_table, ud->read_layer, ud->shared_k_block_ptrs,
-                                                 ud->shared_v_block_ptrs);
+            try {
+                const int seq_idx = batch->seq_id[0];
+                if (scratch_ok && !HasCallbackScratchFailure(ud->work_ctx) && seq_idx >= 0 &&
+                    seq_idx < batch->num_seqs && seq_idx < static_cast<int>(batch->block_tables.size())) {
+                    const auto& block_table = batch->block_tables[static_cast<size_t>(seq_idx)];
+#ifdef DENSECORE_TEST_BUILD
+                    if (densecore::testing::fail_next_paged_shared_pointer_allocation.exchange(false))
+                        throw std::bad_alloc();
+#endif
+                    ud->cache->FillBlockPtrsForLayer(block_table, ud->read_layer, ud->shared_k_block_ptrs,
+                                                     ud->shared_v_block_ptrs);
+                }
+            } catch (...) {
+                // Allocation may have filled only one vector. Retire both and
+                // report on the master after GGML joins every callback worker.
+                ud->shared_k_block_ptrs->clear();
+                ud->shared_v_block_ptrs->clear();
+                MarkCallbackScratchFailure(ud->work_ctx);
             }
+            // Peers must always leave their wait, including on quota/allocation
+            // failure. No exception may escape across GGML/OpenMP barriers.
             ud->shared_block_ptrs_ready.store(1, std::memory_order_release);
         } else {
             int spin_count = 0;
@@ -766,7 +790,7 @@ void cb_paged_attention_decode(struct ggml_tensor* dst, int ith, int nth, void* 
                 .gemma4_paged_attention_head_range.store(head_range, std::memory_order_relaxed);
         }
 
-        if(!scratch_ok) {
+        if(!scratch_ok || HasCallbackScratchFailure(ud->work_ctx)) {
             zero_token_heads(out_token,h_start,h_end);
             continue;
         }

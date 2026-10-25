@@ -10,6 +10,9 @@
 #include <tuple>
 #include <thread>
 #include <vector>
+#if defined(__unix__)
+#include <unistd.h>
+#endif
 
 #include "densecore/backend/flash_attention.h"
 #include "runtime/inference_types_internal.h"
@@ -22,6 +25,7 @@
 #include "kernels/q4k_repacked_gemv.h"
 #include "llm/graph/checked_ops.h"
 #include "llm/attention/exec.h"
+#include "llm/matmul/execution_policy.h"
 #include "llm/graph/construction_ops.h"
 #include "runtime/batched_decode_diagnostic.h"
 #include "llm/graph/gemma4_shared_kv.h"
@@ -31,6 +35,7 @@
 #include "densecore/models/model_types.h"
 
 namespace densecore::testing {
+void FailNextPagedSharedPointerAllocationForTest();
 bool IsGemma4PleF32ProjectionForTest(const TransformerModel*, const ggml_tensor*);
 ggml_tensor* SmartMulMatWithPhaseTest(ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input,
                                      TransformerModel* model, int phase);
@@ -2561,3 +2566,85 @@ TEST(Gemma4GraphBudget, CallbackQuotaFailureWaitsForKvBarriersAndCannotPublishTh
     EXPECT_FALSE(HasCallbackScratchFailure(work.get()));
     ggml_backend_free(backend);
 }
+
+#if GTEST_HAS_DEATH_TEST && defined(__unix__)
+TEST(Gemma4GraphBudget, SingleQuerySharedPointerAllocationFailureJoinsWorkersAndRecovers) {
+    if(GetRuntimeSimdLevel()==densecore::simd::SimdLevel::NONE)
+        GTEST_SKIP()<<"Single-query shared pointer preparation requires Highway";
+    ::testing::FLAGS_gtest_death_test_style="threadsafe";
+    // Bound both an uncaught callback exception and a missing ready publication.
+    ASSERT_EXIT(([] {
+        alarm(15);
+        ScopedEnvOverride tile("DENSECORE_PAGED_ATTN_DECODE_HEAD_TILE", "2");
+        auto model=MakeBaseGemma4GraphModel(1);
+        std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(),1,8,GGML_TYPE_F32,-1));
+        if(!cache)std::exit(2);
+        const int block=cache->block_manager->AllocateSingle();
+        if(block<0)std::exit(3);
+        const float one[2]={1,1};
+        cache->WriteKSlot(block,0,0,one);cache->WriteVSlot(block,0,0,one);
+        BatchSpec batch{};batch.num_seqs=1;batch.n_past={1};batch.tokens={0};
+        batch.seq_id={0};batch.pos={1};batch.block_tables={{block}};
+        std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(
+            CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+        SetCurrentWorkContext(work.get());SetCurrentBatch(&batch);
+        ggml_init_params params{4*1024*1024,nullptr,false};
+        std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init(params),ggml_free);
+        if(!ctx)std::exit(4);
+        auto* q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,2,8,1);
+        auto* k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,2,1,1);
+        auto* v=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,2,1,1);
+        std::fill_n(static_cast<float*>(q->data),16,0.0f);
+        std::fill_n(static_cast<float*>(k->data),2,1.0f);
+        std::fill_n(static_cast<float*>(v->data),2,1.0f);
+        auto* ud=GetPagedAttentionUserData();
+        ASSERT_NE(ud->work_ctx,nullptr);
+        ud->cache=cache.get();ud->head_dim=2;ud->v_head_dim=2;
+        ud->n_head=8;ud->n_head_kv=1;ud->n_tasks=4;ud->is_gemma4=true;
+        ggml_tensor* args[]={q,k,v};
+        auto* output=ggml_custom_4d(ctx.get(),GGML_TYPE_F32,2,8,1,1,args,3,
+                                   cb_paged_attention_decode,4,ud);
+        auto* graph=ggml_new_graph_custom(ctx.get(),32768,false);
+        ggml_build_forward_expand(graph,output);
+        auto* backend=ggml_backend_cpu_init();
+        if(!backend)std::exit(5);
+        ggml_backend_cpu_set_n_threads(backend,4);
+        densecore::runtime::RuntimeMemoryPlan plan;
+        plan.available_bytes=plan.resource_capacity_bytes=1024ULL*1024*1024;
+        plan.callback_scratch_bytes=65536;
+        densecore::runtime::ResourcePlanLease source(plan);
+        auto budget=std::make_shared<densecore::runtime::CallbackScratchBudget>();
+        if(!budget->Adopt(source,65536))std::exit(6);
+        // Compare recovery with the healthy operator as well as the reference;
+        // Highway's softmax uses an approximate reciprocal.
+        EXPECT_EQ(ComputeGraphWithCallbackScratch(backend,graph,budget),GGML_STATUS_SUCCESS);
+        const std::vector<float> healthy(static_cast<float*>(output->data),static_cast<float*>(output->data)+16);
+        // A fresh child has one 2104-byte slice per participating thread:
+        // four one-block pointer arrays and K/V/scores of two floats each.
+        EXPECT_EQ(budget->Used(),4*(2048+4*sizeof(void*)+6*sizeof(float)));
+        ud->epoch_started.store(0);ud->epoch_done.store(0);ud->shared_block_ptrs_ready.store(0);
+        densecore::testing::FailNextPagedSharedPointerAllocationForTest();
+        bool rejected=false;
+        try {ComputeGraphWithCallbackScratch(backend,graph,budget);}
+        catch(const densecore::OutOfMemoryException&){rejected=true;}
+        catch(const std::exception& error){std::fprintf(stderr,"[SharedPointerFailure] unexpected exception: %s\n",error.what());}
+        std::fprintf(stderr,"[SharedPointerFailure] rejected=%d failed=%d ready=%d epoch=%llu\n",
+            rejected,HasCallbackScratchFailure(work.get()),ud->shared_block_ptrs_ready.load(),
+            static_cast<unsigned long long>(ud->epoch_started.load()));
+        EXPECT_TRUE(rejected);
+        EXPECT_TRUE(HasCallbackScratchFailure(work.get()));
+        EXPECT_EQ(ud->shared_block_ptrs_ready.load(),1);
+        ud->epoch_started.store(0);ud->epoch_done.store(0);ud->shared_block_ptrs_ready.store(0);
+        EXPECT_EQ(ComputeGraphWithCallbackScratch(backend,graph,budget),GGML_STATUS_SUCCESS);
+        EXPECT_FALSE(HasCallbackScratchFailure(work.get()));
+        EXPECT_EQ(ud->shared_block_ptrs_ready.load(),1);
+        EXPECT_EQ(std::memcmp(output->data,healthy.data(),healthy.size()*sizeof(float)),0);
+        for(int i=0;i<16;++i)EXPECT_NEAR(static_cast<float*>(output->data)[i],1.0f,1e-6f);
+        const auto* result=::testing::UnitTest::GetInstance()->current_test_info()->result();
+        for(int i=0;i<result->total_part_count();++i)if(result->GetTestPartResult(i).failed())
+            std::fprintf(stderr,"[SharedPointerAssertion] %s\n",result->GetTestPartResult(i).summary());
+        ggml_backend_free(backend);
+        std::exit(::testing::Test::HasFailure()?7:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+#endif
