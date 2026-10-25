@@ -5,6 +5,11 @@
 
 #include "densecore/runtime/scheduler.h"
 
+namespace densecore::testing {
+size_t SetPrefixAdmissionSnapshotLimitForTest(size_t bytes);
+size_t PrefixAdmissionSnapshotBytesForTest();
+}
+
 namespace densecore {
 namespace {
 
@@ -912,6 +917,40 @@ TEST(SchedulerArchitecture, CancelWaitingPrefixAdmissionReleasesItsReferences) {
     scheduler.RemoveRequest(seq, false);
     EXPECT_EQ(manager.GetRefCount(block), 1);
     EXPECT_EQ(scheduler.TakePrefixLease(seq), nullptr);
+    manager.FreeSingle(block);
+}
+
+
+TEST(SchedulerArchitecture, AdmissionSnapshotBudgetRejectsHitAndRecoversAfterLeaseRelease) {
+    struct LimitGuard {
+        size_t previous = testing::SetPrefixAdmissionSnapshotLimitForTest(128);
+        ~LimitGuard() { testing::SetPrefixAdmissionSnapshotLimitForTest(previous); }
+    } limit;
+    BlockManager manager(64, BLOCK_SIZE);
+    Scheduler scheduler(&manager, MakeTestConfig());
+    std::vector<int> prompt(BLOCK_SIZE + 1, 91);
+    const int block = manager.AllocateSingle();
+    ASSERT_GE(block, 0);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot(1);
+    snapshot[0].ssm_state = {1, 2, 3, 4};
+    manager.RegisterPrefixBlockWithTokens(block, BlockManager::ComputeTokenHash(prompt.data(), BLOCK_SIZE),
+                                          prompt.data(), BLOCK_SIZE, &snapshot);
+    const int first = scheduler.AddRequest(1, prompt.size(), 8, 0, &prompt, true, true);
+    ASSERT_GE(first, 0);
+    EXPECT_GT(testing::PrefixAdmissionSnapshotBytesForTest(), 0u);
+    EXPECT_EQ(manager.GetRefCount(block), 2);
+    const int second = scheduler.AddRequest(2, prompt.size(), 8, 0, &prompt, true, true);
+    ASSERT_GE(second, 0);
+    EXPECT_EQ(manager.GetRefCount(block), 2);  // Budget exhaustion is a cache miss.
+    EXPECT_EQ(scheduler.TakePrefixLease(second), nullptr);
+    scheduler.RemoveRequest(first, false);
+    EXPECT_EQ(testing::PrefixAdmissionSnapshotBytesForTest(), 0u);
+    const int third = scheduler.AddRequest(3, prompt.size(), 8, 0, &prompt, true, true);
+    ASSERT_GE(third, 0);
+    EXPECT_EQ(manager.GetRefCount(block), 2);
+    scheduler.RemoveRequest(second, false);
+    scheduler.RemoveRequest(third, false);
+    EXPECT_EQ(testing::PrefixAdmissionSnapshotBytesForTest(), 0u);
     manager.FreeSingle(block);
 }
 

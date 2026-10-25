@@ -5,6 +5,55 @@
 
 namespace {
 
+using HybridSnapshot = std::vector<TransformerModel::SSMSequenceRuntimeState>;
+struct AdmissionSnapshotBudget {
+    std::atomic<size_t> used{0};
+    std::atomic<size_t> limit{256ULL * 1024 * 1024};
+};
+
+std::shared_ptr<AdmissionSnapshotBudget> PrefixAdmissionBudget() {
+    // Process-wide and deliberately conservative across engines. Captures keep
+    // accounting alive even after their originating BlockManager is destroyed.
+    static auto budget = std::make_shared<AdmissionSnapshotBudget>();
+    return budget;
+}
+
+std::shared_ptr<const HybridSnapshot> CaptureAdmissionSnapshot(
+    BlockManager& manager, int block_id, const BlockManager::HybridSSMSnapshotValidator& validator) {
+    std::lock_guard<std::mutex> lock(manager.prefix_mu);
+    auto it = manager.block_hybrid_ssm_snapshots.find(block_id);
+    if (it == manager.block_hybrid_ssm_snapshots.end() || (validator && !validator(it->second))) return {};
+    const auto& states = it->second;
+    auto budget = PrefixAdmissionBudget();
+    const size_t limit = budget->limit.load(std::memory_order_relaxed);
+    size_t bytes = sizeof(HybridSnapshot);
+    auto add = [&](size_t count, size_t element_bytes) {
+        if (bytes > limit || count > (limit - bytes) / element_bytes) return false;
+        bytes += count * element_bytes;
+        return true;
+    };
+    if (!add(states.size(), sizeof(TransformerModel::SSMSequenceRuntimeState))) return {};
+    for (const auto& state : states) {
+        if (!add(state.conv_state.size(), sizeof(float)) || !add(state.ssm_state.size(), sizeof(float))) return {};
+    }
+    size_t used = budget->used.load(std::memory_order_relaxed);
+    do {
+        if (used > limit || bytes > limit - used) return {};
+    } while (!budget->used.compare_exchange_weak(used, used + bytes, std::memory_order_acq_rel));
+    HybridSnapshot* copy;
+    try {
+        copy = new HybridSnapshot(states);
+    } catch (...) {
+        budget->used.fetch_sub(bytes, std::memory_order_release);
+        throw;
+    }
+    // shared_ptr invokes this deleter too if control-block allocation fails.
+    return std::shared_ptr<const HybridSnapshot>(copy, [budget, bytes](const HybridSnapshot* value) {
+        delete value;
+        budget->used.fetch_sub(bytes, std::memory_order_release);
+    });
+}
+
 void ResetAllocatedBlock(BlockManager& manager, int block_id) {
     manager.blocks[block_id].ref_count = 1;
     manager.blocks[block_id].num_filled_slots = 0;
@@ -401,14 +450,18 @@ BlockManager::PrefixCacheMatch BlockManager::FindLongestCachedPrefixWithSnapshot
 
             acquired_blocks.push_back(block_id);
             if (require_hybrid_ssm_snapshot) {
-                std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
-                if (LoadHybridSSMSnapshotForBlock(block_id, &snapshot) &&
-                    (!hybrid_ssm_snapshot_validator || hybrid_ssm_snapshot_validator(snapshot))) {
-                    if (out_snapshot) {
-                        *out_snapshot =
-                            std::make_shared<const std::vector<TransformerModel::SSMSequenceRuntimeState>>(std::move(snapshot));
+                if (out_snapshot) {
+                    auto captured = CaptureAdmissionSnapshot(*this, block_id, hybrid_ssm_snapshot_validator);
+                    if (captured) {
+                        *out_snapshot = std::move(captured);
+                        terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
                     }
-                    terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
+                } else {
+                    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot;
+                    if (LoadHybridSSMSnapshotForBlock(block_id, &snapshot) &&
+                        (!hybrid_ssm_snapshot_validator || hybrid_ssm_snapshot_validator(snapshot))) {
+                        terminal_snapshot_block_count = static_cast<int>(acquired_blocks.size());
+                    }
                 }
             }
         }
@@ -569,3 +622,13 @@ bool BlockManager::RollbackExclusiveSuffix(std::vector<int>* block_ids, int keep
     block_ids->resize(keep_blocks);
     return true;
 }
+#ifdef DENSECORE_TEST_BUILD
+namespace densecore::testing {
+size_t SetPrefixAdmissionSnapshotLimitForTest(size_t bytes) {
+    return PrefixAdmissionBudget()->limit.exchange(bytes);
+}
+size_t PrefixAdmissionSnapshotBytesForTest() {
+    return PrefixAdmissionBudget()->used.load();
+}
+}
+#endif
