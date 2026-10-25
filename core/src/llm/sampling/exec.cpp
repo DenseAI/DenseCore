@@ -11,6 +11,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -348,13 +349,19 @@ void ApplyGrammarMask(float* logits, int n_vocab, const GrammarConstraint* gramm
 // Token Sampling
 // ============================================================================
 
-static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingParams& params, std::mt19937& rng) {
+static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingParams& params, std::mt19937& rng,
+                           std::vector<double>* distribution = nullptr) {
     if (!logits || !logits->data) return 0;
 
     float* logits_data = (float*)logits->data;
     int n_vocab = logits->ne[0];
     if (n_vocab <= 0) return 0;
 
+    if (distribution) distribution->assign(static_cast<size_t>(n_vocab), 0.0);
+    auto point_mass = [&](int token) {
+        if (distribution) (*distribution)[static_cast<size_t>(token)] = 1.0;
+        return token;
+    };
     const int n_cols = std::max<int>(1, (int)logits->ne[1]);
     if (idx < 0) idx = 0;
     if (idx >= n_cols) idx = n_cols - 1;
@@ -602,7 +609,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         const int token = finite_argmax_raw();
         maybe_record_raw_sampling_trace(token);
         debug_log_sample(token);
-        return token;
+        return point_mass(token);
     }
 
     const bool trace_enabled = ShouldCaptureSamplingDebugTrace(params);
@@ -682,7 +689,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         }
         const int token = found ? best_idx : first_allowed_token();
         debug_log_sample(token);
-        return token;
+        return point_mass(token);
     }
 
     thread_local std::vector<float> working_logits;
@@ -914,7 +921,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_adjusted", token);
         debug_log_sample(token);
-        return token;
+        return point_mass(token);
     }
 
     struct SamplingCandidate {
@@ -993,7 +1000,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(token);
         debug_dump_top_candidates("argmax_raw_fallback", token);
         debug_log_sample(token);
-        return token;
+        return point_mass(token);
     }
 
     if (k < active_vocab && params.top_p >= 1.0f && params.min_p <= 0.0f) {
@@ -1002,7 +1009,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
             maybe_record_sampling_trace(best_token);
             debug_dump_top_candidates("empty_candidates_fallback", best_token);
             debug_log_sample(best_token);
-            return best_token;
+            return point_mass(best_token);
         }
 
         const float candidate_max_logit = candidates.front().logit;
@@ -1019,6 +1026,15 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
             maybe_record_sampling_trace(candidates.front().token_id);
             debug_dump_top_candidates("front_candidate_fallback", candidates.front().token_id);
             debug_log_sample(candidates.front().token_id);
+            return point_mass(candidates.front().token_id);
+        }
+
+        if (distribution) {
+            double sum = 0;
+            for (const auto& candidate : candidates) sum += candidate.mass;
+            for (const auto& candidate : candidates) {
+                (*distribution)[static_cast<size_t>(candidate.token_id)] = candidate.mass / sum;
+            }
             return candidates.front().token_id;
         }
 
@@ -1038,7 +1054,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(candidates.front().token_id);
         debug_dump_top_candidates("sorted_front_fallback", candidates.front().token_id);
         debug_log_sample(candidates.front().token_id);
-        return candidates.front().token_id;
+        return point_mass(candidates.front().token_id);
     }
 
     if (k < active_vocab) {
@@ -1073,7 +1089,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(best_token);
         debug_dump_top_candidates("best_token_fallback", best_token);
         debug_log_sample(best_token);
-        return best_token;
+        return point_mass(best_token);
     }
 
     std::sort(candidates.begin(), candidates.end(), candidate_desc);
@@ -1104,7 +1120,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(best_token);
         debug_dump_top_candidates("empty_candidates_fallback", best_token);
         debug_log_sample(best_token);
-        return best_token;
+        return point_mass(best_token);
     }
 
     float total_mass = 0.0f;
@@ -1115,6 +1131,15 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
         maybe_record_sampling_trace(candidates.front().token_id);
         debug_dump_top_candidates("front_candidate_fallback", candidates.front().token_id);
         debug_log_sample(candidates.front().token_id);
+        return point_mass(candidates.front().token_id);
+    }
+
+    if (distribution) {
+        double sum = 0;
+        for (const auto& candidate : candidates) sum += candidate.mass;
+        for (const auto& candidate : candidates) {
+            (*distribution)[static_cast<size_t>(candidate.token_id)] = candidate.mass / sum;
+        }
         return candidates.front().token_id;
     }
 
@@ -1156,4 +1181,15 @@ int SampleToken(GgmlTensorHandle* logits, int idx, const SamplingParams& params)
         last_seed = params.seed;
     }
     return SampleTokenImpl(logits, idx, params, rng);
+}
+
+std::vector<double> BuildSamplingDistribution(GgmlTensorHandle* logits, int idx, const SamplingParams& params) {
+    if (!logits || !logits->data || logits->type != GGML_TYPE_F32 || logits->ne[0] <= 0 ||
+        logits->nb[1] / sizeof(float) < static_cast<size_t>(logits->ne[0])) {
+        throw std::invalid_argument("invalid logits for speculative sampling distribution");
+    }
+    std::vector<double> distribution;
+    std::mt19937 unused_rng(0);
+    SampleTokenImpl(logits, idx, params, unused_rng, &distribution);
+    return distribution;
 }

@@ -1,4 +1,5 @@
 #include "llm/speculative/verification.h"
+#include "densecore/runtime/scheduler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -119,5 +120,15 @@ void RecurrentCheckpoints::Restore(size_t boundary, States& states) const {
 void RecurrentCheckpoints::Clear() {
     for (auto& state : states_) state.clear();
     std::fill(valid_.begin(), valid_.end(), false);
+}
+bool RestoreAcceptanceBoundary(Scheduler& scheduler, int seq_id, int keep_tokens,
+                               std::vector<int>& block_ids, int& n_past,
+                               const RecurrentCheckpoints& checkpoints, size_t boundary,
+                               RecurrentCheckpoints::States& recurrent_states) {
+    RecurrentCheckpoints::States restored;
+    checkpoints.Restore(boundary, restored);
+    if (!scheduler.RollbackSpeculativeSuffix(seq_id, keep_tokens, &block_ids, &n_past)) return false;
+    recurrent_states.swap(restored);
+    return true;
 }
 }  // namespace densecore::llm::speculative

@@ -641,4 +641,27 @@ void PrintSchedulerOutput(const SchedulerOutput& output) {
               << " Decode: " << output.num_decode_tokens << std::endl;
 }
 
+bool Scheduler::RollbackSpeculativeSuffix(int seq_id, int keep_tokens,
+                                         std::vector<int>* request_block_ids, int* request_n_past) {
+    if (!request_block_ids || !request_n_past) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto blocks = seq_block_ids_.find(seq_id);
+    auto context = seq_context_len_.find(seq_id);
+    auto prompt = seq_prompt_len_.find(seq_id);
+    auto generated = seq_generated_tokens_.find(seq_id);
+    if (running_seqs_.count(seq_id) == 0 || blocks == seq_block_ids_.end() ||
+        context == seq_context_len_.end() || prompt == seq_prompt_len_.end() ||
+        generated == seq_generated_tokens_.end() || keep_tokens < prompt->second ||
+        keep_tokens > context->second || context->second != *request_n_past ||
+        blocks->second != *request_block_ids) return false;
+    const int removed = context->second - keep_tokens;
+    if (generated->second < removed) return false;
+    if (!block_manager_->RollbackExclusiveSuffix(&blocks->second, keep_tokens)) return false;
+    request_block_ids->resize(blocks->second.size());
+    context->second = keep_tokens;
+    generated->second -= removed;
+    *request_n_past = keep_tokens;
+    return true;
+}
+
 }  // namespace densecore

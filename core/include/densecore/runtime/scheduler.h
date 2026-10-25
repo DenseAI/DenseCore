@@ -251,6 +251,12 @@ public:
      */
     void OnPrefillChunkComplete(int seq_id, int tokens_processed, bool prefill_finished);
     void OnDecodeStepComplete(int seq_id, int tokens_processed = 1);
+    // Worker-only decode transaction boundary. Recurrent checkpoint restoration
+    // must be prepared before this call; no speculative prefix registration is
+    // allowed. On failure every field remains unchanged.
+    bool RollbackSpeculativeSuffix(int seq_id, int keep_tokens,
+                                    std::vector<int>* request_block_ids, int* request_n_past);
+
     void UpdateProgress(int seq_id, int tokens_generated = 1);
     void UpdateProgressBatch(const std::vector<std::pair<int, int>>& progress_updates);
     static const char* EmptyReasonName(SchedulerEmptyReason reason);

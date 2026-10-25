@@ -520,3 +520,35 @@ uint64_t BlockManager::ComputeTokenHash(const int* tokens, int n_tokens) {
     }
     return hash;
 }
+
+
+bool BlockManager::RollbackExclusiveSuffix(std::vector<int>* block_ids, int keep_tokens) {
+    if (!block_ids || keep_tokens < 0 || block_size <= 0) return false;
+    const size_t keep_blocks = static_cast<size_t>(keep_tokens / block_size) + (keep_tokens % block_size != 0);
+    if (keep_blocks > block_ids->size()) return false;
+    const bool partial = keep_tokens % block_size != 0;
+    const size_t first_touched = partial ? keep_blocks - 1 : keep_blocks;
+    // Same order as prefix registration: prefix lock before allocation shards.
+    // Hold all shard locks so validation and ownership changes are one operation.
+    std::lock_guard<std::mutex> prefix_lock(prefix_mu);
+    std::vector<std::unique_lock<std::mutex>> shard_locks;
+    shard_locks.reserve(shards.size());
+    for (auto& shard : shards) shard_locks.emplace_back(shard->mu);
+    for (size_t i = 0; i < block_ids->size(); ++i) {
+        const int id = (*block_ids)[i];
+        if (id < 0 || id >= num_blocks) return false;
+        for (size_t j = 0; j < i; ++j) if ((*block_ids)[j] == id) return false;
+        if (i >= first_touched && (blocks[id].ref_count != 1 || blocks[id].cache_resident)) return false;
+    }
+    if (partial) blocks[(*block_ids)[keep_blocks - 1]].num_filled_slots = keep_tokens % block_size;
+    for (size_t i = keep_blocks; i < block_ids->size(); ++i) {
+        const int id = (*block_ids)[i];
+        auto& block = blocks[id];
+        block.ref_count = 0;
+        block.num_filled_slots = 0;
+        block.content_hash = 0;
+        shards[id % NUM_SHARDS]->free_blocks.push_back(id);
+    }
+    block_ids->resize(keep_blocks);
+    return true;
+}

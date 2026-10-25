@@ -176,6 +176,12 @@ struct BlockManager {
     // Get number of filled slots
     int GetFilledSlots(int block_id) const;
 
+    // Internal speculative rollback. Prefix blocks before the retained boundary
+    // are untouched. Every block whose slots/ownership change must be exclusive
+    // and outside prefix residency. Failure leaves the table and pool unchanged.
+    bool RollbackExclusiveSuffix(std::vector<int>* block_ids, int keep_tokens);
+
+
     // -------------------------------------------------------------------------
     // Prefix Caching
     // -------------------------------------------------------------------------

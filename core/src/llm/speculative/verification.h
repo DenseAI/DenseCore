@@ -7,6 +7,8 @@
 
 #include "densecore/llm/ssm/state_types.h"
 
+namespace densecore { class Scheduler; }
+
 namespace densecore::llm::speculative {
 
 // Indexed by vocabulary token ID, after every sampler transform (including
@@ -42,6 +44,13 @@ private:
     std::vector<States> states_;
     std::vector<bool> valid_;
 };
+
+// Restores a prepared recurrent boundary and KV/scheduler/request state as one
+// worker operation. Copy/allocation happens before destructive KV rollback.
+bool RestoreAcceptanceBoundary(Scheduler& scheduler, int seq_id, int keep_tokens,
+                               std::vector<int>& block_ids, int& n_past,
+                               const RecurrentCheckpoints& checkpoints, size_t boundary,
+                               RecurrentCheckpoints::States& recurrent_states);
 
 }  // namespace densecore::llm::speculative
 #endif
