@@ -6,6 +6,8 @@
 #include "runtime/engine_internal.h"
 #include "runtime/worker_internal.h"
 #include "runtime/speculation_config.h"
+#include "llm/speculative/head_memory.h"
+#include "llm/speculative/nextn_graph.h"
 #include "densecore/exceptions.h"
 #include <limits>
 
@@ -791,7 +793,7 @@ TransformerModel MakeMtpBudgetModel() {
     model.arch = ModelArch::QWEN35;
     model.variant = ModelVariant::QWEN35;
     model.arch_flags.is_hybrid_ssm = true;
-    model.hparams.n_vocab = 20000000; // Shape only: no weights/vocabulary allocation.
+    model.hparams.n_vocab = 5000000; // Shape only: include head-logit arenas within the 4GiB test budget.
     model.hparams.n_ctx = 16;
     model.ssm_inner_size = 64;
     model.ssm_time_step_rank = 4;
@@ -841,4 +843,99 @@ TEST(EngineKVCacheConfig, MtpResourceCostRejectsUnsignedDimensionsBeforeNarrowin
     model = MakeMtpBudgetModel();
     model.hparams.n_embd_head_k = std::numeric_limits<decltype(model.hparams.n_embd_head_k)>::max();
     EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 2), std::invalid_argument);
+}
+
+TEST(MtpHeadMemory, OddKeyValueBlockStridesMatchActualKVAllocator) {
+    using namespace densecore::llm::speculative;
+    auto model=MakeMtpBudgetModel();
+    model.arch_flags.is_hybrid_ssm=false;
+    model.hparams.n_layer=1;
+    model.hparams.n_head=1;
+    model.hparams.n_head_kv=1;
+    model.hparams.n_embd_head_k=3;
+    model.hparams.n_embd_head_v=5;
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&model,1,17,GGML_TYPE_F16,-1));
+    ASSERT_NE(cache,nullptr);
+    const uint64_t actual=cache->k_allocator->ArenaSize()+cache->v_allocator->ArenaSize();
+    EXPECT_EQ(HeadKVCacheBytes(model,17),actual);
+    EXPECT_EQ(actual,640u); // Two K blocks128bytes each, two V blocks192bytes each.
+    EXPECT_GT(actual,ComputeKVCacheBytesPerToken(GGML_TYPE_F16,3,5,1,1)*32);
+}
+
+TEST(MtpHeadMemory, EveryBoundedRuntimeShapeFitsNonPowerOfTwoContextPlan) {
+    using namespace densecore::llm::speculative;
+    auto model=MakeMtpBudgetModel();
+    for (uint64_t context:{1,17,2049}) {
+        const auto planned=CalculateSpeculationMemory(model,context,1,3);
+        const auto width=std::min(context,kHeadBootstrapTokens);
+        EXPECT_EQ(planned.graph,CalculateHeadGraphMemory(model,width,context).Total());
+        for (uint64_t queries=1;queries<=width;++queries) {
+            for (uint64_t keys:{queries,std::max(queries,context/2),context})
+                EXPECT_LE(CalculateHeadGraphMemory(model,queries,keys).Total(),planned.graph);
+        }
+    }
+    EXPECT_THROW(CalculateHeadGraphMemory(model,17,2049),std::invalid_argument);
+    EXPECT_THROW(CalculateHeadGraphMemory(model,4,3),std::invalid_argument);
+}
+
+TEST(MtpHeadMemory, HugeVocabularyAndActualHeadFfnAreReservedBeforeExecution) {
+    using namespace densecore::llm::speculative;
+    auto model=MakeMtpBudgetModel();
+    const auto small=CalculateHeadGraphMemory(model,16,2049);
+    model.hparams.n_vocab=100000000;
+    const auto large=CalculateHeadGraphMemory(model,16,2049);
+    EXPECT_GE(large.logits,16ULL*100000000*sizeof(float));
+    EXPECT_GT(large.Total()-small.Total(),4ULL*1024*1024*1024);
+    ggml_tensor gate{};
+    gate.ne[1]=17;
+    model.mtp_heads.resize(1);
+    model.mtp_heads[0].tensors["ffn_gate.weight"]=&gate;
+    const auto actual_ffn=CalculateHeadGraphMemory(model,16,2049).feed_forward;
+    model.hparams.n_ff=1000000; // A trunk width must not replace the actual head width.
+    EXPECT_EQ(CalculateHeadGraphMemory(model,16,2049).feed_forward,actual_ffn);
+    gate.ne[1]=170;
+    EXPECT_GT(CalculateHeadGraphMemory(model,16,2049).feed_forward,actual_ffn);
+    EXPECT_THROW(CalculateHeadGraphMemory(model,16,UINT64_MAX),std::overflow_error);
+    EXPECT_THROW(HeadKVCacheBytes(model,UINT64_MAX),std::overflow_error);
+}
+
+TEST(MtpHeadMemory, ExpertMetadataScalesPerSessionButGraphAndBankRemainShared) {
+    using namespace densecore::llm::speculative;
+    auto model=MakeMtpBudgetModel();
+    model.hparams.n_embd=2048;
+    model.hparams.n_experts=256;
+    model.hparams.n_experts_used=8;
+    ggml_tensor expert{},shared{},router{},shared_router{};
+    auto set_router=[&](ggml_tensor& tensor,int64_t rows) {
+        tensor.type=GGML_TYPE_BF16;
+        tensor.ne[0]=model.hparams.n_embd;
+        tensor.ne[1]=rows;
+        tensor.ne[2]=tensor.ne[3]=1;
+        tensor.nb[0]=sizeof(uint16_t);
+        for(int i=1;i<4;++i) tensor.nb[i]=tensor.nb[i-1]*tensor.ne[i-1];
+    };
+    set_router(router,256);
+    set_router(shared_router,1);
+    expert.ne[1]=512;
+    shared.ne[1]=1024;
+    model.mtp_heads.resize(1);
+    model.mtp_heads[0].tensors["ffn_gate_exps.weight"]=&expert;
+    model.mtp_heads[0].tensors["ffn_gate_shexp.weight"]=&shared;
+    model.mtp_heads[0].tensors["ffn_gate_inp.weight"]=&router;
+    model.mtp_heads[0].tensors["ffn_gate_inp_shexp.weight"]=&shared_router;
+    const uint64_t metadata=NextNGraph::RequiredExpertMetadataBytes(model);
+    const auto one=CalculateSpeculationMemory(model,2049,1,3);
+    const auto eight=CalculateSpeculationMemory(model,2049,8,3);
+    RecordProperty("expert_metadata_bytes_35b_router_shape",std::to_string(metadata));
+    EXPECT_GT(metadata,3*1024*1024u);
+    EXPECT_EQ(one.head_metadata,metadata);
+    EXPECT_EQ(eight.head_metadata,8*metadata);
+    EXPECT_EQ(eight.graph,one.graph);
+    EXPECT_EQ(eight.checkpoints,one.checkpoints);
+    EXPECT_EQ(eight.Total()-one.Total(),7*(one.head_kv+one.prompt_hidden+one.prompt_tokens+one.distributions+one.head_metadata));
+    const auto routed=CalculateHeadGraphMemory(model,16,2049).feed_forward;
+    model.hparams.n_experts_used=1;
+    EXPECT_LT(CalculateHeadGraphMemory(model,16,2049).feed_forward,routed);
+    model.hparams.n_experts_used=257;
+    EXPECT_THROW(CalculateHeadGraphMemory(model,16,2049),std::invalid_argument);
 }

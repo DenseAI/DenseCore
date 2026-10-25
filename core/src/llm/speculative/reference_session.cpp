@@ -1,4 +1,5 @@
 #include "llm/speculative/reference_session.h"
+#include "llm/speculative/head_memory.h"
 #include "llm/sampling/sampling_rng.h"
 #include "densecore/models/tokenizer.h"
 #include "ggml-cpu.h"
@@ -103,7 +104,9 @@ ReferenceSession::HeadOutput ReferenceSession::ForwardHead(const std::vector<int
                                                            const InferenceDependencies* deps,
                                                            std::vector<float>* raw_logits) {
     const size_t embd = source_.hparams.n_embd;
-    if (tokens.empty() || hidden.size() != tokens.size() * embd ||
+    if (!embd || tokens.empty() || tokens.size()>kHeadBootstrapTokens ||
+        hidden.size()/embd != tokens.size() || hidden.size()%embd ||
+        head_past_<0 || head_past_>max_context_ ||
         tokens.size() > static_cast<size_t>(max_context_ - head_past_)) {
         throw std::invalid_argument("MTP head context/hidden shape mismatch");
     }
@@ -125,10 +128,11 @@ ReferenceSession::HeadOutput ReferenceSession::ForwardHead(const std::vector<int
     SetInferenceWorkContextModelVariant(work_.get(), source_.variant);
     SetCurrentExecutionPhase(tokens.size() > 1 ? InferenceExecutionPhase::Prefill : InferenceExecutionPhase::Decode);
     SetCurrentBatch(&batch);
-    // Bound bootstrap chunks to 16. Include the attention score matrix in the
-    // reference arena; this allocation must be reserved by the engine planner.
-    const size_t scratch = 64ULL * 1024 * 1024 +
-        sizeof(float) * tokens.size() * (embd * 32 + source_.hparams.n_head * static_cast<size_t>(head_past_ + tokens.size()));
+    // Same checked bound used before target KV allocation/concurrency choice.
+    const auto scratch_bytes=CalculateHeadGraphMemory(source_,tokens.size(),
+        static_cast<uint64_t>(head_past_)+tokens.size()).Total();
+    if (scratch_bytes>SIZE_MAX) throw std::overflow_error("MTP head arena exceeds address space");
+    const size_t scratch=static_cast<size_t>(scratch_bytes);
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({scratch, nullptr, false}), ggml_free);
     if (!ctx) throw std::runtime_error("MTP head graph allocation failed");
     auto* input_hidden = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, embd, tokens.size());
@@ -167,7 +171,7 @@ void ReferenceSession::Bootstrap(const InferenceDependencies* deps, const std::a
     const size_t embd = source_.hparams.n_embd;
     for (size_t begin = 0; begin < prompt_tokens_.size();) {
         CheckCancelled(cancelled);
-        const size_t count = std::min(size_t{16}, prompt_tokens_.size() - begin);
+        const size_t count = std::min(static_cast<size_t>(kHeadBootstrapTokens), prompt_tokens_.size() - begin);
         auto input = BuildNextNBootstrapBatch(prompt_tokens_, prompt_hidden_, embd, begin, count);
         ForwardHead(input.tokens, input.hidden, nullptr, deps);
         begin += count;
