@@ -270,6 +270,7 @@ public:
     // Worker-only decode transaction boundary. Recurrent checkpoint restoration
     // must be prepared before this call; no speculative prefix registration is
     // allowed. On failure every field remains unchanged.
+    bool ReserveSpeculativeSlots(int seq_id, int required_tokens, std::vector<int>* request_block_ids);
     bool RollbackSpeculativeSuffix(int seq_id, int keep_tokens,
                                     std::vector<int>* request_block_ids, int* request_n_past);
 

@@ -367,9 +367,8 @@ TEST(SpeculativeRollback, SchedulerAndRecurrentStateRestoreTogetherAtBoundary) {
     scheduler.OnPrefillChunkComplete(seq, 15, true);
     scheduler.OnDecodeStepComplete(seq, 1);
     const auto decode = scheduler.Schedule();
-    for (const auto& allocation : decode.new_block_allocations) {
-        blocks.insert(blocks.end(), allocation.second.begin(), allocation.second.end());
-    }
+    ASSERT_TRUE(decode.new_block_allocations.empty()); // ordinary decode grows blocks in the worker
+    ASSERT_TRUE(scheduler.ReserveSpeculativeSlots(seq, 19, &blocks));
     ASSERT_EQ(blocks.size(), 2u);
     scheduler.OnDecodeStepComplete(seq, 3);
     int n_past = 19;

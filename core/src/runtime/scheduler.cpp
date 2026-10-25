@@ -675,6 +675,41 @@ void PrintSchedulerOutput(const SchedulerOutput& output) {
               << " Decode: " << output.num_decode_tokens << std::endl;
 }
 
+bool Scheduler::ReserveSpeculativeSlots(int seq_id, int required_tokens, std::vector<int>* request_block_ids) {
+    if (!request_block_ids || required_tokens < 0) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto blocks = seq_block_ids_.find(seq_id);
+    auto context = seq_context_len_.find(seq_id);
+    if (running_seqs_.count(seq_id) == 0 || blocks == seq_block_ids_.end() || context == seq_context_len_.end() ||
+        required_tokens < context->second || required_tokens > config_.max_model_len ||
+        blocks->second.size() > request_block_ids->size() ||
+        !std::equal(blocks->second.begin(), blocks->second.end(), request_block_ids->begin())) return false;
+    for (size_t i = 0; i < request_block_ids->size(); ++i) {
+        const int id = (*request_block_ids)[i];
+        if (id < 0 || id >= block_manager_->num_blocks || block_manager_->GetRefCount(id) <= 0) return false;
+        for (size_t j = 0; j < i; ++j) if ((*request_block_ids)[j] == id) return false;
+    }
+    const size_t required_blocks = static_cast<size_t>(required_tokens / BLOCK_SIZE) + (required_tokens % BLOCK_SIZE != 0);
+    const size_t missing = required_blocks > request_block_ids->size() ? required_blocks - request_block_ids->size() : 0;
+    // Prepare both tables before allocation. Publishing the same owned blocks
+    // in scheduler metadata adds no reference: request and scheduler already
+    // describe the same ownership, including blocks grown by ordinary decode.
+    auto request_replacement = *request_block_ids;
+    auto scheduler_replacement = request_replacement;
+    request_replacement.reserve(request_replacement.size() + missing);
+    scheduler_replacement.reserve(scheduler_replacement.size() + missing);
+    auto allocated = block_manager_->Allocate(static_cast<int>(missing));
+    if (allocated.size() != missing) {
+        block_manager_->Free(allocated);
+        return false;
+    }
+    request_replacement.insert(request_replacement.end(), allocated.begin(), allocated.end());
+    scheduler_replacement.insert(scheduler_replacement.end(), allocated.begin(), allocated.end());
+    blocks->second.swap(scheduler_replacement);
+    request_block_ids->swap(request_replacement);
+    return true;
+}
+
 bool Scheduler::RollbackSpeculativeSuffix(int seq_id, int keep_tokens,
                                          std::vector<int>* request_block_ids, int* request_n_past) {
     if (!request_block_ids || !request_n_past) return false;
