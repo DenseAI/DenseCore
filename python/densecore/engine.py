@@ -238,6 +238,44 @@ class TokenResult(ctypes.Structure):
 # Callback type for TokenResult struct
 TOKEN_RESULT_CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(TokenResult), ctypes.c_void_p)
 
+# Additive native metadata ABI; independent of visible text callback chunks.
+GENERATION_COMPLETION_CALLBACK_TYPE = ctypes.CFUNCTYPE(
+    None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
+)
+
+
+@dataclass
+class _RequestCompletionState:
+    generated_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
+    error_message: Optional[str] = None
+    native_request_id: Optional[int] = None
+    cancel_requested: bool = False
+    cancel_dispatched: bool = False
+    terminal_claimed: bool = False
+
+
+
+@dataclass
+class _CloseAttempt:
+    done: threading.Event
+    error: Optional[BaseException] = None
+
+
+# A failed native cleanup cannot relinquish callback/handle ownership. Keep a
+# strong owner rather than retrying an indeterminate destruction operation.
+_failed_close_owners: Dict[int, Any] = {}
+_failed_close_owners_lock = threading.Lock()
+
+
+class _QuarantinedNativeLibrary:
+    def __init__(self, owner: Any, error: BaseException):
+        self.owner = owner  # Keep the loaded library alive for outstanding callbacks.
+        self.error = error
+
+    def __getattr__(self, _name: str):
+        raise self.error
+
 
 class DenseCoreMetrics(ctypes.Structure):
     _fields_ = [
@@ -654,6 +692,12 @@ class DenseCore:
         self._requests: Dict[int, Any] = {}
         self._active_ctypes_refs: Dict[int, List[Any]] = {}  # Prevent GC of ctypes objects
         self._request_parity_mode: Dict[int, bool] = {}
+        self._request_completions: Dict[int, _RequestCompletionState] = {}
+        self._native_call_lock = threading.RLock()
+        self._closing = False
+        self._close_attempt: Optional[_CloseAttempt] = None
+        self._close_failed = False
+        self._close_indeterminate = False
         self._req_id_counter = 0
         self._lock = threading.Lock()
         self._verbose = verbose
@@ -742,6 +786,13 @@ class DenseCore:
                 native_error = self._lib.DenseCoreGetLastError()
                 detail = native_error.decode("utf-8", errors="replace") if native_error else ""
             raise RuntimeError(f"Failed to initialize DenseCore engine for model: {model_path}: {detail}")
+
+        self._closed = False
+        try:
+            self._install_generation_completion_callback()
+        except BaseException:
+            self.close()
+            raise
 
         # Load LoRA adapter if provided
         if lora_adapter_path:
@@ -1231,60 +1282,119 @@ class DenseCore:
         # Handle other common replacement characters if needed
         return s
 
-    def _global_callback(self, token: bytes, is_finished: int, user_data: int) -> None:
-        """Global callback called from C.
+    def _install_generation_completion_callback(self) -> None:
+        # Only absence of the export permits legacy fallback. A present but
+        # failing setter must not pretend that native usage is authoritative.
+        try:
+            setter = self._lib.DenseCoreSetGenerationCompletionCallback
+        except AttributeError:
+            self._has_generation_completion_api = False
+            return
+        self._has_generation_completion_api = True
+        setter.argtypes = [ctypes.c_void_p, GENERATION_COMPLETION_CALLBACK_TYPE]
+        setter.restype = ctypes.c_int
+        self._c_generation_completion_callback = GENERATION_COMPLETION_CALLBACK_TYPE(
+            self._global_generation_completion_callback
+        )
+        status = setter(self._handle, self._c_generation_completion_callback)
+        if status < 0:
+            raise _error_code_to_exception(status, context="registering generation completion callback")
 
-        Handles both legacy string format and new TokenResult struct format.
-        For TokenResult, the token parameter contains the struct data.
-
-        Thread Safety:
-            - Uses try/finally to ensure _active_ctypes_refs cleanup even on exception
-            - Prevents memory leaks from callback errors
-        """
-        req_id = user_data
-        finished = bool(is_finished)
-
-        with self._lock:
-            handler = self._requests.get(req_id)
-
-        if not handler:
-            # Still need to clean up refs if finished, even without handler
-            if finished:
-                with self._lock:
-                    self._requests.pop(req_id, None)
-                    self._active_ctypes_refs.pop(req_id, None)
-                    self._request_parity_mode.pop(req_id, None)
+    def _global_generation_completion_callback(
+        self, generated_tokens: int, reason: int, user_data: int
+    ) -> None:
+        # Never raise across a CFUNCTYPE/C boundary. Unknown/late userdata cannot
+        # attach metadata to a different request or resurrect retired tracking.
+        try:
+            req_id = int(user_data or 0)
+            with self._lock:
+                state = getattr(self, "_request_completions", {}).get(req_id)
+                if state is None or state.terminal_claimed:
+                    return
+                if generated_tokens < 0 or reason not in (1, 2, 3):
+                    state.generated_tokens = 0
+                    state.finish_reason = "error"
+                    state.error_message = "Error: invalid native generation completion metadata"
+                else:
+                    state.generated_tokens = int(generated_tokens)
+                    state.finish_reason = {1: "stop", 2: "length", 3: "error"}[int(reason)]
+                    if reason == 3:
+                        state.error_message = "Error: native generation failed"
+        except Exception:
             return
 
+    def _cleanup_request(self, req_id: int) -> None:
+        with self._lock:
+            self._requests.pop(req_id, None)
+            self._active_ctypes_refs.pop(req_id, None)
+            self._request_parity_mode.pop(req_id, None)
+            getattr(self, "_request_completions", {}).pop(req_id, None)
+
+    def _cancel_unfinished_request(self, req_id: int) -> None:
         try:
-            # Decode token string
+            self.stop_generation(req_id)
+        except EngineNotInitializedError:
+            pass
+
+    def _native_call_mutex(self):
+        # The lazy path also supports older test/adapter instances constructed
+        # with __new__. Never hold _lock while entering native code: callbacks
+        # may run synchronously before SubmitRequest/CancelRequest returns.
+        with self._lock:
+            mutex = getattr(self, "_native_call_lock", None)
+            if mutex is None:
+                mutex = self._native_call_lock = threading.RLock()
+            return mutex
+
+    def _global_callback(self, token: bytes, is_finished: int, user_data: int) -> None:
+        """Deliver string content, then retire request tracking after terminal."""
+        req_id = user_data
+        finished = bool(is_finished)
+        with self._lock:
+            handler = self._requests.get(req_id)
+            state = getattr(self, "_request_completions", {}).get(req_id)
+            if state is not None:
+                if state.terminal_claimed:
+                    return
+                if finished:
+                    state.terminal_claimed = True
+            parity_mode = self._request_parity_mode.get(req_id, False)
+        if not handler:
+            if finished:
+                self._cleanup_request(req_id)
+            return
+        try:
             token_str = token.decode("utf-8", errors="replace") if token else ""
-
-            # Since C++ now sends decoded tokens, just clean BPE artifacts
-            with self._lock:
-                parity_mode = self._request_parity_mode.get(req_id, False)
             token_str = self._clean_bpe_token(token_str, parity_mode=parity_mode)
-
+            if finished and not token_str.strip().startswith("Error:"):
+                if state is not None and state.error_message:
+                    token_str = state.error_message
+                elif getattr(self, "_has_generation_completion_api", False) and (
+                    state is None or state.generated_tokens is None
+                ):
+                    token_str = "Error: native generation completion metadata is missing"
             handler(token_str, finished)
         except Exception as e:
             import traceback
-
             error_msg = f"Error in callback handler for req {req_id}: {e}\n{traceback.format_exc()}"
             print(f"[DenseCore] {error_msg}")
             warnings.warn(error_msg, stacklevel=2)
         finally:
             if finished:
-                with self._lock:
-                    self._requests.pop(req_id, None)
-                    self._active_ctypes_refs.pop(req_id, None)
-                    self._request_parity_mode.pop(req_id, None)
+                self._cleanup_request(req_id)
 
-    def _register_request(self, handler: Callable[[str, bool], None]) -> int:
-        """Register a request handler and return request ID."""
+    def _register_request(
+        self, handler: Callable[[str, bool], None], completion: Optional[_RequestCompletionState] = None
+    ) -> int:
         with self._lock:
+            if getattr(self, "_closed", False) or getattr(self, "_closing", False) or getattr(self, "_close_failed", False):
+                raise EngineNotInitializedError("engine is closing or closed")
             self._req_id_counter += 1
             req_id = self._req_id_counter
             self._requests[req_id] = handler
+            if not hasattr(self, "_request_completions"):
+                self._request_completions = {}
+            self._request_completions[req_id] = completion or _RequestCompletionState()
             return req_id
 
     def _resolve_generation_params(
@@ -1389,6 +1499,41 @@ class DenseCore:
         return params
 
     def _submit_request(
+        self, req_id: int, prompt: Union[str, List[int]], params: Dict[str, Any]
+    ) -> int:
+        try:
+            with self._native_call_mutex():
+                with self._lock:
+                    if getattr(self, "_closed", False) or getattr(self, "_closing", False) or getattr(self, "_close_failed", False) or not self._handle:
+                        raise EngineNotInitializedError("engine is closing or closed")
+                result = self._submit_request_impl(req_id, prompt, params)
+            if result < 0:
+                self._cleanup_request(req_id)
+                return result
+            with self._lock:
+                state = getattr(self, "_request_completions", {}).get(req_id)
+                if state is not None:
+                    state.native_request_id = int(result)
+                cancel_after_submit = state is not None and state.cancel_requested
+            if cancel_after_submit:
+                try:
+                    self.stop_generation(req_id)
+                except EngineNotInitializedError:
+                    # Close already joined/delivered the accepted request's
+                    # terminal. Consume that event, not a fabricated submit error.
+                    pass
+            return result
+        except Exception:
+            self._cleanup_request(req_id)
+            raise
+        except BaseException:
+            # Interrupting a C call can leave submission outcome unknown. Never
+            # discard callback/ctypes owners or guess that the Python ID is the
+            # native ID; retain them until the real terminal or native close.
+            self._cancel_unfinished_request(req_id)
+            raise
+
+    def _submit_request_impl(
         self,
         req_id: int,
         prompt: Union[str, List[int]],
@@ -1625,7 +1770,11 @@ class DenseCore:
 
         Returns:
             str: Generated text (default)
-            GenerateOutput: If return_dict_in_generate=True
+            GenerateOutput: If return_dict_in_generate=True. Its usage/finish reason
+                use native completion metadata when supported. Reconstructed
+                sequences may have a different length from native sampled tokens.
+                Older libraries without that export retain tokenizer usage estimates
+                and the legacy "stop" finish reason.
 
         Example:
             >>> # DenseCore style
@@ -1732,11 +1881,12 @@ class DenseCore:
         # =======================================================================
         result_queue: queue.Queue = queue.Queue()
         generated_token_ids: List[int] = []
+        completion_state = _RequestCompletionState()
 
         def handler(token: str, finished: bool) -> None:
             result_queue.put((token, finished, _terminal_callback_error(token, finished)))
 
-        req_id = self._register_request(handler)
+        req_id = self._register_request(handler, completion_state)
         with self._lock:
             self._request_parity_mode[req_id] = parity_mode
 
@@ -1747,21 +1897,25 @@ class DenseCore:
             if ret < 0:
                 raise _error_code_to_exception(ret, context="in generate()")
         except Exception:
-            with self._lock:
-                self._requests.pop(req_id, None)
-                self._active_ctypes_refs.pop(req_id, None)
-                self._request_parity_mode.pop(req_id, None)
+            self._cleanup_request(req_id)
             raise
 
-        # Collect generated tokens
+        # The request remains registered until its native terminal, even when
+        # the caller abandons collection or interrupts a blocking queue wait.
         tokens: List[str] = []
-        while True:
-            token, finished, terminal_error = result_queue.get()
-            if terminal_error is not None:
-                raise terminal_error
-            tokens.append(token)
-            if finished:
-                break
+        terminal_seen = False
+        try:
+            while True:
+                token, finished, terminal_error = result_queue.get()
+                terminal_seen = finished
+                if terminal_error is not None:
+                    raise terminal_error
+                tokens.append(token)
+                if finished:
+                    break
+        finally:
+            if not terminal_seen:
+                self._cancel_unfinished_request(req_id)
 
         generated_text = "".join(tokens)
 
@@ -1782,17 +1936,30 @@ class DenseCore:
             else:
                 generated_token_ids = []
 
-            # Full sequence = prompt + generated
+            # Usage counts native samples, including hidden/control tokens. The
+            # reconstructed sequence may have a different token length. Older
+            # libraries without the metadata export retain tokenizer estimates
+            # and the legacy "stop" finish reason.
+            if completion_state.error_message:
+                raise DenseCoreRuntimeError(completion_state.error_message)
+            if getattr(self, "_has_generation_completion_api", False) and completion_state.generated_tokens is None:
+                raise DenseCoreRuntimeError("native generation completion metadata is missing")
+            completion_tokens = (
+                completion_state.generated_tokens
+                if completion_state.generated_tokens is not None else len(generated_token_ids)
+            )
+            finish_reason = completion_state.finish_reason or "stop"
+            # Full sequence = prompt + reconstructed generated IDs
             full_sequence = list(prompt_token_ids) + generated_token_ids
 
             return GenerateOutput(
                 sequences=[full_sequence],
                 text=generated_text,
-                finish_reason="stop",
+                finish_reason=finish_reason,
                 usage={
                     "prompt_tokens": len(prompt_token_ids),
-                    "completion_tokens": len(generated_token_ids),
-                    "total_tokens": len(full_sequence),
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": len(prompt_token_ids) + completion_tokens,
                 },
             )
 
@@ -1973,22 +2140,23 @@ class DenseCore:
             if ret < 0:
                 raise RuntimeError(f"Failed to submit request: error code {ret}")
         except Exception:
-            with self._lock:
-                self._requests.pop(req_id, None)
-                self._active_ctypes_refs.pop(req_id, None)
-                self._request_parity_mode.pop(req_id, None)
+            self._cleanup_request(req_id)
             raise
 
-        while True:
-            token, finished, terminal_error = result_queue.get()
-
-            if terminal_error is not None:
-                raise terminal_error
-
-            if token:
-                yield token
-            if finished:
-                break
+        terminal_seen = False
+        try:
+            while True:
+                token, finished, terminal_error = result_queue.get()
+                terminal_seen = finished
+                if terminal_error is not None:
+                    raise terminal_error
+                if token:
+                    yield token
+                if finished:
+                    break
+        finally:
+            if not terminal_seen:
+                self._cancel_unfinished_request(req_id)
 
     # Alias for HuggingFace-style API
     generate_stream = stream
@@ -2018,44 +2186,58 @@ class DenseCore:
         # Resolve params
         params = self._resolve_generation_params(config, kwargs, default_max_tokens=max_tokens)
 
-        # Async logic
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         accumulated: List[str] = []
 
         def handler(token: str, finished: bool) -> None:
-            if token:
+            terminal_error = _terminal_callback_error(token, finished)
+            if token and terminal_error is None:
                 accumulated.append(token)
-            if finished:
-                terminal_error = _terminal_callback_error(token, finished)
+            if not finished:
+                return
+            result = "".join(accumulated)
+            def deliver() -> None:
+                if future.done():
+                    return
                 if terminal_error is not None:
-                    loop.call_soon_threadsafe(future.set_exception, terminal_error)
+                    future.set_exception(terminal_error)
                 else:
-                    result = "".join(accumulated)
-                    loop.call_soon_threadsafe(future.set_result, result)
+                    future.set_result(result)
+            try:
+                loop.call_soon_threadsafe(deliver)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
 
         req_id = self._register_request(handler)
-
-        def blocking_submit() -> int:
-            """Execute SubmitRequest in executor."""
-            try:
-                prompt_arg = self._normalize_prompt(prompt, kwargs.get("input_ids"))
-                return self._submit_request(req_id, prompt_arg, params)
-            except Exception as e:
-                # Need to handle exception propagation to future if submission fails?
-                # For now just return err code simulation if exceptions happen
-                print(f"[DenseCore] SubmitAsync failed: {e}")
-                return -1
-
-        ret = await loop.run_in_executor(_get_inference_executor(), blocking_submit)
-
-        if ret < 0:
+        completed = False
+        try:
+            prompt_arg = self._normalize_prompt(prompt, kwargs.get("input_ids"))
+            ret = await loop.run_in_executor(
+                _get_inference_executor(), self._submit_request, req_id, prompt_arg, params
+            )
+            if ret < 0:
+                raise _error_code_to_exception(ret, context="in generate_async()")
+            result = await future
+            completed = True
+            return result
+        except Exception:
+            # Submit adapters can fail before native submission. A real accepted
+            # request keeps its handler until the native terminal resolves it.
             with self._lock:
-                self._requests.pop(req_id, None)
-                self._active_ctypes_refs.pop(req_id, None)  # Clean up if we added failure
-            raise _error_code_to_exception(ret, context="in generate_async()")
-
-        return await future
+                state = getattr(self, "_request_completions", {}).get(req_id)
+                accepted = state is not None and state.native_request_id is not None
+            if not accepted:
+                self._cleanup_request(req_id)
+            raise
+        finally:
+            if not completed:
+                if not future.done():
+                    future.cancel()
+                elif not future.cancelled():
+                    future.exception()
+                self._cancel_unfinished_request(req_id)
 
     async def stream_async(
         self,
@@ -2082,44 +2264,45 @@ class DenseCore:
         # Consolidate params
         params = self._resolve_generation_params(config, kwargs, default_max_tokens=max_tokens)
 
-        # Async input processing
         prompt_arg = self._normalize_prompt(prompt, kwargs.get("input_ids"))
-
         loop = asyncio.get_running_loop()
         async_queue: asyncio.Queue = asyncio.Queue()
 
         def handler(token: str, finished: bool) -> None:
-            loop.call_soon_threadsafe(
-                async_queue.put_nowait,
-                (token, finished, _terminal_callback_error(token, finished)),
-            )
+            event = (token, finished, _terminal_callback_error(token, finished))
+            try:
+                loop.call_soon_threadsafe(async_queue.put_nowait, event)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
 
         req_id = self._register_request(handler)
-
-        def blocking_submit() -> int:
-            """Execute SubmitRequest in executor."""
-            try:
-                return self._submit_request(req_id, prompt_arg, params)
-            except Exception as e:
-                print(f"[DenseCore] stream_async submit failed: {e}")
-                return -1
-
-        ret = await loop.run_in_executor(_get_inference_executor(), blocking_submit)
-
-        if ret < 0:
+        terminal_seen = False
+        try:
+            ret = await loop.run_in_executor(
+                _get_inference_executor(), self._submit_request, req_id, prompt_arg, params
+            )
+            if ret < 0:
+                raise _error_code_to_exception(ret, context="in stream_async()")
+            while True:
+                token, finished, terminal_error = await async_queue.get()
+                terminal_seen = finished
+                if terminal_error is not None:
+                    raise terminal_error
+                if token:
+                    yield token
+                if finished:
+                    break
+        except Exception:
             with self._lock:
-                self._requests.pop(req_id, None)
-                self._active_ctypes_refs.pop(req_id, None)
-            raise _error_code_to_exception(ret, context="in stream_async()")
-
-        while True:
-            token, finished, terminal_error = await async_queue.get()
-            if terminal_error is not None:
-                raise terminal_error
-            if token:
-                yield token
-            if finished:
-                break
+                state = getattr(self, "_request_completions", {}).get(req_id)
+                accepted = state is not None and state.native_request_id is not None
+            if not accepted:
+                self._cleanup_request(req_id)
+            raise
+        finally:
+            if not terminal_seen:
+                self._cancel_unfinished_request(req_id)
 
     # Alias for compatibility
     generate_stream_async = stream_async
@@ -2194,25 +2377,36 @@ class DenseCore:
                 "return_dict": False,
             }
 
-            ret = self._submit_request(req_id, prompt, params)
+            try:
+                ret = self._submit_request(req_id, prompt, params)
+            except Exception:
+                self._cleanup_request(req_id)
+                for pending_id in req_ids:
+                    self._cancel_unfinished_request(pending_id)
+                raise
 
             if ret < 0:
                 # Clean up the registered request on failure
-                with self._lock:
-                    self._requests.pop(req_id, None)
+                self._cleanup_request(req_id)
+                for pending_id in req_ids:
+                    self._cancel_unfinished_request(pending_id)
                 raise _error_code_to_exception(
                     ret, context=f"submitting prompt {idx} in generate_batch"
                 )
 
         # Wait for all results (order preserved by queue indices)
         results: List[str] = []
-        for result_queue in result_queues:
-            result = result_queue.get()  # Blocks until result is ready
-            if isinstance(result, DenseCoreError):
-                raise result
-            results.append(result)
-
-        return results
+        try:
+            for result_queue in result_queues:
+                result = result_queue.get()
+                if isinstance(result, DenseCoreError):
+                    raise result
+                results.append(result)
+            return results
+        except BaseException:
+            for pending_id in req_ids:
+                self._cancel_unfinished_request(pending_id)
+            raise
 
     # =========================================================================
     # Chat Interface (OpenAI-compatible)
@@ -2809,58 +3003,42 @@ class DenseCore:
     # =========================================================================
 
     def stop_generation(self, req_id: int) -> bool:
+        """Cancel a registered Python request using its actual native request ID.
+
+        A request submitted concurrently can defer cancellation until native
+        submission returns. Handlers and ctypes references remain registered
+        until the real terminal callback. Without native cancellation support,
+        this returns False and leaves normal completion tracking intact.
         """
-        Request graceful cancellation of an in-progress generation.
-
-        Signals the C++ backend to stop generating tokens for the specified
-        request. The actual stopping may not be immediate as it depends on
-        when the inference loop checks the cancellation flag.
-
-        Args:
-            req_id: Request ID returned from internal registration
-
-        Returns:
-            True if cancellation was successfully requested, False otherwise
-
-        Raises:
-            EngineNotInitializedError: If the engine is not initialized
-
-        Note:
-            This method only performs actual cancellation when the C++ backend's
-            CancelRequest API is available. Otherwise, only Python-side cleanup
-            is performed.
-
-        Example:
-            >>> req_id = model._register_request(handler)
-            >>> # ... later, if user presses Ctrl+C ...
-            >>> model.stop_generation(req_id)
-        """
-        if not self._handle:
-            raise EngineNotInitializedError("Engine handle is null")
-
-        # Attempt to call C++ CancelRequest if available
-        # The C++ side should set a thread-safe cancellation flag
-        if hasattr(self, "_has_cancel_api") and self._has_cancel_api:
-            try:
-                ret = self._lib.CancelRequest(self._handle, ctypes.c_int(req_id))
-                if ret < 0:
-                    if self._verbose:
-                        print(f"[DenseCore] CancelRequest returned error: {ret}")
-                    return False
-            except Exception as e:
-                if self._verbose:
-                    print(f"[DenseCore] CancelRequest failed: {e}")
-                return False
-
-        # Clean up Python-side tracking regardless of C++ result
         with self._lock:
-            self._requests.pop(req_id, None)
-            self._active_ctypes_refs.pop(req_id, None)
-
-        if self._verbose:
-            print(f"[DenseCore] Cancellation requested for req_id={req_id}")
-
-        return True
+            if not self._handle or getattr(self, "_closed", False):
+                raise EngineNotInitializedError("Engine handle is null")
+            if getattr(self, "_closing", False) or getattr(self, "_close_indeterminate", False) or not getattr(self, "_has_cancel_api", False):
+                return False
+            state = getattr(self, "_request_completions", {}).get(req_id)
+            if state is None or state.terminal_claimed:
+                return False
+            state.cancel_requested = True
+            if state.native_request_id is None or state.cancel_dispatched:
+                return True
+            state.cancel_dispatched = True
+            native_id = state.native_request_id
+        try:
+            with self._native_call_mutex():
+                with self._lock:
+                    closing = getattr(self, "_closing", False) or getattr(self, "_closed", False)
+                    handle = self._handle
+                if closing or not handle:
+                    accepted = False
+                else:
+                    accepted = self._lib.CancelRequest(handle, ctypes.c_int(native_id)) >= 0
+        except Exception:
+            accepted = False
+        if not accepted:
+            with self._lock:
+                if getattr(self, "_request_completions", {}).get(req_id) is state:
+                    state.cancel_dispatched = False
+        return accepted
 
     def cancel_all_requests(self) -> int:
         """
@@ -3228,15 +3406,62 @@ class DenseCore:
         }
 
     def close(self) -> None:
-        """Close the engine and release resources."""
+        """Join native producers before releasing callback state.
+
+        A failed cleanup quarantines handle/callback ownership and disables
+        further native calls. No retry guesses whether destruction completed.
+        """
         if not hasattr(self, "_closed"):
             return
-        if not self._closed and getattr(self, "_handle", None):
-            self._lib.FreeEngine(self._handle)
-            self._handle = None
-            self._closed = True
-            if self._verbose:
-                print("[DenseCore] Engine closed")
+        with self._lock:
+            if self._closed:
+                return
+            if getattr(self, "_close_indeterminate", False):
+                raise self._close_attempt.error
+            if getattr(self, "_closing", False):
+                attempt = self._close_attempt
+                owner = False
+            else:
+                self._closing = True
+                attempt = self._close_attempt = _CloseAttempt(threading.Event())
+                owner = True
+        if not owner:
+            attempt.done.wait()
+            if attempt.error is not None:
+                raise attempt.error
+            return
+        try:
+            with self._native_call_mutex():
+                if self._handle:
+                    self._lib.FreeEngine(self._handle)
+        except BaseException as error:
+            with self._lock:
+                self._closing = False
+                self._close_failed = True
+                self._close_indeterminate = True
+                attempt.error = error
+                self._quarantined_handle = self._handle
+                self._handle = None
+                self._lib = _QuarantinedNativeLibrary(self._lib, error)
+            with _failed_close_owners_lock:
+                _failed_close_owners[id(self)] = self
+            raise
+        else:
+            with self._lock:
+                self._handle = None
+                self._closed = True
+                self._closing = False
+                self._close_failed = False
+                self._requests.clear()
+                self._active_ctypes_refs.clear()
+                self._request_parity_mode.clear()
+                getattr(self, "_request_completions", {}).clear()
+            with _failed_close_owners_lock:
+                _failed_close_owners.pop(id(self), None)
+        finally:
+            attempt.done.set()
+        if getattr(self, "_verbose", False):
+            print("[DenseCore] Engine closed")
 
     def get_metrics(self) -> Optional[dict[str, float | int]]:
         if (
@@ -3263,6 +3488,8 @@ class DenseCore:
 
     def __del__(self) -> None:
         """Destructor to ensure cleanup."""
+        if getattr(self, "_close_failed", False):
+            return
         try:
             self.close()
         except Exception:
