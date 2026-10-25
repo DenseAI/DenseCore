@@ -1,4 +1,5 @@
 #include "densecore/runtime/inference.h"
+#include "llm/graph/checked_ops.h"
 
 #include "densecore/backend/flash_attention.h"
 #include "densecore/backend/hardware_topology.h"  // For compute thread affinity
@@ -138,6 +139,10 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     const int n_head_kv = model->hparams.n_head_kv;
     const int n_layer = model->hparams.n_layer;
     const int n_ctx = model->hparams.n_ctx;
+    auto checked_mul = [&](ggml_context* ctx, ggml_tensor* a, ggml_tensor* b,
+                           const char* stage = "gemma4 multiply") -> ggml_tensor* {
+        return model->arch_flags.is_gemma4 ? CheckedBroadcastMul(ctx, a, b, stage) : ggml_mul(ctx, a, b);
+    };
     densecore::llm::decoder::DecoderSpecView decoder_spec_view(model);
     const densecore::models::DecoderModelSpec* decoder_spec = decoder_spec_view.get();
     const DecodePagedAttentionPolicy& decode_paged_policy = ResolveDecodePagedAttentionPolicy(&batch);
@@ -280,7 +285,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 }
                 ggml_set_name(out, rms_name);
             }
-            out = ggml_mul(ctx_c, out, effective_norm_weight);
+            out = checked_mul(ctx_c, out, effective_norm_weight, debug_name ? debug_name : "weighted_rms_norm");
             if (debug_name) {
                 ggml_set_name(out, debug_name);
             }
@@ -1298,7 +1303,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     Q_2d = ggml_rms_norm(ctx_c, Q_2d, model->hparams.f_norm_rms_eps);
 
                     // Multiply by weight [head_dim] - broadcasts across second dimension
-                    Q_2d = ggml_mul(ctx_c, Q_2d, q_norm_effective);
+                    Q_2d = checked_mul(ctx_c, Q_2d, q_norm_effective, "gemma4 query normalization");
 
                     // Reshape back to original 3D: [head_dim, n_head, n_tokens]
                     Qcur = ggml_reshape_3d(ctx_c, Q_2d, head_dim_q, n_head, q_n_tokens);
@@ -1345,7 +1350,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     K_2d = ggml_rms_norm(ctx_c, K_2d, model->hparams.f_norm_rms_eps);
 
                     // Multiply by weight [head_dim] - broadcasts across second dimension
-                    K_2d = ggml_mul(ctx_c, K_2d, k_norm_effective);
+                    K_2d = checked_mul(ctx_c, K_2d, k_norm_effective, "gemma4 key normalization");
 
                     // Reshape back to original 3D: [head_dim, n_head_kv, n_tokens]
                     Kcur = ggml_reshape_3d(ctx_c, K_2d, head_dim_kv, n_head_kv, k_n_tokens);
@@ -1368,7 +1373,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     V_2d = ensure_rms_norm_f32_input(V_2d, "V_2d", il);
                     V_2d = ggml_rms_norm(ctx_c, V_2d, model->hparams.f_norm_rms_eps);
                     if (v_norm && v_norm->ne[0] == head_dim_v) {
-                        V_2d = ggml_mul(ctx_c, V_2d, v_norm);
+                        V_2d = checked_mul(ctx_c, V_2d, v_norm);
                     }
                     Vcur = ggml_reshape_3d(ctx_c, V_2d, head_dim_v, n_head_kv, v_n_tokens);
                 }
@@ -1989,7 +1994,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             cur = ggml_reshape_2d(ctx_c, KQV_merged, attn_out_head_dim * n_head, N);
             if (attn_gate) {
                 attn_gate = ggml_sigmoid(ctx_c, attn_gate);
-                cur = ggml_mul(ctx_c, cur, attn_gate);
+                cur = checked_mul(ctx_c, cur, attn_gate);
             }
             if (IsDebugAttentionPostReferenceEnabled()) {
                 AttentionCoreReferenceUserData* post_ref_ud = GetAttentionCoreReferenceUserData();
@@ -2273,7 +2278,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 ggml_set_name(router_input, "gemma4_router_rms_norm");
                 if (gemma_router_scale) {
                     struct ggml_tensor* router_scale = ggml_repeat(ctx_c, gemma_router_scale, router_input);
-                    router_input = ggml_mul(ctx_c, router_input, router_scale);
+                    router_input = checked_mul(ctx_c, router_input, router_scale);
                 }
                 router_input =
                     ggml_scale(ctx_c, router_input, 1.0f / std::sqrt(static_cast<float>(model->hparams.n_embd)));
@@ -2541,7 +2546,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 } else if (is_gemma4_moe) {
                     shared_ffn = ggml_geglu_split(ctx_c, shared_gate, shared_up);
                 } else if (prefer_native_silu_mul) {
-                    shared_ffn = ggml_mul(ctx_c, ggml_silu(ctx_c, shared_gate), shared_up);
+                    shared_ffn = checked_mul(ctx_c, ggml_silu(ctx_c, shared_gate), shared_up);
                 } else {
                     shared_ffn =
                         ggml_map_custom2(ctx_c, shared_gate, shared_up, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
@@ -2738,7 +2743,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             } else {
                 if ((model->variant == ModelVariant::QWEN35 || model->variant == ModelVariant::QWEN36) &&
                     model->arch_flags.is_hybrid_ssm) {
-                    cur = ggml_mul(ctx_c, ggml_silu(ctx_c, w1), w3);
+                    cur = checked_mul(ctx_c, ggml_silu(ctx_c, w1), w3);
                 } else {
                     cur = ggml_map_custom2(ctx_c, w1, w3, cb_silu_mul_fused, GGML_N_TASKS_MAX, nullptr);
                 }
@@ -2783,7 +2788,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             if (model->arch_flags.is_gemma4) {
                 cur = ensure_rms_norm_f32_input(cur, "gemma4_post_feedforward_layernorm_input", il);
                 cur = ggml_rms_norm(ctx_c, cur, model->hparams.f_norm_rms_eps);
-                cur = ggml_mul(ctx_c, cur,
+                cur = checked_mul(ctx_c, cur,
                                effective_rms_weight(gemma_post_ffn_norm, "gemma4_post_feedforward_layernorm_weight"));
                 ggml_set_name(cur, "gemma4_post_feedforward_layernorm");
             } else {
@@ -2833,7 +2838,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                                  static_cast<size_t>(il) * gemma4_per_layer_inputs->nb[1]);
                 struct ggml_tensor* per_layer_delta = smart_mul_mat(ctx_c, per_layer_gate, cur, model);
                 per_layer_delta = ggml_gelu(ctx_c, per_layer_delta);
-                per_layer_delta = ggml_mul(ctx_c, per_layer_delta, per_layer_input);
+                per_layer_delta = checked_mul(ctx_c, per_layer_delta, per_layer_input, "gemma4 per-layer input gate");
                 per_layer_delta = smart_mul_mat(ctx_c, per_layer_proj, per_layer_delta, model);
                 per_layer_delta = apply_weighted_rms_norm(per_layer_delta, post_per_layer_norm,
                                                           "gemma4_post_per_layer_input_norm", il);
@@ -2860,7 +2865,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 // This matches the training-time behavior where subsequent layers see
                 // the scaled hidden state as their input.
                 struct ggml_tensor* scale = ggml_repeat(ctx_c, layer_output_scale, cur);
-                cur = ggml_mul(ctx_c, cur, scale);
+                cur = checked_mul(ctx_c, cur, scale);
                 if (ShouldRunHiddenSnapshotProbe(il, "after_layer_output_scale")) {
                     auto* hidden_ud = AllocateHiddenSnapshotUserData(ctx_c);
                     if (hidden_ud) {

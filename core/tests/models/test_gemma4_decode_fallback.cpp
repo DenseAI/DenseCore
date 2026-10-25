@@ -13,6 +13,7 @@
 #include "runtime/inference_types_internal.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "llm/graph/checked_ops.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_types.h"
@@ -1230,5 +1231,37 @@ TEST(Gemma4FallbackDecodeTest, Bf16ProjectionLayerLogitsMatchRoundedF32AcrossDec
         ASSERT_EQ(actual.size(), expected.size());
         ASSERT_EQ(actual.size(), static_cast<size_t>(kTinyGraphVocab));
         for (size_t i = 0; i < actual.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 1e-6);
+    }
+}
+
+TEST(Gemma4FallbackDecodeTest, PerLayerSliceBroadcastUsesTwoDimensionalTokenLayout) {
+    constexpr int hidden = 256;
+    constexpr int layers = 35;
+    for (int tokens : {1, 25}) {
+        SCOPED_TRACE(tokens);
+        ggml_init_params params{8 * 1024 * 1024, nullptr, false};
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+        ASSERT_NE(ctx, nullptr);
+        ggml_tensor* per_layer = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hidden, layers, tokens);
+        ggml_tensor* gate = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, hidden, tokens);
+        for (int64_t i = 0; i < ggml_nelements(per_layer); ++i) static_cast<float*>(per_layer->data)[i] = 0.5f;
+        for (int64_t i = 0; i < ggml_nelements(gate); ++i) static_cast<float*>(gate->data)[i] = 0.25f;
+        for (int layer : {0, 17, 34}) {
+            ggml_tensor* slice = ggml_view_2d(ctx.get(), per_layer, hidden, tokens, per_layer->nb[2],
+                                               static_cast<size_t>(layer) * per_layer->nb[1]);
+            ggml_tensor* result = densecore::llm::graph::detail::CheckedBroadcastMul(ctx.get(), gate, slice, "per_layer");
+            ggml_cgraph* graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, result);
+            ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
+            for (int64_t i = 0; i < ggml_nelements(result); ++i) EXPECT_FLOAT_EQ(static_cast<float*>(result->data)[i], 0.125f);
+        }
+        if (tokens > 1) {
+            ggml_tensor* malformed = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, hidden, 1, tokens);
+            EXPECT_THROW(densecore::llm::graph::detail::CheckedBroadcastMul(ctx.get(), gate, malformed, "bad_layer"),
+                         densecore::InvalidArgumentException);
+        }
+        ggml_tensor* wrong_norm = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1536);
+        EXPECT_THROW(densecore::llm::graph::detail::CheckedBroadcastMul(ctx.get(), gate, wrong_norm, "bad_norm"),
+                     densecore::InvalidArgumentException);
     }
 }
