@@ -20,11 +20,24 @@ namespace densecore {
  * Pooling strategy for sequence-to-vector conversion
  */
 enum class PoolingStrategy {
+    AUTO = -1, // Resolve model metadata before execution; never pass to pooling kernels
     MEAN = 0,  // Mean of all tokens (sentence-transformers default)
     CLS = 1,   // First token [CLS] (BERT-style)
     LAST = 2,  // Last token
     MAX = 3    // Element-wise max
 };
+
+inline bool ResolveEmbeddingPooling(int requested, bool has_metadata, int gguf_pooling, PoolingStrategy& result) {
+    if (requested >= 0 && requested <= 3) { result = static_cast<PoolingStrategy>(requested); return true; }
+    if (requested != -1) return false;
+    if (!has_metadata) { result = PoolingStrategy::MEAN; return true; }
+    switch (gguf_pooling) {
+    case 1: result = PoolingStrategy::MEAN; return true;
+    case 2: result = PoolingStrategy::CLS; return true;
+    case 3: result = PoolingStrategy::LAST; return true;
+    default: return false; // NONE and RANK do not produce supported sentence vectors.
+    }
+}
 
 /**
  * Configuration for embedding extraction
@@ -60,7 +73,8 @@ struct BatchEmbeddingResult {
  * Get pooling strategy from string (for API compatibility)
  */
 inline PoolingStrategy PoolingFromString(const char* str) {
-    if (!str) return PoolingStrategy::MEAN;
+    if (!str || !str[0]) return PoolingStrategy::AUTO;
+    if (str[0] == 'a' || str[0] == 'A') return PoolingStrategy::AUTO;
 
     if (str[0] == 'm' || str[0] == 'M') {
         if (str[1] == 'e' || str[1] == 'E') return PoolingStrategy::MEAN;
@@ -77,6 +91,7 @@ inline PoolingStrategy PoolingFromString(const char* str) {
  */
 inline const char* PoolingName(PoolingStrategy strategy) {
     switch (strategy) {
+    case PoolingStrategy::AUTO: return "auto";
     case PoolingStrategy::MEAN: return "mean";
     case PoolingStrategy::CLS: return "cls";
     case PoolingStrategy::LAST: return "last";

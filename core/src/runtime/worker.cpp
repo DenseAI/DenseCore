@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include <ggml-cpu.h>
 
 #include <algorithm>

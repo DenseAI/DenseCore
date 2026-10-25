@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -149,75 +150,10 @@ int ReadEnvInt(const char* name, int default_value, bool* was_set = nullptr) {
 
 size_t ReadAvailableMemoryMbForKVAutoSizing() {
     const char* hint = std::getenv("DENSECORE_KV_AVAILABLE_MB_HINT");
-    if (hint && hint[0] != '\0') {
-        char* end = nullptr;
-        const unsigned long long hinted = std::strtoull(hint, &end, 10);
-        if (end != hint && hinted > 0) {
-            return static_cast<size_t>(hinted);
-        }
-    }
-    constexpr unsigned long long MB = 1024ULL * 1024ULL;
-    auto read_ull_file = [](const char* path) -> unsigned long long {
-        std::FILE* file = std::fopen(path, "r");
-        if (!file) {
-            return 0;
-        }
-        char buffer[128] = {};
-        if (!std::fgets(buffer, sizeof(buffer), file)) {
-            std::fclose(file);
-            return 0;
-        }
-        std::fclose(file);
-        if (std::strncmp(buffer, "max", 3) == 0) {
-            return 0;
-        }
-        char* end = nullptr;
-        const unsigned long long value = std::strtoull(buffer, &end, 10);
-        if (end == buffer || value == 0 || value > (1ULL << 50)) {
-            return 0;
-        }
-        return value;
-    };
-
-#if defined(__linux__)
-    size_t cgroup_available_mb = 0;
-    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
-    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
-    if (cgroup_v2_limit > 0) {
-        cgroup_available_mb = static_cast<size_t>(((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
-                                                       ? (cgroup_v2_limit - cgroup_v2_current)
-                                                       : cgroup_v2_limit) /
-                                                  MB);
-    }
-    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-    if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
-        cgroup_available_mb = static_cast<size_t>(((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
-                                                       ? (cgroup_v1_limit - cgroup_v1_current)
-                                                       : cgroup_v1_limit) /
-                                                  MB);
-    }
-
-    std::FILE* file = std::fopen("/proc/meminfo", "r");
-    if (!file) {
-        return cgroup_available_mb;
-    }
-    char line[256] = {};
-    unsigned long long kb = 0;
-    while (std::fgets(line, sizeof(line), file)) {
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-            std::fclose(file);
-            const size_t mem_available_mb = static_cast<size_t>(kb / 1024ULL);
-            if (cgroup_available_mb > 0) {
-                return std::min(mem_available_mb, cgroup_available_mb);
-            }
-            return mem_available_mb;
-        }
-    }
-    std::fclose(file);
-    return cgroup_available_mb;
-#endif
-    return 0;
+    uint64_t mb = 0;
+    if (hint && densecore::runtime::ResourceUnsigned(hint, mb) && mb <= SIZE_MAX / (1024*1024)) return static_cast<size_t>(mb);
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes / (1024*1024)) : 0;
 }
 
 size_t SaturatingMulSize(size_t a, size_t b) {
@@ -478,6 +414,77 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
     return config;
 }
 
+
+// Keep the legacy effective default context, then fit concurrency around it.
+// Explicit context is a contract and must not silently shrink to a KV target.
+KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type) {
+    KVCacheConfig config = ComputeKVCacheConfig(model, requested_cache_type);
+    bool explicit_context = false, explicit_concurrency = false;
+    const int context = ReadEnvInt("DENSECORE_MAX_SEQ_LEN", config.max_seq_len, &explicit_context);
+    const int concurrency = ReadEnvInt("DENSECORE_MAX_NUM_SEQS", 0, &explicit_concurrency);
+    if (explicit_context) config.max_seq_len = context;
+    auto resources = densecore::runtime::DetectResourceBudget();
+    const char* hint = std::getenv("DENSECORE_KV_AVAILABLE_MB_HINT");
+    uint64_t hint_mb = 0;
+    if (hint && densecore::runtime::ResourceUnsigned(hint,hint_mb) && hint_mb <= SIZE_MAX/(1024*1024))
+        resources.memory = {densecore::runtime::ResourceState::Finite, hint_mb*(1024*1024)};
+    if (resources.memory.state != densecore::runtime::ResourceState::Finite) {
+#if defined(__linux__)
+        throw densecore::OutOfMemoryException("resource memory availability unknown; cannot safely initialize");
+#else
+        // Non-Linux detection is not implemented yet. Preserve the previous explicit policy.
+        return config;
+#endif
+    }
+    auto plan_for = [&](int sequences) {
+        densecore::runtime::RuntimeMemoryPlan plan;
+        constexpr uint64_t MB = 1024*1024;
+        plan.available_bytes = resources.memory.bytes;
+        const size_t rounded_context = (static_cast<size_t>(config.max_seq_len) + BLOCK_SIZE-1) / BLOCK_SIZE * BLOCK_SIZE;
+        plan.kv_bytes = SaturatingMulSize(SaturatingMulSize(config.bytes_per_token,rounded_context),sequences);
+        const size_t graph_seq = std::max(1,std::min(config.max_seq_len,2048));
+        const auto graph = EngineState::EstimateGraphContextSize(model,graph_seq,sequences,
+                                  model && model->arch_flags.is_hybrid_ssm ? graph_seq : std::min<size_t>(graph_seq,192));
+        plan.graph_bytes = graph.total_bytes;
+        plan.repack_bytes = std::min<uint64_t>(plan.available_bytes/8,4ULL*1024*MB);
+        if (model && model->arch_flags.is_hybrid_ssm && model->ssm_time_step_rank > 0) {
+            const size_t channels = static_cast<size_t>(std::max(0,model->ssm_inner_size)) +
+                                   2ULL*std::max(0,model->ssm_group_count)*std::max(0,model->ssm_state_size);
+            const size_t conv = SaturatingMulSize(channels,std::max(0,model->ssm_conv_kernel-1));
+            const size_t recurrent = SaturatingMulSize(std::max(0,model->ssm_inner_size),std::max(0,model->ssm_state_size));
+            const size_t per_request = SaturatingMulSize(SaturatingMulSize(conv+recurrent,sizeof(float)),model->ssm_layer_states.size());
+            // Request state + admission snapshot lease + restoration copy.
+            plan.recurrent_bytes = SaturatingMulSize(SaturatingMulSize(per_request,sequences),3);
+            plan.prefix_snapshot_bytes = 512*MB;
+        }
+        // No checkpoints allocated while no MTP profile is qualified. The real
+        // K+1 request-state cost must replace zero when a profile is enabled.
+        plan.mtp_checkpoint_bytes = 0;
+        plan.allocator_bytes = std::max<uint64_t>(256*MB,plan.available_bytes/16);
+        return plan;
+    };
+    const int maximum = explicit_concurrency ? concurrency : 8;
+    for (int sequences = maximum; sequences >= 1; --sequences) {
+        const auto plan = plan_for(sequences);
+        if (plan.Fits()) {
+            config.max_num_seqs = sequences;
+            config.memory_plan = plan;
+            std::cout << "[DenseCore] Resource plan: threads=" << resources.effective_threads
+                      << " context=" << config.max_seq_len << " concurrency=" << sequences
+                      << " required_bytes=" << plan.RequiredBytes() << " available_bytes=" << plan.available_bytes
+                      << " kv=" << plan.kv_bytes << " graph=" << plan.graph_bytes << " repack=" << plan.repack_bytes
+                      << " recurrent=" << plan.recurrent_bytes << " prefix_snapshot=" << plan.prefix_snapshot_bytes
+                      << " mtp_checkpoint=" << plan.mtp_checkpoint_bytes << " allocator=" << plan.allocator_bytes << std::endl;
+            return config;
+        }
+        if (explicit_concurrency) break;
+    }
+    const auto minimum = plan_for(explicit_concurrency ? concurrency : 1);
+    throw densecore::OutOfMemoryException("resource plan required_bytes=" + std::to_string(minimum.RequiredBytes()) +
+               " available_bytes=" + std::to_string(minimum.available_bytes) + " context=" + std::to_string(config.max_seq_len) +
+               " concurrency=" + std::to_string(explicit_concurrency ? concurrency : 1));
+}
+
 namespace {
 
 void SetError(DenseCoreStatus status, const std::string& message) {
@@ -616,13 +623,14 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
         return true;
     }
 
-    TransformerModel* draft_model = LoadModelWithNuma(draft_model_path.c_str(), state->numa_node_id);
+    auto draft_model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(draft_model_path.c_str(), state->numa_node_id));
+    TransformerModel* draft_model = draft_model_owner.get();
     if (!draft_model) {
         SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, std::string(api_name) + ": failed to load draft model");
         return false;
     }
 
-    KVCacheConfig draft_kv_config = ComputeKVCacheConfig(draft_model, cache_type);
+    KVCacheConfig draft_kv_config = ComputeSafeKVCacheConfig(draft_model, cache_type);
     if (draft_kv_config.effective_cache_type != draft_kv_config.requested_cache_type) {
         LOG_WARN("Draft model KV cache request {} is incompatible with head_dim={}, using {} instead",
                  KVCacheTypeDisplayName(draft_kv_config.requested_cache_type), ResolveKVHeadDim(draft_model),
@@ -631,12 +639,11 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
     PagedKVCache* draft_cache = InitPagedKVCache(draft_model, draft_kv_config.max_num_seqs, draft_kv_config.max_seq_len,
                                                  draft_kv_config.effective_cache_type, state->numa_node_id);
     if (!draft_cache) {
-        delete draft_model;
         SetError(DENSECORE_STATUS_OUT_OF_MEMORY, std::string(api_name) + ": failed to initialize draft KV cache");
         return false;
     }
 
-    auto draft_entry = MakeModelEntry("draft", draft_model_path, std::unique_ptr<TransformerModel>(draft_model),
+    auto draft_entry = MakeModelEntry("draft", draft_model_path, std::move(draft_model_owner),
                                       std::unique_ptr<PagedKVCache>(draft_cache));
 
     state->models["draft"] = std::move(draft_entry);
@@ -817,7 +824,7 @@ int ResolveEngineThreadCount(int threads) {
     if (threads <= 0) {
         threads = densecore::simd::GetNumCores();
     }
-    return threads;
+    return std::max(1, std::min(threads, densecore::runtime::DetectResourceBudget().effective_threads));
 }
 
 void InitializeRuntimeBackends(int threads) {
@@ -861,7 +868,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
 
     const ggml_type default_cache_type = ResolveDefaultKVCacheType(model);
     state->requested_kv_cache_type = default_cache_type;
-    const KVCacheConfig kv_config = ComputeKVCacheConfig(model, default_cache_type);
+    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type);
     std::cout << "[DenseCore] Auto-configured max_seq_len: " << kv_config.max_seq_len << " (KV capacity: ~"
               << (kv_config.bytes_per_token * kv_config.max_seq_len *
                   static_cast<size_t>(std::max(1, kv_config.max_num_seqs)) / 1024 / 1024)
@@ -1051,9 +1058,7 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
 
         // Reuse InitEngineEx logic but with custom KV cache type
         // Thread configuration
-        if (threads <= 0) {
-            threads = densecore::simd::GetNumCores();
-        }
+        threads = ResolveEngineThreadCount(threads);
         std::cout << "[DenseCore] Threading configured: " << threads << " threads" << std::endl;
 
         // SIMD dispatch initialization
@@ -1083,7 +1088,7 @@ DENSECORE_API DenseCoreHandle InitEngineWithKVType(const char* model_path, const
         state->op_registry = std::make_unique<densecore::OpRegistry>();
         state->InitializeExecutionDependencies(threads);
 
-        KVCacheConfig kv_config = ComputeKVCacheConfig(model, cache_type);
+        KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, cache_type);
         if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
             std::cout << "[DenseCore] Requested " << KVCacheTypeDisplayName(kv_config.requested_cache_type)
                       << " KV cache is not supported for this model/runtime; using "
@@ -1619,69 +1624,84 @@ void FreeEngine(DenseCoreHandle handle) {
 // Multi-Model API implementations
 
 int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_path, int /*threads*/) {
-    if (!handle || !model_id || !model_path) {
-        SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "LoadModel: invalid arguments");
-        return DENSECORE_STATUS_INVALID_ARGUMENT;
-    }
-
-    EngineState* state = (EngineState*)handle;
-    std::string canonical_model_path;
-    if (!ValidateModelPathArg(model_path, "LoadModel", "model_path", &canonical_model_path)) {
-        return DENSECORE_STATUS_INVALID_ARGUMENT;
-    }
-
-    // Check if model already exists
-    {
-        std::lock_guard<std::mutex> lock(state->models_mu);
-        if (state->models.find(model_id) != state->models.end()) {
-            std::cerr << "[DenseCore] Model " << model_id << " already loaded" << std::endl;
-            SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "LoadModel: model already loaded");
+    try {
+        if (!handle || !model_id || !model_path) {
+            SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "LoadModel: invalid arguments");
             return DENSECORE_STATUS_INVALID_ARGUMENT;
         }
-    }
 
-#ifdef LOG_INFO
-    LOG_INFO("Loading model from: ", model_path);
-#endif
-    TransformerModel* model = LoadModelWithNuma(canonical_model_path.c_str(), state->numa_node_id);
-    if (!model) {
-#ifdef LOG_ERROR
-        LOG_ERROR("Failed to load main model");
-#else
-        std::cerr << "[DenseCore] Failed to load model from " << model_path << std::endl;
-#endif
-        SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "LoadModel: failed to load model");
-        return DENSECORE_STATUS_MODEL_LOAD_FAILED;
-    }
-
-    // Initialize KV cache for this model
-    KVCacheConfig kv_config = ComputeKVCacheConfig(model, state->requested_kv_cache_type);
-    PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
-                                           kv_config.effective_cache_type, state->numa_node_id);
-    if (!cache) {
-        delete model;
-        std::cerr << "[DenseCore] Failed to initialize KV cache for " << model_id << std::endl;
-        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "LoadModel: failed to initialize KV cache");
-        return DENSECORE_STATUS_OUT_OF_MEMORY;
-    }
-
-    // Create model entry with unique_ptr ownership
-    auto entry = MakeModelEntry(model_id, canonical_model_path, std::unique_ptr<TransformerModel>(model),
-                                std::unique_ptr<PagedKVCache>(cache));
-
-    // Add to pool
-    {
-        std::lock_guard<std::mutex> lock(state->models_mu);
-        state->models[model_id] = std::move(entry);
-
-        // Set as default if no default exists
-        if (state->default_model_id.empty()) {
-            state->default_model_id = model_id;
+        EngineState* state = (EngineState*)handle;
+        std::string canonical_model_path;
+        if (!ValidateModelPathArg(model_path, "LoadModel", "model_path", &canonical_model_path)) {
+            return DENSECORE_STATUS_INVALID_ARGUMENT;
         }
+
+        // Check if model already exists
+        {
+            std::lock_guard<std::mutex> lock(state->models_mu);
+            if (state->models.find(model_id) != state->models.end()) {
+                std::cerr << "[DenseCore] Model " << model_id << " already loaded" << std::endl;
+                SetError(DENSECORE_STATUS_INVALID_ARGUMENT, "LoadModel: model already loaded");
+                return DENSECORE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+
+    #ifdef LOG_INFO
+        LOG_INFO("Loading model from: ", model_path);
+    #endif
+        auto model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(canonical_model_path.c_str(), state->numa_node_id));
+        TransformerModel* model = model_owner.get();
+        if (!model) {
+    #ifdef LOG_ERROR
+            LOG_ERROR("Failed to load main model");
+    #else
+            std::cerr << "[DenseCore] Failed to load model from " << model_path << std::endl;
+    #endif
+            SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "LoadModel: failed to load model");
+            return DENSECORE_STATUS_MODEL_LOAD_FAILED;
+        }
+
+        // Initialize KV cache for this model
+        KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, state->requested_kv_cache_type);
+        PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
+                                               kv_config.effective_cache_type, state->numa_node_id);
+        if (!cache) {
+            std::cerr << "[DenseCore] Failed to initialize KV cache for " << model_id << std::endl;
+            SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "LoadModel: failed to initialize KV cache");
+            return DENSECORE_STATUS_OUT_OF_MEMORY;
+        }
+
+        // Create model entry with unique_ptr ownership
+        auto entry = MakeModelEntry(model_id, canonical_model_path, std::move(model_owner),
+                                    std::unique_ptr<PagedKVCache>(cache));
+
+        // Add to pool
+        {
+            std::lock_guard<std::mutex> lock(state->models_mu);
+            state->models[model_id] = std::move(entry);
+
+            // Set as default if no default exists
+            if (state->default_model_id.empty()) {
+                state->default_model_id = model_id;
+            }
+        }
+
+        ClearError();
+        return 0;
+    } catch (const densecore::DenseCoreException& ex) {
+        SetError(MapErrorCodeToStatus(ex.Code()), ex.what());
+        return MapErrorCodeToStatus(ex.Code());
+    } catch (const std::bad_alloc&) {
+        SetError(DENSECORE_STATUS_OUT_OF_MEMORY, "LoadModel: allocation failed");
+        return DENSECORE_STATUS_OUT_OF_MEMORY;
+    } catch (const std::exception& ex) {
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR, ex.what());
+        return DENSECORE_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        SetError(DENSECORE_STATUS_INTERNAL_ERROR, "LoadModel: unknown error");
+        return DENSECORE_STATUS_INTERNAL_ERROR;
     }
 
-    ClearError();
-    return 0;
 }
 
 int UnloadModel(DenseCoreHandle handle, const char* model_id) {
@@ -1984,6 +2004,30 @@ DENSECORE_API int ExecuteGraphSync(DenseCoreHandle handle, const DenseCoreTensor
         return DENSECORE_STATUS_OK;
     } catch (const std::exception& e) {
         SetError(DENSECORE_STATUS_INTERNAL_ERROR, std::string("ExecuteGraphSync error: ") + e.what());
+        return DENSECORE_STATUS_INTERNAL_ERROR;
+    }
+}
+
+int DenseCoreGetResourceBudget(DenseCoreResourceBudget* out) {
+    if (!out || out->struct_size < sizeof(DenseCoreResourceBudget) || out->version != 1) {
+        SetLastError(DENSECORE_STATUS_INVALID_ARGUMENT, "DenseCoreGetResourceBudget: expected version 1 and full struct_size");
+        return DENSECORE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        const auto budget = densecore::runtime::DetectResourceBudget();
+        out->memory_state = static_cast<uint32_t>(budget.memory.state);
+        out->memory_limit_state = static_cast<uint32_t>(budget.cgroup_memory_limit.state);
+        out->memory_available_bytes = budget.memory.bytes;
+        out->memory_limit_bytes = budget.cgroup_memory_limit.bytes;
+        out->cpu_quota_state = static_cast<uint32_t>(budget.cpu_quota_state);
+        out->effective_threads = static_cast<uint32_t>(budget.effective_threads);
+        out->cpu_quota = budget.cpu_quota;
+        return DENSECORE_STATUS_OK;
+    } catch (const std::exception& ex) {
+        SetLastError(DENSECORE_STATUS_INTERNAL_ERROR, ex.what());
+        return DENSECORE_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        SetLastError(DENSECORE_STATUS_INTERNAL_ERROR, "DenseCoreGetResourceBudget: detection failed");
         return DENSECORE_STATUS_INTERNAL_ERROR;
     }
 }

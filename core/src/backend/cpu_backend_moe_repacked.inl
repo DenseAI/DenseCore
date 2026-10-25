@@ -11,19 +11,10 @@ static_assert(sizeof(MoEQ5Kx8Block) == 16 * sizeof(uint16_t) + 8 * K_SCALE_SIZE 
               "MoE Q5_Kx8 block layout must match ggml block_q5_Kx8");
 
 size_t GetRepackedMoECacheLimitBytes() {
-    constexpr size_t kMinBytes = 1024ull * 1024ull * 1024ull;
-    constexpr size_t kMaxBytes = 4ull * 1024ull * 1024ull * 1024ull;
-#if defined(__linux__)
-    struct sysinfo info {};
-    if (sysinfo(&info) == 0 && info.mem_unit > 0) {
-        const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-        const uint64_t free_bytes =
-            (static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit;
-        const size_t target = static_cast<size_t>(free_bytes / 8);
-        return std::clamp(target, kMinBytes, kMaxBytes);
-    }
-#endif
-    return 2ull * 1024ull * 1024ull * 1024ull;
+    constexpr size_t kMaxBytes = 4ull * 1024 * 1024 * 1024;
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite
+               ? std::min(static_cast<size_t>(memory.bytes / 8), kMaxBytes) : 0;
 }
 
 struct RepackedMoEKey {
@@ -111,11 +102,6 @@ std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void
         !CanUseQ5KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
-    if (cache_limit == 0) {
-        return nullptr;
-    }
-
     static std::mutex mutex;
     static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q5KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
     static size_t cache_bytes = 0;
@@ -132,8 +118,12 @@ std::shared_ptr<Q5KRepackedMoEWeight> GetOrCreateQ5KRepackedMoEWeight(const void
         return found->second;
     }
 
+    // Cached weights allocate nothing; probe resource files only on a miss.
+    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
+    if (cache_limit == 0) return nullptr;
     const int64_t blocks_per_row = cols / QK_K;
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
+    if (packed_blocks > cache_limit / sizeof(MoEQ5Kx8Block)) return nullptr;
     auto packed = std::make_shared<Q5KRepackedMoEWeight>();
     packed->rows = rows;
     packed->cols = cols;
@@ -174,11 +164,6 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
         !CanUseQ6KRepackedMoEGemvFastPath()) {
         return nullptr;
     }
-    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
-    if (cache_limit == 0) {
-        return nullptr;
-    }
-
     static std::mutex mutex;
     static std::unordered_map<RepackedMoEKey, std::shared_ptr<Q6KRepackedMoEWeight>, RepackedMoEKeyHash> cache;
     static size_t cache_bytes = 0;
@@ -195,8 +180,12 @@ std::shared_ptr<Q6KRepackedMoEWeight> GetOrCreateQ6KRepackedMoEWeight(const void
         return found->second;
     }
 
+    // Cached weights allocate nothing; probe resource files only on a miss.
+    const size_t cache_limit = GetRepackedMoECacheLimitBytes();
+    if (cache_limit == 0) return nullptr;
     const int64_t blocks_per_row = cols / QK_K;
     const size_t packed_blocks = static_cast<size_t>(rows / 8) * static_cast<size_t>(blocks_per_row);
+    if (packed_blocks > cache_limit / kMoEQ6Kx8BlockBytes) return nullptr;
     auto packed = std::make_shared<Q6KRepackedMoEWeight>();
     packed->weight_ptr = weight_ptr;
     packed->fingerprint = key.fingerprint;

@@ -551,10 +551,28 @@ void BlockManager::RegisterPrefixBlockWithTokens(
     } else {
         block_tokens.erase(block_id);
     }
+    // Remove the old value before accounting; failed admission is a cache miss,
+    // never a partially copied recurrent state.
+    block_hybrid_ssm_snapshots.erase(block_id);
     if (hybrid_ssm_snapshot && !hybrid_ssm_snapshot->empty()) {
-        block_hybrid_ssm_snapshots[block_id] = *hybrid_ssm_snapshot;
-    } else {
-        block_hybrid_ssm_snapshots.erase(block_id);
+        auto snapshot_bytes = [](const std::vector<TransformerModel::SSMSequenceRuntimeState>& snapshot) {
+            size_t total = 0;
+            for (const auto& state : snapshot) {
+                for (size_t elements : {state.conv_state.size(), state.ssm_state.size()}) {
+                    if (elements > (SIZE_MAX - total) / sizeof(float)) return SIZE_MAX;
+                    total += elements * sizeof(float);
+                }
+            }
+            return total;
+        };
+        size_t remaining = max_hybrid_ssm_snapshot_bytes;
+        for (const auto& entry : block_hybrid_ssm_snapshots) {
+            const size_t bytes = snapshot_bytes(entry.second);
+            remaining = bytes >= remaining ? 0 : remaining - bytes;
+        }
+        if (snapshot_bytes(*hybrid_ssm_snapshot) <= remaining) {
+            block_hybrid_ssm_snapshots.emplace(block_id, *hybrid_ssm_snapshot);
+        }
     }
 }
 

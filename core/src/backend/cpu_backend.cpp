@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 /**
  * @file cpu_backend.cpp
  * @brief Cross-platform CPU backend implementation

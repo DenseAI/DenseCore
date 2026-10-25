@@ -110,6 +110,23 @@ DENSECORE_API const DenseCoreVersionInfo* GetLibraryVersion(void);
  */
 DENSECORE_API const char* GetLibraryVersionString(void);
 
+/** Versioned resource snapshot. Initialize struct_size=sizeof(...), version=1.
+ * State values: 0=unknown/detection failure, 1=finite (zero means exhausted), 2=unlimited.
+ * memory_available_bytes includes current process cgroup ancestors and host availability.
+ */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t memory_state;
+    uint32_t memory_limit_state;
+    uint64_t memory_available_bytes;
+    uint64_t memory_limit_bytes;
+    uint32_t cpu_quota_state;
+    uint32_t effective_threads;
+    double cpu_quota;
+} DenseCoreResourceBudget;
+DENSECORE_API int DenseCoreGetResourceBudget(DenseCoreResourceBudget* budget);
+
 /// Opaque handle to the DenseCore engine
 typedef void* DenseCoreHandle;
 
@@ -714,7 +731,7 @@ DENSECORE_API int SubmitEmbeddingRequest(DenseCoreHandle handle, const char* pro
  *
  * @param handle Handle to the DenseCore engine
  * @param prompt Input text
- * @param pooling_type Pooling strategy: 0=MEAN, 1=CLS, 2=LAST, 3=MAX
+ * @param pooling_type Pooling strategy: -1=AUTO (model metadata, MEAN if absent), 0=MEAN, 1=CLS, 2=LAST, 3=MAX
  * @param normalize Whether to L2 normalize (1=yes, 0=no)
  * @param callback Function pointer for returning embedding
  * @param user_data User data
@@ -733,7 +750,7 @@ DENSECORE_API int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* p
  * @param handle Handle to the DenseCore engine
  * @param prompts Array of input texts
  * @param num_prompts Number of prompts
- * @param pooling_type Pooling strategy: 0=MEAN, 1=CLS, 2=LAST, 3=MAX
+ * @param pooling_type Pooling strategy: -1=AUTO (model metadata, MEAN if absent), 0=MEAN, 1=CLS, 2=LAST, 3=MAX
  * @param normalize Whether to L2 normalize
  * @param callback Callback for each embedding (called num_prompts times)
  * @param user_data User data

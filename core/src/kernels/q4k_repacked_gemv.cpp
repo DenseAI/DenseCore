@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include "kernels/q4k_repacked_gemv.h"
 
 #include <algorithm>
@@ -82,71 +83,8 @@ std::atomic<size_t>& RuntimeAutoCacheFloorBytes() {
 }
 
 size_t ReadAvailableMemoryBytes() {
-#if defined(__linux__)
-    auto read_ull_file = [](const char* path) -> unsigned long long {
-        std::FILE* file = std::fopen(path, "r");
-        if (!file) {
-            return 0;
-        }
-        char buffer[128] = {};
-        if (!std::fgets(buffer, sizeof(buffer), file)) {
-            std::fclose(file);
-            return 0;
-        }
-        std::fclose(file);
-        if (std::strncmp(buffer, "max", 3) == 0) {
-            return 0;
-        }
-        char* end = nullptr;
-        const unsigned long long value = std::strtoull(buffer, &end, 10);
-        if (end == buffer || value == 0 || value > (1ULL << 50)) {
-            return 0;
-        }
-        return value;
-    };
-
-    size_t cgroup_available_bytes = 0;
-    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
-    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
-    if (cgroup_v2_limit > 0) {
-        cgroup_available_bytes = static_cast<size_t>((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
-                                                         ? (cgroup_v2_limit - cgroup_v2_current)
-                                                         : cgroup_v2_limit);
-    }
-    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-    if (cgroup_available_bytes == 0 && cgroup_v1_limit > 0) {
-        cgroup_available_bytes = static_cast<size_t>((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
-                                                         ? (cgroup_v1_limit - cgroup_v1_current)
-                                                         : cgroup_v1_limit);
-    }
-
-    std::FILE* file = std::fopen("/proc/meminfo", "r");
-    if (file) {
-        char line[256] = {};
-        unsigned long long kb = 0;
-        while (std::fgets(line, sizeof(line), file)) {
-            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-                std::fclose(file);
-                const size_t mem_available_bytes = static_cast<size_t>(kb) * 1024ull;
-                return cgroup_available_bytes > 0 ? std::min(mem_available_bytes, cgroup_available_bytes)
-                                                  : mem_available_bytes;
-            }
-        }
-        std::fclose(file);
-    }
-    if (cgroup_available_bytes > 0) {
-        return cgroup_available_bytes;
-    }
-    struct sysinfo info {};
-    if (sysinfo(&info) == 0 && info.mem_unit > 0) {
-        const uint64_t unit = static_cast<uint64_t>(info.mem_unit);
-        const size_t sys_available_bytes =
-            static_cast<size_t>((static_cast<uint64_t>(info.freeram) + static_cast<uint64_t>(info.bufferram)) * unit);
-        return cgroup_available_bytes > 0 ? std::min(sys_available_bytes, cgroup_available_bytes) : sys_available_bytes;
-    }
-#endif
-    return 0;
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes) : 0;
 }
 
 size_t ManualCacheLimitBytes() {
@@ -217,7 +155,7 @@ size_t Q4KRepackedGemvCacheLimitBytes() {
 size_t Q4KRepackedGemvAutoCacheLimitBytes(size_t reserved_bytes) {
     const size_t available_bytes = ReadAvailableMemoryBytes();
     if (available_bytes == 0) {
-        return 1024ull * kMiB;
+        return 0;
     }
     const size_t runtime_headroom = std::max<size_t>(available_bytes / 8, 512ull * kMiB);
     if (available_bytes <= reserved_bytes + runtime_headroom) {

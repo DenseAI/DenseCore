@@ -815,9 +815,9 @@ func (e *DenseEngine) CancelRequest(reqID uintptr) {
 	C.CancelRequestWrapper(e.handle, C.int(reqID))
 }
 
-// GetEmbeddings (Non-blocking) - default: MEAN pooling with normalization
+// GetEmbeddings (Non-blocking) - default: model metadata pooling with normalization
 func (e *DenseEngine) GetEmbeddings(prompt string) ([]float32, error) {
-	return e.GetEmbeddingsWithOptions(prompt, "mean", nil)
+	return e.GetEmbeddingsWithOptions(prompt, "auto", nil)
 }
 
 // GetEmbeddingsWithOptions - with pooling type and normalization control
@@ -830,7 +830,7 @@ func (e *DenseEngine) GetEmbeddingsWithOptions(prompt string, poolingType string
 	embeddingChannels.Store(uintptr(id), outputChan)
 
 	// Map pooling type to integer
-	poolingInt := 0 // default: MEAN
+	poolingInt := -1 // default: AUTO; native resolves GGUF metadata
 	switch poolingType {
 	case "mean":
 		poolingInt = 0
@@ -1201,4 +1201,21 @@ func (e *DenseEngine) RenderChatPrompt(messages []domain.Message, enableThinking
 		result.PromptFamily = C.GoString(rendered.prompt_family)
 	}
 	return result, nil
+}
+
+// nativeResourceBudget uses the same process/cgroup interpretation as native inference.
+func nativeResourceBudget() (threads int, quota float64, memoryLimit int64, ok bool) {
+	budget := C.DenseCoreResourceBudget{}
+	budget.struct_size = C.uint32_t(unsafe.Sizeof(budget))
+	budget.version = 1
+	if C.DenseCoreGetResourceBudget(&budget) != 0 {
+		return 0, 0, 0, false
+	}
+	if budget.memory_limit_state == 1 && uint64(budget.memory_limit_bytes) <= uint64(^uint64(0)>>1) {
+		memoryLimit = int64(budget.memory_limit_bytes)
+	}
+	if budget.cpu_quota_state == 1 {
+		quota = float64(budget.cpu_quota)
+	}
+	return int(budget.effective_threads), quota, memoryLimit, true
 }

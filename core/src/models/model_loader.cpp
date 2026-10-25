@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include "densecore/models/model_loader.h"
 
 #include <ggml-alloc.h>
@@ -396,22 +397,8 @@ bool ResolveStackedInt4ViewBinding(ggml_context* vctx, const ggml_tensor* root_t
 constexpr size_t kGemma4RequantSafetyHeadroomBytes = size_t{8} * 1024 * 1024 * 1024;
 
 size_t ReadMemAvailableBytes() {
-#if defined(__linux__)
-    std::ifstream meminfo("/proc/meminfo");
-    std::string key;
-    uint64_t value_kib = 0;
-    std::string unit;
-    while (meminfo >> key >> value_kib >> unit) {
-        if (key == "MemAvailable:") {
-            constexpr uint64_t kBytesPerKiB = 1024;
-            if (value_kib > std::numeric_limits<size_t>::max() / kBytesPerKiB) {
-                return std::numeric_limits<size_t>::max();
-            }
-            return static_cast<size_t>(value_kib * kBytesPerKiB);
-        }
-    }
-#endif
-    return 0;
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes) : 0;
 }
 
 size_t Requantized3DQ8Bytes(int64_t ne0, int64_t ne1, int64_t ne2) {
@@ -3359,6 +3346,14 @@ TransformerModel* LoadGGUFModel(const char* path) {
     model->tokenizer_add_eos = idx_add_eos != -1 && gguf_get_kv_type(ctx_gguf, idx_add_eos) == GGUF_TYPE_BOOL &&
                                gguf_get_val_bool(ctx_gguf, idx_add_eos);
 
+
+    const std::string pooling_key = arch_lower + ".pooling_type";
+    const int pooling_idx = gguf_find_key(ctx_gguf, pooling_key.c_str());
+    model->has_pooling_metadata = pooling_idx >= 0;
+    uint64_t pooling_value = 0;
+    model->gguf_pooling_type = GetGgufNonNegativeInteger(ctx_gguf, pooling_key.c_str(), &pooling_value) &&
+                                      pooling_value <= static_cast<uint64_t>(std::numeric_limits<int>::max())
+                                  ? static_cast<int>(pooling_value) : -1;
 
     // 2. Load Vocab
     int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");

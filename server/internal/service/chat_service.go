@@ -520,7 +520,7 @@ func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, err
 // This is more efficient than calling GetEmbeddings in a loop as it reduces
 // per-call overhead, though the underlying engine still processes sequentially.
 func (s *ChatService) GetBatchEmbeddings(texts []string) ([][]float32, error) {
-	return s.GetBatchEmbeddingsWithOptions(texts, "mean", nil)
+	return s.GetBatchEmbeddingsWithOptions(texts, "auto", nil)
 }
 
 // GetBatchEmbeddingsWithOptions processes multiple texts with explicit pooling and normalization.
@@ -546,10 +546,10 @@ func (s *ChatService) GetBatchEmbeddingsWithOptions(texts []string, poolingType 
 
 func normalizePoolingType(poolingType string) string {
 	switch strings.ToLower(strings.TrimSpace(poolingType)) {
-	case "cls", "last", "max":
+	case "mean", "cls", "last", "max":
 		return strings.ToLower(strings.TrimSpace(poolingType))
 	default:
-		return "mean"
+		return "auto"
 	}
 }
 

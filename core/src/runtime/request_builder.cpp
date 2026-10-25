@@ -591,8 +591,8 @@ int DenseCoreSetGenerationCompletionCallback(DenseCoreHandle handle, GenerationC
 
 
 int SubmitEmbeddingRequest(DenseCoreHandle handle, const char* prompt, EmbeddingCallback callback, void* user_data) {
-    // Default: MEAN pooling with normalization
-    return SubmitEmbeddingRequestEx(handle, prompt, 0, 1, callback, user_data);
+    // Default: resolve GGUF pooling metadata with normalization
+    return SubmitEmbeddingRequestEx(handle, prompt, -1, 1, callback, user_data);
 }
 
 int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int pooling_type, int normalize,
@@ -630,8 +630,13 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt, int poo
         req->embedding_callback = callback;
         req->user_data = user_data;
 
-        // Store pooling config
-        req->pooling_type = static_cast<densecore::PoolingStrategy>(pooling_type);
+        // Resolve AUTO before queueing; unsupported metadata fails without executing a request.
+        if (!densecore::ResolveEmbeddingPooling(pooling_type, model_entry->model->has_pooling_metadata,
+                                               model_entry->model->gguf_pooling_type, req->pooling_type)) {
+            SetError(DENSECORE_STATUS_INVALID_ARGUMENT,
+                     "SubmitEmbeddingRequestEx: unsupported pooling_type or model pooling metadata");
+            return DENSECORE_STATUS_INVALID_ARGUMENT;
+        }
         req->normalize_embedding = (normalize != 0);
 
         // Embedding models can pool the EOS hidden state (e.g. Qwen3-Embedding).

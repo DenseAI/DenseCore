@@ -566,6 +566,8 @@ struct TransformerModel {
     ModelArch arch = ModelArch::UNKNOWN;
     ModelVariant variant = ModelVariant::UNKNOWN;
     ModelArchFlags arch_flags;
+    bool has_pooling_metadata = false;
+    int gguf_pooling_type = -1; // GGUF enum; explicitly converted to native pooling at submission.
     uint32_t gguf_declared_layer_count = 0;
     uint32_t skipped_mtp_layer_count = 0;
     // Original trailing GGUF blocks, excluded from hparams.n_layer/layers and

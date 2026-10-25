@@ -5,74 +5,12 @@ bool IsFlexibleGraphPoolSizingEnabled(const TransformerModel* model) {
 
 size_t ReadAvailableMemoryBytesForRuntimePools() {
     const char* hint = std::getenv("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT");
-    if (hint && hint[0] != '\0') {
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long long hinted_mb = std::strtoull(hint, &end, 10);
-        if (errno == 0 && end != hint && *end == '\0' && hinted_mb > 0) {
-            return static_cast<size_t>(hinted_mb) * 1024ULL * 1024ULL;
-        }
+    if (hint && hint[0]) {
+        uint64_t mb = 0;
+        if (densecore::runtime::ResourceUnsigned(hint, mb) && mb <= SIZE_MAX / (1024*1024)) return mb * (1024*1024);
     }
-#if defined(__linux__)
-    auto read_ull_file = [](const char* path) -> unsigned long long {
-        std::FILE* f = std::fopen(path, "r");
-        if (!f) {
-            return 0;
-        }
-        char buffer[128] = {};
-        if (!std::fgets(buffer, sizeof(buffer), f)) {
-            std::fclose(f);
-            return 0;
-        }
-        std::fclose(f);
-        if (std::strncmp(buffer, "max", 3) == 0) {
-            return 0;
-        }
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long long value = std::strtoull(buffer, &end, 10);
-        if (errno != 0 || end == buffer || value == 0 || value > (1ULL << 50)) {
-            return 0;
-        }
-        return value;
-    };
-
-    size_t cgroup_available_bytes = 0;
-    const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
-    const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
-    if (cgroup_v2_limit > 0) {
-        cgroup_available_bytes =
-            static_cast<size_t>((cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current)
-                                    ? (cgroup_v2_limit - cgroup_v2_current)
-                                    : cgroup_v2_limit);
-    }
-    const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-    if (cgroup_available_bytes == 0 && cgroup_v1_limit > 0) {
-        cgroup_available_bytes =
-            static_cast<size_t>((cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current)
-                                    ? (cgroup_v1_limit - cgroup_v1_current)
-                                    : cgroup_v1_limit);
-    }
-
-    std::FILE* file = std::fopen("/proc/meminfo", "r");
-    if (!file) {
-        return cgroup_available_bytes;
-    }
-    char line[256] = {};
-    unsigned long long kb = 0;
-    while (std::fgets(line, sizeof(line), file)) {
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-            std::fclose(file);
-            const size_t mem_available_bytes = static_cast<size_t>(kb) * 1024ULL;
-            return cgroup_available_bytes > 0 ? std::min(mem_available_bytes, cgroup_available_bytes)
-                                              : mem_available_bytes;
-        }
-    }
-    std::fclose(file);
-    return cgroup_available_bytes;
-#endif
-    return 0;
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes) : 0;
 }
 
 void AccumulateDryRunTensorBytes(const ggml_tensor* tensor, std::unordered_set<const ggml_tensor*>& seen,
@@ -112,7 +50,7 @@ struct RuntimeGraphPoolReservation {
 
 bool GraphPoolReplacementFits(size_t target_bytes, size_t safety_margin_bytes, size_t available_bytes) {
     if (available_bytes == 0) {
-        return true;
+        return target_bytes == 0 && safety_margin_bytes == 0;
     }
     return target_bytes <= available_bytes && safety_margin_bytes <= available_bytes - target_bytes;
 }

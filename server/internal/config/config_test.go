@@ -87,3 +87,10 @@ func TestValidateRejectsUnknownDenseCorePerformanceKnobs(t *testing.T) {
 		t.Fatal("expected invalid benchmark profile error")
 	}
 }
+
+func TestDefaultConcurrencyLeavesNativeMemoryPlanningAutomatic(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.MaxNumSeqs != 0 {
+		t.Fatalf("MaxNumSeqs=%d, want auto (0)", cfg.MaxNumSeqs)
+	}
+}

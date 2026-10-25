@@ -681,3 +681,53 @@ TEST(EngineKVCacheConfig, C4AQwen36AdmitsWaitingPrefillBeforeAdvancingDecodeCoho
     EXPECT_FALSE(BuildRuntimeSchedulerConfig(config, &model).fill_slots_before_first_decode);
     EXPECT_FALSE(BuildRuntimeSchedulerConfig(config).fill_slots_before_first_decode);
 }
+
+TEST(EngineKVCacheConfig, SafeAutoConcurrencyKeepsLegacyEffectiveContext) {
+    ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "32");
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", nullptr);
+    ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "16384");
+    auto model = MakeModel(64, 4, 4);
+    model.hparams.n_ctx = 8192;
+    const auto legacy = ComputeKVCacheConfig(&model, GGML_TYPE_F16);
+    const auto safe = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+    EXPECT_EQ(safe.max_seq_len, legacy.max_seq_len);
+    EXPECT_EQ(safe.max_num_seqs, 8);
+    EXPECT_TRUE(safe.memory_plan.Fits());
+    EXPECT_GT(safe.memory_plan.graph_bytes, 0u);
+    EXPECT_GT(safe.memory_plan.repack_bytes, 0u);
+}
+TEST(EngineKVCacheConfig, SafeExplicitContextRemainsExactAndCapacityFailureIsExplicit) {
+    ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "32");
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "8192");
+    ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", "2");
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "16384");
+    auto model = MakeModel(64, 4, 4);
+    model.hparams.n_ctx = 8192;
+    auto safe = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+    EXPECT_EQ(safe.max_seq_len, 8192);
+    EXPECT_EQ(safe.max_num_seqs, 2);
+    {
+        ScopedEnvVar exhausted("DENSECORE_KV_AVAILABLE_MB_HINT", "0");
+        try {
+            ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+            FAIL() << "exhausted budget must fail initialization";
+        } catch (const std::exception& ex) {
+            EXPECT_NE(std::string(ex.what()).find("required_bytes="), std::string::npos);
+            EXPECT_NE(std::string(ex.what()).find("available_bytes=0"), std::string::npos);
+        }
+    }
+}
+TEST(EngineKVCacheConfig, SafeAutoConcurrencyReducesSequencesInsteadOfEffectiveContext) {
+    ScopedEnvVar target("DENSECORE_KV_TARGET_MB", "128");
+    ScopedEnvVar context("DENSECORE_MAX_SEQ_LEN", "4096");
+    ScopedEnvVar concurrency("DENSECORE_MAX_NUM_SEQS", nullptr);
+    ScopedEnvVar memory("DENSECORE_KV_AVAILABLE_MB_HINT", "2048");
+    auto model = MakeModel(128, 16, 8);
+    model.hparams.n_ctx = 4096;
+    auto safe = ComputeSafeKVCacheConfig(&model, GGML_TYPE_F16);
+    EXPECT_EQ(safe.max_seq_len, 4096);
+    EXPECT_GE(safe.max_num_seqs, 1);
+    EXPECT_LT(safe.max_num_seqs, 8);
+    EXPECT_TRUE(safe.memory_plan.Fits());
+}

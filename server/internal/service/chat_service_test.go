@@ -973,3 +973,16 @@ func TestPreparedGenerationInputPreservesSubmissionPrecedence(t *testing.T) {
 		})
 	}
 }
+
+func TestEmbeddingPoolingDefaultPreservesNativeAuto(t *testing.T) {
+	for _, value := range []string{"", "auto", " AUTO "} {
+		if got := normalizePoolingType(value); got != "auto" {
+			t.Fatalf("pooling %q: got %q", value, got)
+		}
+	}
+	for _, value := range []string{"mean", "cls", "last", "max"} {
+		if got := normalizePoolingType(value); got != value {
+			t.Fatalf("pooling %q: got %q", value, got)
+		}
+	}
+}

@@ -1092,3 +1092,9 @@ TEST(DecodeThreadPolicy, ExplicitGraphContextMaxNeverUndercutsMeasuredRequiredFl
 }
 
 }  // namespace
+
+TEST(DecodeThreadPolicy, ExhaustedMemoryDoesNotAdmitGraphPoolGrowth) {
+    EXPECT_FALSE(GraphPoolReplacementFitsForTest(1, 0, 0));
+    EXPECT_FALSE(GraphPoolReplacementFitsForTest(0, 1, 0));
+    EXPECT_TRUE(GraphPoolReplacementFitsForTest(0, 0, 0));
+}

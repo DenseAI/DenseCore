@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #ifndef DENSECORE_ENGINE_INTERNAL_H
 #define DENSECORE_ENGINE_INTERNAL_H
 
@@ -91,6 +92,7 @@ struct KVCacheConfig {
     int max_seq_len = 4096;
     size_t target_kv_memory = 512ULL * 1024ULL * 1024ULL;
     size_t bytes_per_token = 0;
+    densecore::runtime::RuntimeMemoryPlan memory_plan{};
     ggml_type requested_cache_type = GGML_TYPE_F16;
     ggml_type effective_cache_type = GGML_TYPE_F16;
 };
@@ -102,6 +104,7 @@ ggml_type ResolveEffectiveKVCacheType(const TransformerModel* model, ggml_type r
 size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_head_dim, int n_head_kv, int n_layer,
                                    int index_head_dim = 0);
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
+KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 densecore::SchedulerConfig BuildRuntimeSchedulerConfig(const KVCacheConfig& kv_config,
                                                       const TransformerModel* model = nullptr);
 
@@ -1866,61 +1869,8 @@ struct EngineState {
                     return static_cast<size_t>(hinted_mb);
                 }
             }
-#if defined(__linux__)
-            auto read_ull_file = [&](const char* path) -> unsigned long long {
-                std::FILE* file = std::fopen(path, "r");
-                if (!file) return 0;
-                char buffer[128] = {};
-                const char* line = std::fgets(buffer, sizeof(buffer), file);
-                std::fclose(file);
-                if (!line) return 0;
-                if (std::strncmp(buffer, "max", 3) == 0) return 0;
-                const unsigned long long bytes = parse_positive_ull(buffer);
-                if (bytes == 0 || bytes > (1ULL << 50)) return 0;  // Treat absurd values as "unlimited".
-                return bytes;
-            };
-            auto read_mem_available_mb = [&]() -> size_t {
-                std::FILE* file = std::fopen("/proc/meminfo", "r");
-                if (!file) return 0;
-                char line[256] = {};
-                unsigned long long kb = 0;
-                while (std::fgets(line, sizeof(line), file)) {
-                    if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-                        std::fclose(file);
-                        return static_cast<size_t>(kb / 1024ULL);
-                    }
-                }
-                std::fclose(file);
-                return 0;
-            };
-
-            size_t cgroup_available_mb = 0;
-            const unsigned long long cgroup_v2_limit = read_ull_file("/sys/fs/cgroup/memory.max");
-            const unsigned long long cgroup_v2_current = read_ull_file("/sys/fs/cgroup/memory.current");
-            if (cgroup_v2_limit > 0) {
-                const unsigned long long cgroup_v2_available =
-                    cgroup_v2_current > 0 && cgroup_v2_limit > cgroup_v2_current ? cgroup_v2_limit - cgroup_v2_current
-                                                                                 : cgroup_v2_limit;
-                cgroup_available_mb = static_cast<size_t>(cgroup_v2_available / MB);
-            }
-            const unsigned long long cgroup_v1_limit = read_ull_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-            const unsigned long long cgroup_v1_current = read_ull_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-            if (cgroup_available_mb == 0 && cgroup_v1_limit > 0) {
-                const unsigned long long cgroup_v1_available =
-                    cgroup_v1_current > 0 && cgroup_v1_limit > cgroup_v1_current ? cgroup_v1_limit - cgroup_v1_current
-                                                                                 : cgroup_v1_limit;
-                cgroup_available_mb = static_cast<size_t>(cgroup_v1_available / MB);
-            }
-            size_t available_mb = 0;
-            const size_t mem_available_mb = read_mem_available_mb();
-            for (const size_t candidate_mb : {cgroup_available_mb, mem_available_mb}) {
-                if (candidate_mb == 0) continue;
-                available_mb = (available_mb == 0) ? candidate_mb : std::min(available_mb, candidate_mb);
-            }
-            return available_mb;
-#else
-            return 0;
-#endif
+            const auto memory = densecore::runtime::DetectResourceBudget().memory;
+            return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes / MB) : 0;
         };
 
         GraphContextEstimate estimate{};

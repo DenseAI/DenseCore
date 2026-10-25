@@ -116,6 +116,9 @@ struct BlockManager {
     std::unordered_map<int, std::vector<int>> block_tokens;
     std::unordered_map<int, std::vector<TransformerModel::SSMSequenceRuntimeState>> block_hybrid_ssm_snapshots;
 
+    // Protected by prefix_mu; capped independently from KV arena residency.
+    size_t max_hybrid_ssm_snapshot_bytes = 256ULL * 1024 * 1024;
+
     struct PrefixCacheMatch {
         int cached_tokens = 0;
         std::vector<int> cached_block_ids;

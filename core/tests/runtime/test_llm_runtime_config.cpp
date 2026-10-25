@@ -239,3 +239,130 @@ TEST(LLMRuntimeConfigTest, RemovedEnvironmentAliasesAreRejectedExplicitly) {
     EXPECT_NE(error.find("DENSECORE_DIRECT_CALLBACK"), std::string::npos);
     EXPECT_NE(error.find("DENSECORE_CALLBACK_MODE"), std::string::npos);
 }
+
+#include <unordered_map>
+#include "densecore.h"
+#include "densecore/runtime/resource_budget.h"
+#include "densecore/models/embedding.h"
+
+namespace {
+using ResourceFiles = std::unordered_map<std::string, std::string>;
+densecore::runtime::ResourceBudget FixtureBudget(const ResourceFiles& files, int affinity = 16) {
+    return densecore::runtime::DetectResourceBudget([&](const std::string& path, std::string& value) {
+        auto it = files.find(path); if (it == files.end()) { errno = ENOENT; return false; } value = it->second; return true;
+    }, affinity);
+}
+ResourceFiles V2Resources() {
+    return {{"/proc/meminfo","MemAvailable: 10000 kB\n"}, {"/proc/self/cgroup","0::/pods/one\n"},
+            {"/proc/self/mountinfo","21 20 0:1 / /cg rw - cgroup2 cgroup rw\n"},
+            {"/cg/memory.max","max"}, {"/cg/cpu.max","max 100000"},
+            {"/cg/pods/memory.max","9000000"}, {"/cg/pods/memory.current","3000000"},
+            {"/cg/pods/cpu.max","150000 100000"},
+            {"/cg/pods/one/memory.max","8000000"}, {"/cg/pods/one/memory.current","1000000"},
+            {"/cg/pods/one/cpu.max","250000 100000"}, {"/cg/pods/one/cpuset.cpus.effective","0-3,8-9"}};
+}
+}
+TEST(ResourceBudgetTest, NestedV2UsesTightestRemainingMemoryAndCeilsFractionalCPU) {
+    auto result = FixtureBudget(V2Resources());
+    EXPECT_EQ(result.memory.state, densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes, 6000000u);
+    EXPECT_EQ(result.cgroup_memory_limit.bytes, 8000000u);
+    EXPECT_DOUBLE_EQ(result.cpu_quota, 1.5);
+    EXPECT_EQ(result.effective_threads, 2);
+}
+TEST(ResourceBudgetTest, ExhaustedParentIsFiniteZeroAndNeverUnlimited) {
+    auto files = V2Resources(); files["/cg/pods/memory.current"] = "10000000";
+    auto result = FixtureBudget(files);
+    EXPECT_EQ(result.memory.state, densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes, 0u);
+}
+TEST(ResourceBudgetTest, MissingUsageIsUnknownInsteadOfFullLimit) {
+    auto files = V2Resources(); files.erase("/cg/pods/memory.current");
+    EXPECT_EQ(FixtureBudget(files).memory.state, densecore::runtime::ResourceState::Unknown);
+}
+TEST(ResourceBudgetTest, UnlimitedRemainsDistinctFromDetectionFailure) {
+    auto files = V2Resources();
+    files["/cg/pods/memory.max"] = "max"; files["/cg/pods/one/memory.max"] = "max";
+    auto result = FixtureBudget(files);
+    EXPECT_EQ(result.cgroup_memory_limit.state, densecore::runtime::ResourceState::Unlimited);
+    EXPECT_EQ(result.memory.bytes, 10240000u);
+    EXPECT_EQ(FixtureBudget({}).memory.state, densecore::runtime::ResourceState::Unknown);
+}
+TEST(ResourceBudgetTest, NamespacedV1MountRootAndParentAreResolved) {
+    ResourceFiles files{{"/proc/meminfo","MemAvailable: 10000 kB\n"},
+        {"/proc/self/cgroup","5:memory:/slice/task\n4:cpu,cpuacct:/slice/task\n3:cpuset:/slice/task\n"},
+        {"/proc/self/mountinfo","1 0 0:1 /slice /memory rw - cgroup cgroup rw,memory\n2 0 0:2 /slice /cpu rw - cgroup cgroup rw,cpu,cpuacct\n3 0 0:3 /slice /sets rw - cgroup cgroup rw,cpuset\n"},
+        {"/memory/memory.limit_in_bytes","6000000"}, {"/memory/memory.usage_in_bytes","2000000"},
+        {"/memory/task/memory.limit_in_bytes","5000000"}, {"/memory/task/memory.usage_in_bytes","4000000"},
+        {"/cpu/cpu.cfs_quota_us","-1"}, {"/cpu/task/cpu.cfs_quota_us","50000"}, {"/cpu/task/cpu.cfs_period_us","100000"},
+        {"/sets/task/cpuset.cpus","2-3"}};
+    auto result = FixtureBudget(files, 8);
+    EXPECT_EQ(result.memory.bytes, 1000000u);
+    EXPECT_EQ(result.effective_threads, 1);
+    EXPECT_DOUBLE_EQ(result.cpu_quota, 0.5);
+}
+TEST(ResourceBudgetTest, CpusetAndAffinityRestrictUnlimitedCPU) {
+    auto files = V2Resources(); files["/cg/pods/cpu.max"] = "max 100000"; files["/cg/pods/one/cpu.max"] = "max 100000";
+    EXPECT_EQ(FixtureBudget(files, 4).effective_threads, 4);
+    EXPECT_EQ(FixtureBudget(files, 16).effective_threads, 6);
+}
+TEST(EmbeddingPoolingTest, AutoConvertsGGUFEnumsAndPreservesExplicitValues) {
+    using densecore::PoolingStrategy;
+    PoolingStrategy result;
+    ASSERT_TRUE(densecore::ResolveEmbeddingPooling(-1, true, 3, result));
+    EXPECT_EQ(result, PoolingStrategy::LAST);
+    ASSERT_TRUE(densecore::ResolveEmbeddingPooling(-1, true, 1, result));
+    EXPECT_EQ(result, PoolingStrategy::MEAN);
+    ASSERT_TRUE(densecore::ResolveEmbeddingPooling(-1, true, 2, result));
+    EXPECT_EQ(result, PoolingStrategy::CLS);
+    ASSERT_TRUE(densecore::ResolveEmbeddingPooling(-1, false, -1, result));
+    EXPECT_EQ(result, PoolingStrategy::MEAN);
+    EXPECT_FALSE(densecore::ResolveEmbeddingPooling(-1, true, 0, result));
+    EXPECT_FALSE(densecore::ResolveEmbeddingPooling(-1, true, 4, result));
+    EXPECT_FALSE(densecore::ResolveEmbeddingPooling(-1, true, -1, result));
+    ASSERT_TRUE(densecore::ResolveEmbeddingPooling(2, true, 4, result));
+    EXPECT_EQ(result, PoolingStrategy::LAST);
+    EXPECT_FALSE(densecore::ResolveEmbeddingPooling(7, false, 0, result));
+}
+TEST(ResourceBudgetTest, SizedQueryRejectsUnknownVersionAndShortStruct) {
+    DenseCoreResourceBudget budget{};
+    EXPECT_EQ(DenseCoreGetResourceBudget(&budget), DENSECORE_STATUS_INVALID_ARGUMENT);
+    budget.struct_size = sizeof(budget); budget.version = 2;
+    EXPECT_EQ(DenseCoreGetResourceBudget(&budget), DENSECORE_STATUS_INVALID_ARGUMENT);
+    budget.version = 1;
+    EXPECT_EQ(DenseCoreGetResourceBudget(&budget), DENSECORE_STATUS_OK);
+    EXPECT_GE(budget.effective_threads, 1u);
+}
+
+TEST(ResourceBudgetTest, ExhaustionRemainsKnownEvenWhenAnotherConstraintIsUnreadable) {
+    auto files = V2Resources();
+    files["/cg/pods/memory.current"] = "9000000";
+    files.erase("/cg/pods/one/memory.current");
+    auto result = FixtureBudget(files);
+    EXPECT_EQ(result.memory.state, densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes, 0u);
+}
+TEST(ResourceBudgetTest, HierarchyRootMissingLimitIsUnlimitedButConstrainedMissingLimitIsUnknown) {
+    auto files = V2Resources(); files.erase("/cg/memory.max"); files.erase("/cg/cpu.max");
+    EXPECT_EQ(FixtureBudget(files).memory.state, densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(FixtureBudget(files).cpu_quota_state, densecore::runtime::ResourceState::Finite);
+    files.erase("/cg/pods/memory.max");
+    EXPECT_EQ(FixtureBudget(files).memory.state, densecore::runtime::ResourceState::Unknown);
+}
+TEST(ResourceBudgetTest, CPUParentReadFailureIsUnknownAndConservative) {
+    auto files = V2Resources(); files.erase("/cg/pods/cpu.max");
+    auto result = FixtureBudget(files);
+    EXPECT_EQ(result.cpu_quota_state, densecore::runtime::ResourceState::Unknown);
+    EXPECT_EQ(result.effective_threads, 1);
+}
+TEST(ResourceBudgetTest, UnreadableRootLimitIsNotMistakenForUnlimited) {
+    const auto files = V2Resources();
+    const auto result = densecore::runtime::DetectResourceBudget([&](const std::string& path, std::string& text) {
+        if (path == "/cg/memory.max") { errno = EACCES; return false; }
+        auto it = files.find(path);
+        if (it == files.end()) { errno = ENOENT; return false; }
+        text = it->second;
+        return true;
+    }, 16);
+    EXPECT_EQ(result.memory.state, densecore::runtime::ResourceState::Unknown);
+}

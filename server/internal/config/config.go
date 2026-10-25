@@ -90,7 +90,7 @@ func DefaultConfig() *ServerConfig {
 		GoWorkers:        0,
 		ServerInflight:   1024,
 		KVType:           "fp16",
-		MaxNumSeqs:       4,
+		MaxNumSeqs:       0, // Native memory plan chooses 1..8 without changing effective context.
 		MaxSeqLen:        0,
 		KVTargetMB:       0,
 		BenchmarkProfile: "",
@@ -303,7 +303,7 @@ func (c *ServerConfig) Validate() error {
 	if c.ServerInflight <= 0 {
 		return fmt.Errorf("invalid server inflight: %d", c.ServerInflight)
 	}
-	if c.MaxNumSeqs <= 0 {
+	if c.MaxNumSeqs < 0 {
 		return fmt.Errorf("invalid max num seqs: %d", c.MaxNumSeqs)
 	}
 	if c.MaxSeqLen < 0 {

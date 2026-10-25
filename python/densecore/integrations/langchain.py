@@ -1333,7 +1333,7 @@ class DenseCoreEmbeddings(Embeddings):
     def __init__(
         self,
         model_path: str,
-        pooling_strategy: str = "mean",
+        pooling_strategy: str = "auto",
         normalize: bool = True,
         threads: int = 0,
     ) -> None:

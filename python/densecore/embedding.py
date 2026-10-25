@@ -38,18 +38,19 @@ class EmbeddingConfig:
     Configuration for embedding extraction.
 
     Args:
-        pooling: Pooling strategy ("mean", "cls", "last", "max")
+        pooling: Pooling strategy ("auto", "mean", "cls", "last", "max")
         normalize: Whether to L2 normalize embeddings
         max_length: Maximum sequence length
     """
 
-    pooling: str = "mean"  # mean, cls, last, max
+    pooling: str = "auto"  # auto uses model metadata; mean, cls, last, max override it
     normalize: bool = True
     max_length: int = 512
 
 
 # Pooling strategy mapping
 POOLING_MAP = {
+    "auto": -1,
     "mean": 0,
     "cls": 1,
     "last": 2,
@@ -187,7 +188,7 @@ class EmbeddingModel:
 
         Args:
             texts: Single text or list of texts to embed
-            pooling: Override pooling strategy (mean, cls, last, max)
+            pooling: Override pooling strategy (auto, mean, cls, last, max)
             normalize: Override L2 normalization setting
 
         Returns:
@@ -203,7 +204,10 @@ class EmbeddingModel:
             texts = [texts]
 
         # Get config
-        pool_type = POOLING_MAP.get(pooling or self._config.pooling, 0)
+        pooling_name = pooling or self._config.pooling
+        if pooling_name not in POOLING_MAP:
+            raise ValueError(f"Invalid pooling: {pooling_name}")
+        pool_type = POOLING_MAP[pooling_name]
         norm = normalize if normalize is not None else self._config.normalize
 
         # Embed each text
@@ -228,7 +232,7 @@ class EmbeddingModel:
                 emb = np.ctypeslib.as_array(emb_ptr, shape=(size,)).copy()
                 result_queue.put(emb)
             else:
-                result_queue.put(np.zeros(self._dimension, dtype=np.float32))
+                result_queue.put(RuntimeError("Embedding worker failed or request was cancelled"))
 
         # Create callback
         callback_type = ctypes.CFUNCTYPE(
@@ -252,6 +256,8 @@ class EmbeddingModel:
         # Wait for result (with timeout)
         try:
             embedding = result_queue.get(timeout=30.0)
+            if isinstance(embedding, Exception):
+                raise embedding
             return embedding
         except queue.Empty:
             raise RuntimeError("Embedding request timed out")
@@ -278,7 +284,7 @@ class EmbeddingModel:
         """
 
         # Get config
-        pool_type = POOLING_MAP.get(self._config.pooling, 0)
+        pool_type = POOLING_MAP[self._config.pooling]
         norm = 1 if self._config.normalize else 0
 
         # Check if C++ batch API is available
@@ -310,8 +316,8 @@ class EmbeddingModel:
                 idx = result_idx[0]
                 if idx < n_texts and emb_ptr and size > 0:
                     results[idx] = np.ctypeslib.as_array(emb_ptr, shape=(size,)).copy()
-                else:
-                    results[idx] = np.zeros(self._dimension, dtype=np.float32)
+                elif idx < n_texts:
+                    results[idx] = RuntimeError("Batch embedding worker failed or request was cancelled")
                 result_idx[0] += 1
                 if result_idx[0] >= n_texts:
                     done_event.set()
@@ -333,6 +339,10 @@ class EmbeddingModel:
         # Wait for all results (with timeout)
         if not done_event.wait(timeout=60.0 * (n_texts / 10 + 1)):
             raise RuntimeError("Batch embedding request timed out")
+
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
 
         return np.array(
             [r if r is not None else np.zeros(self._dimension) for r in results], dtype=np.float32

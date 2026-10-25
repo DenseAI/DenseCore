@@ -1,3 +1,4 @@
+#include "densecore/runtime/resource_budget.h"
 #include "llm/config/runtime_config.h"
 
 #include <algorithm>
@@ -39,22 +40,8 @@ WorkerRuntimeConfig::CallbackMode ParseCallbackMode() {
 }
 
 std::size_t ReadAvailableMemoryMbForAutoRuntimeCache() {
-#if defined(__linux__)
-    std::FILE* file = std::fopen("/proc/meminfo", "r");
-    if (!file) {
-        return 0;
-    }
-    char line[256] = {};
-    unsigned long long kb = 0;
-    while (std::fgets(line, sizeof(line), file)) {
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-            std::fclose(file);
-            return static_cast<std::size_t>(kb / 1024ULL);
-        }
-    }
-    std::fclose(file);
-#endif
-    return 0;
+    const auto memory = densecore::runtime::DetectResourceBudget().memory;
+    return memory.state == densecore::runtime::ResourceState::Finite ? static_cast<size_t>(memory.bytes / (1024*1024)) : 0;
 }
 
 }  // namespace

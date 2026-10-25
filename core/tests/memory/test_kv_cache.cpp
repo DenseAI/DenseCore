@@ -1058,3 +1058,25 @@ TEST(PagedKVCache, QuantizedCacheFallsBackWhenHeadDimMisaligned) {
     ASSERT_NE(q8_cache, nullptr);
     EXPECT_EQ(q8_cache->cache_type, GGML_TYPE_F16);
 }
+
+TEST_F(BlockManagerTest, HybridSnapshotBudgetRefusesOversizedSnapshotAndReclaimsReplacement) {
+    const int block = manager->AllocateSingle();
+    ASSERT_GE(block, 0);
+    int tokens[BLOCK_SIZE] = {};
+    const auto hash = BlockManager::ComputeTokenHash(tokens, BLOCK_SIZE);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> snapshot(1);
+    snapshot[0].conv_state.assign(8, 1.f);
+    snapshot[0].ssm_state.assign(8, 2.f);
+    manager->max_hybrid_ssm_snapshot_bytes = 63;
+    manager->RegisterPrefixBlockWithTokens(block, hash, tokens, BLOCK_SIZE, &snapshot);
+    std::vector<TransformerModel::SSMSequenceRuntimeState> restored;
+    EXPECT_FALSE(manager->LoadHybridSSMSnapshotForBlock(block, &restored));
+    manager->max_hybrid_ssm_snapshot_bytes = 64;
+    manager->RegisterPrefixBlockWithTokens(block, hash, tokens, BLOCK_SIZE, &snapshot);
+    EXPECT_TRUE(manager->LoadHybridSSMSnapshotForBlock(block, &restored));
+    snapshot[0].ssm_state[0] = 3.f;
+    manager->RegisterPrefixBlockWithTokens(block, hash, tokens, BLOCK_SIZE, &snapshot);
+    ASSERT_TRUE(manager->LoadHybridSSMSnapshotForBlock(block, &restored));
+    EXPECT_EQ(restored[0].ssm_state[0], 3.f);
+    manager->FreeSingle(block);
+}
