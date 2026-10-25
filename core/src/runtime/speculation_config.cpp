@@ -51,13 +51,31 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
     }
     state->speculation_requested.store(mode, std::memory_order_relaxed);
     state->spec_draft_n_max.store(draft_n_max, std::memory_order_relaxed);
-    if (mode != 2) {
-        state->speculation_reason = mode == 1 ? "explicitly disabled" : "no qualified automatic MTP profile";
-        state->speculation_selected.store(1, std::memory_order_release);
+    auto* entry = state->GetDefaultModel();
+    int selected_mode = mode;
+    int selected_k = draft_n_max;
+    if (mode == DENSECORE_SPEC_AUTO) {
+        selected_mode = DENSECORE_SPEC_NONE;
+        if (entry && entry->kv_config.speculation_preselected) {
+            const auto& selected = entry->kv_config;
+            if (selected.speculation_requested != mode || selected.speculation_requested_upper != draft_n_max)
+                return fail("automatic MTP initialization does not match pre-KV selection");
+            selected_mode = selected.speculation_selected;
+            selected_k = selected.speculation_selected_k;
+            if (selected_mode == DENSECORE_SPEC_MTP && (selected.speculation_profile.empty() || selected_k < 1 || selected_k > draft_n_max))
+                return fail("automatic MTP has no valid preselected qualification/K");
+            if (selected_mode != DENSECORE_SPEC_NONE && selected_mode != DENSECORE_SPEC_MTP)
+                return fail("automatic MTP has an invalid preselected mode");
+        }
+    }
+    if (selected_mode != DENSECORE_SPEC_MTP) {
+        state->speculation_reason = mode == DENSECORE_SPEC_NONE ? "explicitly disabled" :
+            (entry && !entry->kv_config.speculation_reason.empty() ? entry->kv_config.speculation_reason : "no qualified automatic MTP profiles");
+        state->speculation_selected.store(DENSECORE_SPEC_NONE, std::memory_order_release);
         return true;
     }
+    state->spec_draft_n_max.store(selected_k, std::memory_order_relaxed);
     if (state->models.size() != 1) return fail("explicit MTP requires one target model; separate draft/additional models are unsupported");
-    auto* entry = state->GetDefaultModel();
     if (!entry || !entry->model || !entry->kv_cache) return fail("MTP requires a loaded target model");
     auto& model = *entry->model;
     if (model.variant != ModelVariant::QWEN35 && model.variant != ModelVariant::QWEN36) {
@@ -71,7 +89,7 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         if (context == 0 || concurrency == 0 || plan.available_bytes == 0) {
             return fail("MTP requires an effective context/concurrency memory plan");
         }
-        const auto cost = CalculateSpeculationMemory(model, context, concurrency, draft_n_max);
+        const auto cost = CalculateSpeculationMemory(model, context, concurrency, selected_k);
         const uint64_t additional = cost.Total();
         const uint64_t reserved_mtp = plan.mtp_checkpoint_bytes;
         // One fenced verification graph at a time shares a model-owned bank.
@@ -83,19 +101,22 @@ bool ConfigureSpeculation(EngineState* state, int mode, int draft_n_max, std::st
         }
         if (!entry->resource_lease) return fail("MTP requires an enforced model resource reservation");
         std::string reservation_error;
+        if (mode == DENSECORE_SPEC_AUTO && reserved_mtp == 0)
+            return fail("automatic MTP was not reserved before primary KV allocation");
         if (reserved_mtp == 0) {
             if (!entry->resource_lease->ExtendMTP(additional, &reservation_error)) return fail(reservation_error);
         } else if (reserved_mtp != additional) {
             return fail("MTP preallocation resource contract does not match initialization cost");
         }
-        entry->mtp_target_checkpoints = std::make_unique<densecore::llm::speculative::TargetCheckpointBank>(model, draft_n_max);
+        entry->mtp_target_checkpoints = std::make_unique<densecore::llm::speculative::TargetCheckpointBank>(model, selected_k);
         entry->kv_config.memory_plan = plan;
         state->speculation_max_context = static_cast<int>(context);
         state->speculation_reserved_bytes = additional;
-        state->speculation_reason = "explicit batched MTP with serialized verification; automatic performance qualification pending";
+        state->speculation_reason = mode == DENSECORE_SPEC_AUTO ? entry->kv_config.speculation_reason :
+            "explicit batched MTP with serialized verification; automatic performance qualification pending";
         state->speculation_selected.store(2, std::memory_order_release);
         LOG_INFO("MTP reference selected: context={} concurrency={} draft_n_max={} head_kv={} prompt_hidden={} head_metadata={} graph={} distributions={} reservation={}",
-                 context,concurrency,draft_n_max,cost.head_kv,cost.prompt_hidden,cost.head_metadata,cost.graph,cost.distributions,additional);
+                 context,concurrency,selected_k,cost.head_kv,cost.prompt_hidden,cost.head_metadata,cost.graph,cost.distributions,additional);
         return true;
     } catch (const std::exception& e) {
         return fail(std::string("MTP initialization failed: ") + e.what());

@@ -9,6 +9,10 @@
 #include <unistd.h>
 #include <vector>
 #include "llm/speculative/qualification.h"
+#include "runtime/engine_internal.h"
+#include "runtime/speculation_config.h"
+#include <cstring>
+#include <cstdlib>
 
 namespace {
 using namespace densecore::llm::speculative::qualification;
@@ -222,4 +226,152 @@ TEST(MtpQualification, RealLoadedFileHashMatchesRegardlessOfPathName) {
     TemporaryFile file("model bytes");const auto stamp=CaptureFileStamp(file.path);ASSERT_TRUE(stamp);
     LazyModelIdentity identity([&]{return HashLoadedModel(file.path,*stamp,false);});
     EXPECT_EQ(SelectAutomatic({Profile()},Runtime(),2,identity,Fits).mode,SelectionMode::MTP);
+}
+
+namespace {
+std::unique_ptr<TransformerModel> AutomaticTinyModel() {
+    auto owner = std::make_unique<TransformerModel>();
+    auto& source = *owner;
+    source.arch = ModelArch::QWEN35;
+    source.variant = ModelVariant::QWEN35;
+    source.arch_flags.is_hybrid_ssm = true;
+    source.arch_flags.requires_q_norm = true;
+    source.arch_flags.requires_k_norm = true;
+    source.hparams.n_embd = 2;
+    source.hparams.n_vocab = 2;
+    source.hparams.n_head = 1;
+    source.hparams.n_head_kv = 1;
+    source.hparams.n_embd_head_k = 2;
+    source.hparams.n_embd_head_v = 2;
+    source.hparams.n_rot = 2;
+    source.hparams.n_ctx = 16;
+    source.hparams.n_layer = 4;
+    source.layers.resize(4);
+    source.hybrid_layer_is_ssm = {0,0,0,0};
+    source.hparams.n_ff = 2;
+    source.ctx_w = ggml_init({1024 * 1024, nullptr, false});
+    if (!source.ctx_w) throw std::bad_alloc();
+    const auto weight = [&](int columns, int rows, float value) {
+        auto* t = ggml_new_tensor_2d(source.ctx_w, GGML_TYPE_F32, columns, rows);
+        std::fill_n(static_cast<float*>(t->data), columns * rows, value);
+        return t;
+    };
+    source.tok_embeddings = weight(2, 2, 1);
+    source.output_norm = weight(2, 1, 1);
+    source.output = weight(2, 2, 0);
+    const float identity[] = {1, 0, 0, 1};
+    std::memcpy(source.output->data, identity, sizeof(identity));
+    source.mtp_heads.resize(1);
+    auto& head = source.mtp_heads[0];
+    head.gguf_layer_index = 4;
+    head.tensors["nextn.enorm.weight"] = weight(2, 1, 1);
+    head.tensors["nextn.hnorm.weight"] = weight(2, 1, 1);
+    auto* eh = weight(4, 2, 0);
+    const float hidden_selector[] = {0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(eh->data, hidden_selector, sizeof(hidden_selector));
+    head.tensors["nextn.eh_proj.weight"] = eh;
+    for (const char* name : {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
+                             "attn_k_norm.weight"}) head.tensors[name] = weight(2, 1, 1);
+    for (const char* name : {"attn_k.weight", "attn_v.weight", "attn_output.weight",
+                             "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}) {
+        head.tensors[name] = weight(2, 2, 0);
+    }
+    head.tensors["attn_q.weight"] = weight(2, 4, 0); // [q | gate] per head
+    return owner;
+}
+
+struct AutoEnv {
+    std::string key, previous; bool present;
+    AutoEnv(const char* name,const char* value):key(name),present(std::getenv(name)!=nullptr) {
+        if(present) previous=std::getenv(name);
+        if(value) setenv(name,value,1);else unsetenv(name);
+    }
+    ~AutoEnv(){if(present)setenv(key.c_str(),previous.c_str(),1);else unsetenv(key.c_str());}
+};
+RuntimeConditions AutoRuntime(int context,int concurrency,ggml_type type) {
+    auto r=Runtime();r.context=context;r.concurrency=concurrency;r.prefix=PrefixMode::Disabled;
+    r.kv_dtype=ggml_type_name(type);return r;
+}
+QualificationProfile AutoProfile(const KVCacheConfig& config,int k=1) {
+    auto p=Profile(k);
+    auto r=BindAutomaticPrefillChunk(AutoRuntime(config.max_seq_len,config.max_num_seqs,config.effective_cache_type),config.max_prefill_chunk_tokens);
+    p.cpu=r.cpu;p.context=r.context;p.prefix=r.prefix;p.kv_dtype=r.kv_dtype;p.concurrency_max=8;return p;
+}
+}
+TEST(MtpAutomaticIntegration, SelectedKIsReservedBeforeKvAndConfigurePreservesRequestedAuto) {
+    AutoEnv context("DENSECORE_MAX_SEQ_LEN","16"),concurrency("DENSECORE_MAX_NUM_SEQS","4"),memory("DENSECORE_KV_AVAILABLE_MB_HINT","2048");
+    auto model=AutomaticTinyModel();
+    const auto plain=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16);
+    std::vector<QualificationProfile> profiles{AutoProfile(plain)};
+    int hashes=0;LazyModelIdentity identity([&]{++hashes;return Identity();});
+    AutomaticSpeculationContext automatic{&profiles,&identity,AutoRuntime};
+    auto selected=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16,DENSECORE_SPEC_AUTO,2,&automatic);
+    ASSERT_EQ(selected.speculation_selected,DENSECORE_SPEC_MTP);
+    EXPECT_EQ(selected.speculation_requested,DENSECORE_SPEC_AUTO);EXPECT_EQ(selected.speculation_selected_k,1);
+    EXPECT_EQ(selected.max_num_seqs,plain.max_num_seqs);EXPECT_EQ(hashes,1);
+    EXPECT_NE(selected.speculation_reason.find(profiles[0].id),std::string::npos);
+    EXPECT_EQ(selected.memory_plan.mtp_checkpoint_bytes,CalculateSpeculationMemory(*model,16,4,1).Total());
+    EngineState state;auto entry=std::make_unique<ModelEntry>();entry->model=std::move(model);entry->kv_config=selected;
+    entry->resource_lease=std::make_unique<densecore::runtime::ResourcePlanLease>(selected.memory_plan);
+    entry->kv_cache.reset(InitPagedKVCache(entry->model.get(),4,16,selected.effective_cache_type,-1));
+    ASSERT_TRUE(entry->kv_cache);state.default_model_id="default";state.models.emplace("default",std::move(entry));
+    std::string error;ASSERT_TRUE(ConfigureSpeculation(&state,DENSECORE_SPEC_AUTO,2,&error))<<error;
+    EXPECT_EQ(state.speculation_requested.load(),DENSECORE_SPEC_AUTO);EXPECT_EQ(state.speculation_selected.load(),DENSECORE_SPEC_MTP);
+    EXPECT_EQ(state.spec_draft_n_max.load(),1);EXPECT_EQ(state.speculation_reserved_bytes,selected.memory_plan.mtp_checkpoint_bytes);
+    EXPECT_TRUE(state.models["default"]->mtp_target_checkpoints);
+    EXPECT_NE(state.speculation_reason.find(profiles[0].id),std::string::npos);
+}
+TEST(MtpAutomaticIntegration, EmptyRegistryAndWrongPrefillPolicySkipIdentity) {
+    AutoEnv context("DENSECORE_MAX_SEQ_LEN","16"),concurrency("DENSECORE_MAX_NUM_SEQS","4"),memory("DENSECORE_KV_AVAILABLE_MB_HINT","2048");
+    auto model=AutomaticTinyModel();int captures=0,hashes=0;
+    LazyModelIdentity identity([&]{++hashes;return Identity();});std::vector<QualificationProfile> profiles;
+    AutomaticSpeculationContext automatic{&profiles,&identity,[&](int c,int n,ggml_type t){++captures;return AutoRuntime(c,n,t);}};
+    auto selected=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16,DENSECORE_SPEC_AUTO,2,&automatic);
+    EXPECT_EQ(selected.speculation_selected,DENSECORE_SPEC_NONE);EXPECT_EQ(captures,0);EXPECT_EQ(hashes,0);
+    profiles={AutoProfile(selected)};profiles[0].cpu.runtime_policy_sha256=Sha256Hex("different actual prefill chunk");
+    selected=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16,DENSECORE_SPEC_AUTO,2,&automatic);
+    EXPECT_EQ(selected.speculation_selected,DENSECORE_SPEC_NONE);EXPECT_GT(captures,0);EXPECT_EQ(hashes,0);
+}
+TEST(MtpAutomaticIntegration, MtpCostFailureKeepsSameConcurrencyAndExplicitNeverFallsBack) {
+    AutoEnv context("DENSECORE_MAX_SEQ_LEN","16"),concurrency("DENSECORE_MAX_NUM_SEQS","8"),memory("DENSECORE_KV_AVAILABLE_MB_HINT","2048");
+    auto model=AutomaticTinyModel();model->hparams.n_vocab=5000000; // Cost-only output rows; never execute this graph.
+    const auto plain=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16);
+    std::vector<QualificationProfile> profiles{AutoProfile(plain,2)};LazyModelIdentity identity([]{return Identity();});
+    AutomaticSpeculationContext automatic{&profiles,&identity,AutoRuntime};
+    const auto selected=ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16,DENSECORE_SPEC_AUTO,2,&automatic);
+    EXPECT_EQ(selected.max_num_seqs,plain.max_num_seqs);EXPECT_EQ(selected.speculation_selected,DENSECORE_SPEC_NONE);
+    EXPECT_EQ(selected.memory_plan.mtp_checkpoint_bytes,0u);
+    EXPECT_THROW(ComputeSafeKVCacheConfig(model.get(),GGML_TYPE_F16,DENSECORE_SPEC_MTP,2),densecore::OutOfMemoryException);
+}
+TEST(MtpAutomaticIntegration, WeightMutationRequiresNoneAndRejectsBeforeTensorLookup) {
+    EngineState state;auto entry=std::make_unique<ModelEntry>();entry->model=AutomaticTinyModel();
+    auto* weights=static_cast<float*>(entry->model->tok_embeddings->data);
+    state.default_model_id="default";state.models.emplace("default",std::move(entry));
+    float values[4]={3,4,5,6};DenseCoreTensor tensor{values,{2,2,0,0},2,0};
+    state.speculation_selected.store(DENSECORE_SPEC_NONE);
+    ASSERT_EQ(DenseCoreSetWeight(&state,"model.embed_tokens.weight",&tensor),DENSECORE_STATUS_OK);EXPECT_EQ(weights[0],3);
+    for(int requested:{DENSECORE_SPEC_AUTO,DENSECORE_SPEC_MTP}) {
+        state.speculation_requested.store(requested);state.speculation_selected.store(DENSECORE_SPEC_MTP);values[0]=9;
+        EXPECT_EQ(DenseCoreSetWeight(&state,"model.embed_tokens.weight",&tensor),DENSECORE_STATUS_UNSUPPORTED_OPERATION);
+        EXPECT_EQ(DenseCoreSetWeight(&state,"nonexistent.weight",&tensor),DENSECORE_STATUS_UNSUPPORTED_OPERATION);EXPECT_EQ(weights[0],3);
+    }
+}
+
+TEST(MtpAutomaticIntegration, MissingPreKvReservationAndInvalidPreselectionFailClosed) {
+    EngineState state;auto entry=std::make_unique<ModelEntry>();entry->model=AutomaticTinyModel();entry->kv_cache=std::make_unique<PagedKVCache>();
+    auto& config=entry->kv_config;config.max_seq_len=16;config.max_num_seqs=1;config.speculation_preselected=true;
+    config.speculation_requested=DENSECORE_SPEC_AUTO;config.speculation_requested_upper=2;
+    config.speculation_selected=DENSECORE_SPEC_MTP;config.speculation_selected_k=1;
+    config.speculation_profile="injected qualified profile";config.memory_plan.available_bytes=1024ULL*1024*1024;
+    config.memory_plan.resource_capacity_bytes=config.memory_plan.available_bytes;config.memory_plan.kv_bytes=1024;
+    entry->resource_lease=std::make_unique<densecore::runtime::ResourcePlanLease>(config.memory_plan);
+    state.default_model_id="default";state.models.emplace("default",std::move(entry));std::string error;
+    EXPECT_FALSE(ConfigureSpeculation(&state,DENSECORE_SPEC_AUTO,2,&error));EXPECT_NE(error.find("before primary KV"),std::string::npos);
+    config.speculation_profile.clear();EXPECT_FALSE(ConfigureSpeculation(&state,DENSECORE_SPEC_AUTO,2,&error));
+    EXPECT_NE(error.find("preselected qualification"),std::string::npos);
+    config.speculation_profile="injected qualified profile";config.speculation_selected_k=3;
+    EXPECT_FALSE(ConfigureSpeculation(&state,DENSECORE_SPEC_AUTO,2,&error));EXPECT_NE(error.find("preselected qualification"),std::string::npos);
+    config.speculation_selected_k=1;
+    EXPECT_FALSE(ConfigureSpeculation(&state,DENSECORE_SPEC_AUTO,3,&error));EXPECT_NE(error.find("does not match pre-KV"),std::string::npos);
+    EXPECT_EQ(state.speculation_selected.load(),DENSECORE_SPEC_NONE);
 }

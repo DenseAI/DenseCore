@@ -90,6 +90,7 @@ enum class DecodeSilentFinishReason : uint8_t {
     Utf8PendingOnly,
 };
 
+struct AutomaticSpeculationContext;
 struct KVCacheConfig {
     int max_num_seqs = 4;
     int max_seq_len = 4096;
@@ -99,6 +100,13 @@ struct KVCacheConfig {
     densecore::runtime::RuntimeMemoryPlan memory_plan{};
     ggml_type requested_cache_type = GGML_TYPE_F16;
     ggml_type effective_cache_type = GGML_TYPE_F16;
+    bool speculation_preselected = false;
+    int speculation_requested = DENSECORE_SPEC_NONE;
+    int speculation_requested_upper = 2;
+    int speculation_selected = DENSECORE_SPEC_NONE;
+    int speculation_selected_k = 0;
+    std::string speculation_reason;
+    std::string speculation_profile;
 };
 
 void SetLastError(DenseCoreStatus status, const std::string& message);
@@ -109,7 +117,8 @@ size_t ComputeKVCacheBytesPerToken(ggml_type cache_type, int k_head_dim, int v_h
                                    int index_head_dim = 0);
 KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type);
 KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type,
-                                      int speculation_mode = DENSECORE_SPEC_NONE, int draft_n_max = 2);
+                                      int speculation_mode = DENSECORE_SPEC_NONE, int draft_n_max = 2,
+                                      const AutomaticSpeculationContext* automatic = nullptr);
 DenseCoreHandle InitializeEngineWithOptionsInternal(const char* model_path, const char* reserved, int threads,
     int numa_node_id, int pinning_policy, int kv_type, int spec_type, int draft_n_max);
 

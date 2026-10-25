@@ -42,6 +42,7 @@
 #include "runtime/engine_internal.h"
 #include "runtime/request_builder.h"
 #include "runtime/speculation_config.h"
+#include "runtime/automatic_speculation_profile.h"
 #include "runtime/runtime_env.h"
 #include "runtime/worker_internal.h"
 
@@ -438,7 +439,7 @@ KVCacheConfig ComputeKVCacheConfig(const TransformerModel* model, ggml_type requ
 // Keep the legacy effective default context, then fit concurrency around it.
 // Explicit context is a contract and must not silently shrink to a KV target.
 KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type requested_cache_type,
-                                      int speculation_mode, int draft_n_max) {
+                                      int speculation_mode, int draft_n_max, const AutomaticSpeculationContext* automatic) {
     if (speculation_mode < DENSECORE_SPEC_AUTO || speculation_mode > DENSECORE_SPEC_MTP ||
         draft_n_max < 1 || draft_n_max > 3 || (speculation_mode == DENSECORE_SPEC_MTP && !model))
         throw std::invalid_argument("invalid speculation resource configuration");
@@ -477,7 +478,7 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
     largest_chunk = std::max(1,largest_chunk);
     const bool unchunked_embedding = model && (model->arch == ModelArch::BERT ||
         (model->has_pooling_metadata && model->gguf_pooling_type >= 1 && model->gguf_pooling_type <= 3));
-    auto plan_for = [&](int sequences, int prefill_chunk) {
+    auto plan_for = [&](int sequences, int prefill_chunk, int selected_mode, int selected_k) {
         densecore::runtime::RuntimeMemoryPlan plan;
         constexpr uint64_t MB = 1024*1024;
         plan.resource_capacity_bytes = physical_available;
@@ -496,9 +497,9 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
             plan.prefix_snapshot_bytes = 512*MB;
         }
         // Reserve real head/checkpoint cost before selecting concurrency and
-        // before the primary KV arena is allocated. AUTO has no eligible profile.
-        plan.mtp_checkpoint_bytes = speculation_mode == DENSECORE_SPEC_MTP
-            ? CalculateSpeculationMemory(*model, config.max_seq_len, sequences, draft_n_max).Total() : 0;
+        // before the primary KV arena is allocated, using the selected K.
+        plan.mtp_checkpoint_bytes = selected_mode == DENSECORE_SPEC_MTP
+            ? CalculateSpeculationMemory(*model, config.max_seq_len, sequences, selected_k).Total() : 0;
         plan.allocator_bytes = std::max<uint64_t>(256*MB,plan.available_bytes/16);
         const uint64_t fixed = plan.RequiredBytes();
         const size_t cache_reserve = DecodeGraphCacheCtxBytes();
@@ -508,8 +509,8 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         const size_t prefill_pool = PlanRuntimeGraphPoolBytes(model,key_context,1,prefill_chunk,prefill_chunk,pool_available);
         const size_t decode_pool = PlanRuntimeGraphPoolBytes(model,key_context,sequences,1,sequences,pool_available);
         size_t peak_pool = std::max(prefill_pool,decode_pool);
-        if (speculation_mode == DENSECORE_SPEC_MTP) {
-            const size_t width = std::min<size_t>(draft_n_max + 1, key_context);
+        if (selected_mode == DENSECORE_SPEC_MTP) {
+            const size_t width = std::min<size_t>(selected_k + 1, key_context);
             peak_pool = std::max(peak_pool, PlanRuntimeGraphPoolBytes(model, key_context, 1, width, width, pool_available));
         }
         auto candidate_config = config;
@@ -526,15 +527,48 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
         return plan;
     };
     const int maximum = explicit_concurrency ? concurrency : 8;
-    auto minimum = plan_for(explicit_concurrency ? concurrency : 1,1);
+    auto minimum = densecore::runtime::RuntimeMemoryPlan{};
     for (int sequences = maximum; sequences >= 1; --sequences) {
         for (int chunk = largest_chunk;; chunk = std::max(1,chunk/2)) {
-            const auto plan = plan_for(sequences,chunk);
+            int selected_mode = speculation_mode == DENSECORE_SPEC_MTP ? DENSECORE_SPEC_MTP : DENSECORE_SPEC_NONE;
+            int selected_k = selected_mode == DENSECORE_SPEC_MTP ? draft_n_max : 0;
+            std::string selection_reason = speculation_mode == DENSECORE_SPEC_NONE
+                ? "explicitly disabled" : (speculation_mode == DENSECORE_SPEC_MTP ? "explicit MTP preselected" : "no qualified automatic MTP profiles");
+            std::string profile_id;
+            if (speculation_mode == DENSECORE_SPEC_AUTO && automatic && automatic->profiles &&
+                !automatic->profiles->empty() && automatic->identity && automatic->runtime && model) {
+                using namespace densecore::llm::speculative::qualification;
+                Selection selection;
+                try {
+                    const auto runtime = BindAutomaticPrefillChunk(
+                        automatic->runtime(config.max_seq_len,sequences,config.effective_cache_type),chunk);
+                    selection = SelectAutomatic(*automatic->profiles,runtime,draft_n_max,*automatic->identity,
+                        [&](int k) { const auto candidate = plan_for(sequences,chunk,DENSECORE_SPEC_MTP,k);
+                            return CostFit{candidate.Fits(),"required_bytes=" + std::to_string(candidate.RequiredBytes()) +
+                                " available_bytes=" + std::to_string(candidate.available_bytes)}; });
+                } catch (const std::exception& error) {
+                    selection.reason = std::string("automatic MTP capture failed: ") + error.what();
+                }
+                selection_reason = selection.reason;
+                if (selection.mode == SelectionMode::MTP) {
+                    selected_mode = DENSECORE_SPEC_MTP; selected_k = selection.draft_n_max; profile_id = selection.profile_id;
+                }
+            }
+            // AUTO retries NONE at this exact context/concurrency/chunk before
+            // any lower concurrency is considered. Explicit MTP never falls back.
+            const auto plan = plan_for(sequences,chunk,selected_mode,selected_k);
             minimum = plan;
             if (plan.Fits()) {
                 config.max_num_seqs = sequences;
                 config.max_prefill_chunk_tokens = chunk;
                 config.memory_plan = plan;
+                config.speculation_preselected = true;
+                config.speculation_requested = speculation_mode;
+                config.speculation_requested_upper = draft_n_max;
+                config.speculation_selected = selected_mode;
+                config.speculation_selected_k = selected_k;
+                config.speculation_reason = selection_reason;
+                config.speculation_profile = profile_id;
                 std::cout << "[DenseCore] Resource plan: threads=" << resources.effective_threads
                           << " context=" << config.max_seq_len << " concurrency=" << sequences
                           << " prefill_chunk=" << chunk
@@ -916,7 +950,14 @@ void InitializeRuntimeBackends(int threads) {
 std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, int threads, int numa_node_id,
                                                        int pinning_policy, ggml_type requested_type,
                                                        const char* api_name, int spec_type, int draft_n_max) {
+    using namespace densecore::llm::speculative::qualification;
+    const auto& automatic_profiles = ProductionProfiles();
+    const bool inspect_automatic_identity = spec_type == DENSECORE_SPEC_AUTO && !automatic_profiles.empty() &&
+                                            paths.draft_model_path.empty();
+    // Never stat/hash/capture an automatic profile for today's empty registry.
+    const auto before_load = inspect_automatic_identity ? CaptureFileStamp(paths.model_path) : std::optional<FileStamp>{};
     auto model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(paths.model_path.c_str(), numa_node_id));
+    const auto after_load = inspect_automatic_identity ? CaptureFileStamp(paths.model_path) : std::optional<FileStamp>{};
     TransformerModel* model = model_owner.get();
     if (!model) {
         SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, std::string(api_name) + ": failed to load model");
@@ -933,7 +974,39 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
 
     const ggml_type default_cache_type = requested_type == GGML_TYPE_COUNT ? ResolveDefaultKVCacheType(model) : requested_type;
     state->requested_kv_cache_type = default_cache_type;
-    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type, spec_type, draft_n_max);
+    std::optional<LazyModelIdentity> automatic_identity;
+    AutomaticSpeculationContext automatic;
+    if (inspect_automatic_identity) {
+        automatic_identity.emplace([&] {
+            ModelIdentity missing;
+            if (!before_load || !after_load || *before_load != *after_load) {
+                missing.reason = "model identity changed or was unavailable during GGUF load";
+                return missing;
+            }
+            bool split = !model->ctx_gguf_shards.empty();
+            if (model->ctx_gguf) {
+                const int key = gguf_find_key(model->ctx_gguf,"split.count");
+                if (key >= 0) {
+                    uint64_t count = 0;
+                    switch (gguf_get_kv_type(model->ctx_gguf,key)) {
+                    case GGUF_TYPE_UINT16: count=gguf_get_val_u16(model->ctx_gguf,key); break;
+                    case GGUF_TYPE_UINT32: count=gguf_get_val_u32(model->ctx_gguf,key); break;
+                    case GGUF_TYPE_UINT64: count=gguf_get_val_u64(model->ctx_gguf,key); break;
+                    default: split=true; break;
+                    }
+                    if (count != 1) split=true;
+                }
+            }
+            return HashLoadedModel(paths.model_path,*after_load,split);
+        });
+        automatic.profiles = &automatic_profiles;
+        automatic.identity = &*automatic_identity;
+        automatic.runtime = [&](int context,int concurrency,ggml_type type) {
+            return densecore::runtime::CaptureAutomaticRuntimeConditions(*state,*model,context,concurrency,type);
+        };
+    }
+    const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type, spec_type, draft_n_max,
+                                                             inspect_automatic_identity ? &automatic : nullptr);
     auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
     if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
         LOG_WARN("Requested KV type {} is incompatible with this model; using {}",
@@ -1254,6 +1327,11 @@ DENSECORE_API int DenseCoreSetWeight(DenseCoreHandle engine, const char* name, c
 
     EngineState* state = (EngineState*)engine;
     std::lock_guard<std::mutex> construction_lock(state->construction_mu);
+    if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP) {
+        SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
+                 "DenseCoreSetWeight: selected MTP requires immutable loaded target/head weights");
+        return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
+    }
     ModelEntry* entry = state->GetDefaultModel();
     if (!entry || !entry->model) {
         SetError(DENSECORE_STATUS_MODEL_LOAD_FAILED, "DenseCoreSetWeight: no model loaded");
