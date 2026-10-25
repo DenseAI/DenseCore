@@ -833,3 +833,12 @@ TEST(EngineKVCacheConfig, MtpMemoryCostChecksOverflowAndResolvesValueHeadDefault
     EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 4), std::invalid_argument);
     EXPECT_EQ(cost.prompt_tokens, 16u * sizeof(int) * 2);
 }
+
+TEST(EngineKVCacheConfig, MtpResourceCostRejectsUnsignedDimensionsBeforeNarrowing) {
+    auto model = MakeMtpBudgetModel();
+    model.hparams.n_head_kv = std::numeric_limits<decltype(model.hparams.n_head_kv)>::max();
+    EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 2), std::invalid_argument);
+    model = MakeMtpBudgetModel();
+    model.hparams.n_embd_head_k = std::numeric_limits<decltype(model.hparams.n_embd_head_k)>::max();
+    EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 2), std::invalid_argument);
+}

@@ -18,8 +18,14 @@ uint64_t SpeculationMemoryCost::Total() const {
 }
 SpeculationMemoryCost CalculateSpeculationMemory(const TransformerModel& model, uint64_t context,
                                                  uint64_t concurrency, int draft_n_max) {
+    const auto dimension_fits = [](uint64_t value) {
+        return value > 0 && value <= static_cast<uint64_t>(std::numeric_limits<int>::max());
+    };
     if (!context || !concurrency || draft_n_max < 1 || draft_n_max > 3 ||
-        model.hparams.n_embd <= 0 || model.hparams.n_head <= 0 || model.hparams.n_vocab <= 0)
+        !dimension_fits(model.hparams.n_embd) || !dimension_fits(model.hparams.n_head) ||
+        !dimension_fits(model.hparams.n_vocab) || !dimension_fits(model.hparams.n_head_kv) ||
+        model.hparams.n_embd_head_k > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+        model.hparams.n_embd_head_v > static_cast<uint64_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("invalid MTP resource dimensions");
     const uint64_t rounded = Mul(Add(context, BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE);
     const int key_dim = model.hparams.n_embd_head_k > 0 ? model.hparams.n_embd_head_k
