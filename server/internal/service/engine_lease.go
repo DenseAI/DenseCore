@@ -1,24 +1,45 @@
 package service
 
-import "github.com/DenseAI/DenseCore/server/internal/domain"
+import (
+	"errors"
+
+	"github.com/DenseAI/DenseCore/server/internal/domain"
+)
 
 type engineLeaseProvider interface {
 	AcquireEngineLease() *engineLease
 }
 
 func AcquireRequestEngine(modelService domain.ModelService) (domain.Engine, func()) {
+	engine, release, _ := acquireRequestEngineWithError(modelService)
+	return engine, release
+}
+
+func acquireRequestEngineWithError(modelService domain.ModelService) (domain.Engine, func(), error) {
+	if provider, ok := modelService.(interface {
+		AcquireRequestEngine() (domain.Engine, func(), error)
+	}); ok {
+		engine, release, err := provider.AcquireRequestEngine()
+		if engine == nil && err == nil {
+			err = errors.New("no model loaded")
+		}
+		return engine, release, err
+	}
 	if modelService == nil {
-		return nil, func() {}
+		return nil, func() {}, errors.New("no model loaded")
 	}
 	if provider, ok := modelService.(engineLeaseProvider); ok {
 		lease := provider.AcquireEngineLease()
 		if lease == nil {
-			return nil, func() {}
+			return nil, func() {}, errors.New("no model loaded")
 		}
-		return lease.Engine(), lease.Close
+		return lease.Engine(), lease.Close, nil
 	}
 	engine := modelService.GetEngine()
-	return engine, func() {}
+	if engine == nil {
+		return nil, func() {}, errors.New("no model loaded")
+	}
+	return engine, func() {}, nil
 }
 
 func acquireRequestEngine(modelService domain.ModelService) (domain.Engine, func()) {

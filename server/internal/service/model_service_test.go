@@ -482,3 +482,54 @@ func TestObservationDuringNativeDrainRetainsOwnerWithoutReopeningAdmission(t *te
 		t.Fatalf("close count=%d, want 1", got)
 	}
 }
+
+func TestClosingModelClassifiesRequestRejectionInsideAdmissionLock(t *testing.T) {
+	engine := &contextShutdownTestEngine{selected: make(chan context.Context, 1), release: make(chan struct{})}
+	svc := NewModelService()
+	svc.currentSlot = &engineSlot{engine: engine}
+	accepted := svc.AcquireEngineLease()
+	if accepted == nil {
+		t.Fatal("initial admission rejected")
+	}
+	defer accepted.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.BeginEngineShutdownContext(ctx) }()
+	select {
+	case <-engine.selected:
+	case <-time.After(time.Second):
+		t.Fatal("native drain did not start")
+	}
+	if svc.GetEngine() != engine {
+		t.Fatal("draining model unexpectedly unloaded")
+	}
+	chat := NewChatService(svc, nil)
+	check := func(err error) {
+		t.Helper()
+		var unavailable *domain.AppError
+		if !errors.As(err, &unavailable) || unavailable.StatusCode != 503 || unavailable.Code != domain.ErrCodeServiceUnavailable {
+			t.Fatalf("drain admission error=%v", err)
+		}
+	}
+	_, err := chat.SubmitGeneration(ctx, domain.ChatCompletionRequest{}, 1)
+	check(err)
+	_, _, _, _, err = chat.GenerateSyncWithMetadata(ctx, domain.ChatCompletionRequest{})
+	check(err)
+	_, err = chat.GetEmbeddings(domain.EmbeddingRequest{Input: "Hi"})
+	check(err)
+	_, err = chat.GetBatchEmbeddingsWithOptions([]string{"Hi"}, "auto", nil)
+	check(err)
+	observer, releaseObserver := AcquireObservationEngine(svc)
+	if observer != engine {
+		t.Fatal("drain diagnostics lost owner")
+	}
+	releaseObserver()
+	if atomic.LoadInt32(&engine.closeCount) != 0 {
+		t.Fatal("accepted request engine freed during rejection")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("drain=%v", err)
+	}
+}

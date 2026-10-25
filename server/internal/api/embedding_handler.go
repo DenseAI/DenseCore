@@ -39,7 +39,8 @@ func (h *Handler) EmbeddingsHandler(w http.ResponseWriter, r *http.Request) {
 	batchEmbeddings, err := h.chatService.GetBatchEmbeddingsWithOptions(texts, req.PoolingType, req.Normalize)
 	if err != nil {
 		slog.Error("embedding generation failed", slog.String("error", err.Error()))
-		sendError(w, err.Error(), "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		message, errType, code, status := classifyGenerationError(err)
+		sendError(w, message, errType, code, status)
 		return
 	}
 

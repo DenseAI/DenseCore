@@ -360,12 +360,30 @@ func (s *ModelService) AcquireEngineObservationLease() (domain.Engine, func()) {
 	return lease.Engine(), lease.Close
 }
 
+// AcquireRequestEngine returns a typed admission error from the same locked
+// decision that rejects a closing model; absence retains the legacy nil result.
+func (s *ModelService) AcquireRequestEngine() (domain.Engine, func(), error) {
+	lease, err := s.acquireEngineLeaseWithError(false)
+	if lease == nil {
+		return nil, func() {}, err
+	}
+	return lease.Engine(), lease.Close, nil
+}
+
 func (s *ModelService) acquireEngineLease(observation bool) *engineLease {
+	lease, _ := s.acquireEngineLeaseWithError(observation)
+	return lease
+}
+
+func (s *ModelService) acquireEngineLeaseWithError(observation bool) (*engineLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.currentSlot == nil || s.currentSlot.engine == nil || (s.currentSlot.closing && !observation) {
-		return nil
+	if s.currentSlot == nil || s.currentSlot.engine == nil {
+		return nil, nil
+	}
+	if s.currentSlot.closing && !observation {
+		return nil, domain.ErrServiceUnavailable("engine is shutting down; retry later")
 	}
 
 	s.currentSlot.refCount++
@@ -374,7 +392,7 @@ func (s *ModelService) acquireEngineLease(observation bool) *engineLease {
 		engine: s.currentSlot.engine,
 		slot:   s.currentSlot,
 		owner:  s,
-	}
+	}, nil
 }
 
 // BeginEngineShutdown stops new leases and asks the native engine to resolve

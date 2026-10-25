@@ -49,7 +49,13 @@ func (h *Handler) RerankHandler(w http.ResponseWriter, r *http.Request) {
 	allEmbeddings, err := h.chatService.GetBatchEmbeddings(allTexts)
 	if err != nil {
 		slog.Error("failed to get embeddings for rerank", slog.String("error", err.Error()))
-		sendError(w, "Failed to compute embeddings", "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		message, errType, code, status := classifyGenerationError(err)
+		if status == http.StatusServiceUnavailable && code == ErrCodeServiceBusy {
+			sendError(w, message, errType, code, status)
+		} else {
+			// Preserve the existing generic error for missing models/other failures.
+			sendError(w, "Failed to compute embeddings", "internal_error", ErrCodeServerError, http.StatusInternalServerError)
+		}
 		return
 	}
 

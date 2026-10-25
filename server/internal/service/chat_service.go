@@ -58,7 +58,7 @@ func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *Ch
 // event stream. HTTP consumers read it directly, without a per-token proxy.
 func (s *ChatService) SubmitGeneration(ctx context.Context, req domain.ChatCompletionRequest, eventBufferSize int) (*domain.Generation, error) {
 	serverStart := time.Now()
-	engine, releaseEngine := acquireRequestEngine(s.modelService)
+	engine, releaseEngine, admissionErr := acquireRequestEngineWithError(s.modelService)
 	transferred := false
 	defer func() {
 		if !transferred {
@@ -66,7 +66,7 @@ func (s *ChatService) SubmitGeneration(ctx context.Context, req domain.ChatCompl
 		}
 	}()
 	if engine == nil {
-		return nil, errors.New("no model loaded")
+		return nil, admissionErr
 	}
 
 	// Validate request parameters
@@ -141,7 +141,7 @@ func (s *ChatService) GenerateSync(ctx context.Context, req domain.ChatCompletio
 // GenerateSyncWithMetadata preserves authoritative native usage and termination.
 func (s *ChatService) GenerateSyncWithMetadata(ctx context.Context, req domain.ChatCompletionRequest) (string, int, int, *domain.GenerationCompletion, error) {
 	serverStart := time.Now()
-	engine, releaseEngine := acquireRequestEngine(s.modelService)
+	engine, releaseEngine, admissionErr := acquireRequestEngineWithError(s.modelService)
 	transferred := false
 	defer func() {
 		if !transferred {
@@ -149,7 +149,7 @@ func (s *ChatService) GenerateSyncWithMetadata(ctx context.Context, req domain.C
 		}
 	}()
 	if engine == nil {
-		return "", 0, 0, nil, errors.New("no model loaded")
+		return "", 0, 0, nil, admissionErr
 	}
 
 	if req.MaxTokens < 0 {
@@ -494,10 +494,10 @@ func (s *ChatService) logPromptPathDebug(engine domain.Engine, req domain.ChatCo
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {
-	engine, releaseEngine := acquireRequestEngine(s.modelService)
+	engine, releaseEngine, admissionErr := acquireRequestEngineWithError(s.modelService)
 	defer releaseEngine()
 	if engine == nil {
-		return nil, errors.New("no model loaded")
+		return nil, admissionErr
 	}
 
 	// Handle both string and []string input
@@ -525,10 +525,10 @@ func (s *ChatService) GetBatchEmbeddings(texts []string) ([][]float32, error) {
 
 // GetBatchEmbeddingsWithOptions processes multiple texts with explicit pooling and normalization.
 func (s *ChatService) GetBatchEmbeddingsWithOptions(texts []string, poolingType string, normalize *bool) ([][]float32, error) {
-	engine, releaseEngine := acquireRequestEngine(s.modelService)
+	engine, releaseEngine, admissionErr := acquireRequestEngineWithError(s.modelService)
 	defer releaseEngine()
 	if engine == nil {
-		return nil, errors.New("no model loaded")
+		return nil, admissionErr
 	}
 
 	results := make([][]float32, len(texts))
