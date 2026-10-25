@@ -91,11 +91,9 @@ class EmbeddingModel:
         self._dimension = 0
 
         # Load library
-        from .engine import _find_library, _preload_linux_runtime_dependencies
+        from .engine import get_library
 
-        lib_path = _find_library()
-        _preload_linux_runtime_dependencies(lib_path)
-        self._lib = ctypes.CDLL(lib_path)
+        self._lib = get_library()
 
         # Setup C functions
         self._setup_cfunctions()
