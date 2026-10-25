@@ -131,7 +131,8 @@ namespace fs = std::filesystem;
 
 std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string model_path,
                                            std::unique_ptr<TransformerModel> model,
-                                           std::unique_ptr<PagedKVCache> kv_cache, const KVCacheConfig& kv_config) {
+                                           std::unique_ptr<PagedKVCache> kv_cache, const KVCacheConfig& kv_config,
+                                           std::unique_ptr<densecore::runtime::ResourcePlanLease> resource_lease) {
     auto entry = std::make_unique<ModelEntry>();
     entry->kv_config = kv_config;
     if (kv_config.memory_plan.RequiredBytes() > 0 && kv_cache) {
@@ -141,7 +142,13 @@ std::unique_ptr<ModelEntry> MakeModelEntry(std::string model_id, std::string mod
         }
         entry->kv_config.memory_plan.kv_bytes = std::max(actual_kv,kv_config.memory_plan.kv_bytes);
     }
-    entry->resource_lease = std::make_unique<densecore::runtime::ResourcePlanLease>(entry->kv_config.memory_plan);
+    if (!resource_lease) throw densecore::OutOfMemoryException("model resource reservation is missing");
+    if (entry->kv_config.memory_plan.RequiredBytes() > 0) {
+        std::string error;
+        if (!resource_lease->EnsureKVBytes(entry->kv_config.memory_plan.kv_bytes, &error))
+            throw densecore::OutOfMemoryException(error);
+    }
+    entry->resource_lease = std::move(resource_lease);
     entry->model_id = std::move(model_id);
     entry->model_path = std::move(model_path);
     entry->model = std::move(model);
@@ -647,6 +654,7 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
     }
 
     KVCacheConfig draft_kv_config = ComputeSafeKVCacheConfig(draft_model, cache_type);
+    auto draft_reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(draft_kv_config.memory_plan);
     if (draft_kv_config.effective_cache_type != draft_kv_config.requested_cache_type) {
         LOG_WARN("Draft model KV cache request {} is incompatible with head_dim={}, using {} instead",
                  KVCacheTypeDisplayName(draft_kv_config.requested_cache_type), ResolveKVHeadDim(draft_model),
@@ -660,7 +668,7 @@ bool LoadOptionalDraftModel(EngineState* state, const std::string& main_model_pa
     }
 
     auto draft_entry = MakeModelEntry("draft", draft_model_path, std::move(draft_model_owner),
-                                      std::unique_ptr<PagedKVCache>(draft_cache), draft_kv_config);
+                                      std::unique_ptr<PagedKVCache>(draft_cache), draft_kv_config, std::move(draft_reservation));
 
     state->models["draft"] = std::move(draft_entry);
     state->draft_model_id = "draft";
@@ -880,6 +888,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
     const ggml_type default_cache_type = requested_type == GGML_TYPE_COUNT ? ResolveDefaultKVCacheType(model) : requested_type;
     state->requested_kv_cache_type = default_cache_type;
     const KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, default_cache_type);
+    auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
     if (kv_config.effective_cache_type != kv_config.requested_cache_type) {
         LOG_WARN("Requested KV type {} is incompatible with this model; using {}",
                  KVCacheTypeDisplayName(kv_config.requested_cache_type), KVCacheTypeDisplayName(kv_config.effective_cache_type));
@@ -923,7 +932,7 @@ std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, i
         return nullptr;
     }
     auto entry = MakeModelEntry("default", paths.model_path, std::move(model_owner),
-                                std::unique_ptr<PagedKVCache>(cache), kv_config);
+                                std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation));
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
 
@@ -1544,6 +1553,7 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
 
         // Initialize KV cache for this model
         KVCacheConfig kv_config = ComputeSafeKVCacheConfig(model, state->requested_kv_cache_type);
+        auto reservation = std::make_unique<densecore::runtime::ResourcePlanLease>(kv_config.memory_plan);
         PagedKVCache* cache = InitPagedKVCache(model, kv_config.max_num_seqs, kv_config.max_seq_len,
                                                kv_config.effective_cache_type, state->numa_node_id);
         if (!cache) {
@@ -1554,7 +1564,7 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
 
         // Create model entry with unique_ptr ownership
         auto entry = MakeModelEntry(model_id, canonical_model_path, std::move(model_owner),
-                                    std::unique_ptr<PagedKVCache>(cache), kv_config);
+                                    std::unique_ptr<PagedKVCache>(cache), kv_config, std::move(reservation));
 
         // Add to pool
         {
