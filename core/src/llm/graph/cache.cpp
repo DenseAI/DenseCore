@@ -42,7 +42,7 @@ void CachedGraphStorage::Reset() {
     embd_inp = nullptr;
     pos = nullptr;
     work_ctx.reset();
-    ctx_buffer.clear();
+    std::vector<uint8_t>().swap(ctx_buffer);
     allocation_lease.reset();
 }
 
@@ -56,7 +56,9 @@ ScopedGgmlGraphArena::~ScopedGgmlGraphArena() {
 }
 
 bool ScopedGgmlGraphArena::Ensure(size_t metadata_bytes, ggml_backend_t backend) {
+    last_error_.clear();
     if (!backend || metadata_bytes == 0) {
+        last_error_ = "stage=invalid_arena_arguments";
         return false;
     }
     if (ctx_ && gallocr_ && backend_ == backend && metadata_bytes <= metadata_bytes_) {
@@ -69,11 +71,16 @@ bool ScopedGgmlGraphArena::Ensure(size_t metadata_bytes, ggml_backend_t backend)
 bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
     Reset();
     if (!backend || metadata_bytes == 0) {
+        last_error_ = "stage=invalid_arena_arguments";
         return false;
     }
+    densecore::runtime::ResourceAllocationRejection rejection;
     metadata_lease_ = densecore::runtime::ResourceAllocationLease::Acquire(
-        densecore::runtime::AllocationCategory::Graph, metadata_bytes);
-    if (!metadata_lease_) return false;
+        densecore::runtime::AllocationCategory::Graph, metadata_bytes, &rejection);
+    if (!metadata_lease_) {
+        last_error_ = "stage=metadata_lease_denied " + rejection.Describe();
+        return false;
+    }
 #if defined(_WIN32)
     metadata_buffer_ = _aligned_malloc(metadata_bytes, 64);
 #else
@@ -82,6 +89,7 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
     }
 #endif
     if (!metadata_buffer_) {
+        last_error_ = "stage=metadata_host_allocation_failed requested_bytes=" + std::to_string(metadata_bytes);
         Reset();
         return false;
     }
@@ -92,16 +100,19 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
     };
     ctx_ = ggml_init(params);
     if (!ctx_) {
+        last_error_ = "stage=metadata_context_init_failed";
         Reset();
         return false;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     if (!buft) {
+        last_error_ = "stage=backend_buffer_type_unavailable";
         Reset();
         return false;
     }
     gallocr_ = ggml_gallocr_new(buft);
     if (!gallocr_) {
+        last_error_ = "stage=backend_allocator_init_failed";
         Reset();
         return false;
     }
@@ -111,23 +122,33 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
 }
 
 bool ScopedGgmlGraphArena::AllocGraph(ggml_cgraph* graph) {
-    if (!gallocr_ || !graph) return false;
+    last_error_.clear();
+    if (!gallocr_ || !graph) { last_error_ = "stage=invalid_graph_arguments"; return false; }
     // This allocator has one CPU/backend buffer type. Measure before allocating,
     // so its scratch cannot independently spend the graph-pool reservation.
     size_t required = 0;
     ggml_gallocr_reserve_n_size(gallocr_, graph, nullptr, nullptr, &required);
     if (required > charged_payload_bytes_) {
+        densecore::runtime::ResourceAllocationRejection rejection;
         auto lease = densecore::runtime::ResourceAllocationLease::Acquire(
-            densecore::runtime::AllocationCategory::Graph, required-charged_payload_bytes_);
-        if (!lease) return false;
+            densecore::runtime::AllocationCategory::Graph, required-charged_payload_bytes_, &rejection);
+        if (!lease) {
+            last_error_ = "stage=payload_lease_denied payload_required_bytes=" + std::to_string(required) +
+                          " payload_charged_bytes=" + std::to_string(charged_payload_bytes_) + " " + rejection.Describe();
+            return false;
+        }
         payload_leases_.push_back(std::move(lease));
         charged_payload_bytes_ = required;
     }
     // reserve_n_size updates topology assignments but deliberately leaves its
     // buffers unallocated. alloc_graph may now see matching assignments and
     // skip its automatic reserve, so commit buffers explicitly after admission.
-    if (!ggml_gallocr_reserve(gallocr_, graph)) return false;
-    return ggml_gallocr_alloc_graph(gallocr_, graph);
+    if (!ggml_gallocr_reserve(gallocr_, graph)) {
+        last_error_ = "stage=backend_reserve_failed required_bytes=" + std::to_string(required);
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(gallocr_, graph)) { last_error_ = "stage=backend_graph_allocation_failed"; return false; }
+    return true;
 }
 
 ggml_context* ScopedGgmlGraphArena::ctx() const {

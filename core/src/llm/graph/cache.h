@@ -137,12 +137,14 @@ public:
     bool Init(size_t metadata_bytes, ggml_backend_t backend);
     bool AllocGraph(ggml_cgraph* graph);
     ggml_context* ctx() const;
+    const std::string& LastError() const { return last_error_; }
     void Reset();
 
 private:
     std::shared_ptr<densecore::runtime::ResourceAllocationLease> metadata_lease_;
     std::vector<std::shared_ptr<densecore::runtime::ResourceAllocationLease>> payload_leases_;
     size_t charged_payload_bytes_ = 0;
+    std::string last_error_;
     void* metadata_buffer_ = nullptr;
     ggml_context* ctx_ = nullptr;
     ggml_gallocr_t gallocr_ = nullptr;

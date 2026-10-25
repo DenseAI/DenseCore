@@ -3443,7 +3443,8 @@ void EngineLoop(EngineState* state) {
                         transient_graph_arena = arena_entry ? arena_entry->arena.get() : nullptr;
                         if (!transient_graph_arena || !transient_graph_arena->Ensure(metadata_bytes, active_backend)) {
                             throw densecore::OutOfMemoryException(
-                                "Gemma4 prefill graph arena metadata allocation failed");
+                                "Gemma4 prefill graph arena metadata allocation failed " +
+                                (transient_graph_arena ? transient_graph_arena->LastError() : "stage=arena_missing"));
                         }
                         struct ggml_context* ctx_nodes = transient_graph_arena->ctx();
                         gf = ggml_new_graph_custom(ctx_nodes, 32768, false);
@@ -3453,7 +3454,7 @@ void EngineLoop(EngineState* state) {
                             continue;
                         }
                         if (!output || !embd_inp || !pos || !transient_graph_arena->AllocGraph(gf)) {
-                            throw densecore::OutOfMemoryException("Gemma4 prefill graph arena allocation failed");
+                            throw densecore::OutOfMemoryException("Gemma4 prefill graph arena allocation failed " + transient_graph_arena->LastError());
                         }
                         graph_build_end = std::chrono::steady_clock::now();
                         using_transient_graph_arena = true;

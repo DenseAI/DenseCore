@@ -108,16 +108,27 @@ inline uint64_t StandaloneAdmissionCapacity(const ResourceBudget& budget) {
 // Charge actual allocation lifetimes, including evicted but still referenced
 // weights and simultaneous cache builders. Inactive/standalone kernel tests use
 // the pre-existing local cache policy without an engine reservation.
+struct ResourceAllocationRejection {
+    uint64_t requested_bytes = 0, capacity_bytes = 0, used_bytes = 0, available_bytes = 0;
+    std::string Describe() const {
+        return "requested_bytes=" + std::to_string(requested_bytes) + " capacity_bytes=" + std::to_string(capacity_bytes) +
+               " used_bytes=" + std::to_string(used_bytes) + " available_bytes=" + std::to_string(available_bytes);
+    }
+};
 class ResourceAllocationLease {
 public:
-    static std::shared_ptr<ResourceAllocationLease> Acquire(AllocationCategory category, uint64_t bytes) {
+    static std::shared_ptr<ResourceAllocationLease> Acquire(AllocationCategory category, uint64_t bytes,
+                                                             ResourceAllocationRejection* rejection = nullptr) {
         auto& ledger = resource_detail::ProcessLedger();
         std::lock_guard<std::mutex> lock(ledger.mutex);
         uint64_t capacity = ledger.plans.empty() ? (category == AllocationCategory::Admission ? StandaloneAdmissionCapacity(DetectResourceBudget()) : UINT64_MAX) : 0;
         for (const auto& entry : ledger.plans)
             capacity = resource_detail::Add(capacity, CategoryCapacity(entry.second,category));
         uint64_t& used = CategoryUsed(ledger,category);
-        if (used > capacity || bytes > capacity-used) return {};
+        if (used > capacity || bytes > capacity-used) {
+            if (rejection) *rejection = {bytes,capacity,used,used >= capacity ? 0 : capacity-used};
+            return {};
+        }
         // Allocate the control block before charging so bad_alloc cannot strand a charge.
         auto result = std::shared_ptr<ResourceAllocationLease>(new ResourceAllocationLease(category,bytes));
         used += bytes;
