@@ -141,12 +141,15 @@ inline ResourceBudget DetectResourceBudget(const ResourceReader& read, int affin
             std::istringstream before(line.substr(0,separator)), after(line.substr(separator+3));
             std::string id, parent, device, root, path, options, type, source, super;
             if (!(before >> id >> parent >> device >> root >> path >> options) ||
-                !(after >> type >> source >> super) || root.empty() || root[0] != '/' || path.empty() || path[0] != '/') {
+                !(after >> type >> source >> super) || root.empty() || path.empty() || path[0] != '/') {
                 mounts_malformed = true;
                 continue;
             }
             saw_mount_record = true;
-            if (type == "cgroup" || type == "cgroup2") mounts.push_back({ResourceUnescape(root), ResourceUnescape(path),type,super});
+            if (type == "cgroup" || type == "cgroup2") {
+                if (root[0] != '/') { mounts_malformed = true; continue; }
+                mounts.push_back({ResourceUnescape(root), ResourceUnescape(path),type,super});
+            }
         }
     }
     const bool empty_membership_with_cgroup_mount = memberships.empty() && !mounts.empty();

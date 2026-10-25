@@ -532,3 +532,13 @@ TEST(ResourceBudgetTest, ValidV2HierarchyWithoutResourceControllersUsesHostBudge
     EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Unlimited);
     EXPECT_EQ(result.effective_threads,4);
 }
+
+TEST(ResourceBudgetTest, NamespaceMountOpaqueRootDoesNotInvalidateCgroupDiscovery) {
+    auto files = V2Resources();
+    files["/proc/self/mountinfo"] += "844 115 0:4 net:[4026532366] /run/docker/netns/example rw shared:383 - nsfs nsfs rw\n";
+    const auto result = FixtureBudget(files);
+    EXPECT_EQ(result.memory.state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.memory.bytes,6000000u);
+    EXPECT_EQ(result.cpu_quota_state,densecore::runtime::ResourceState::Finite);
+    EXPECT_EQ(result.effective_threads,2);
+}
