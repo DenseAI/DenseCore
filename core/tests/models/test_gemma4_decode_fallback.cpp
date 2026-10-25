@@ -2033,7 +2033,15 @@ TEST(Gemma4DecodeGraphTest, CanonicalQ4KProjectionMatchesOwnedSingleColumnsAtEve
     struct Retire { ~Retire(){densecore::kernels::RetireRepackedWeightCaches();} } retire;
     densecore::kernels::RetireRepackedWeightCaches();
     const auto old_floor=densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes();
-    struct Floor { size_t previous;~Floor(){densecore::kernels::Q4KRepackedGemvSetRuntimeCacheBudgetFloor(previous);} } floor{old_floor};
+    struct Floor {
+        size_t previous;
+        ~Floor() {
+            // Setting a zero floor also sets a zero hard cache limit. Reset
+            // the automatic limit instead of disabling later fixture caches.
+            if(previous==0)densecore::kernels::Q4KRepackedGemvResetRuntimeCacheBudgetFloorForTest();
+            else densecore::kernels::Q4KRepackedGemvSetRuntimeCacheBudgetFloor(previous);
+        }
+    } floor{old_floor};
     densecore::kernels::Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(64*1024*1024);
     for(auto type:{GGML_TYPE_Q4_K,GGML_TYPE_Q6_K})for(int outputs:{256,2048})for(bool weight_strided:{false,true}) {
         SCOPED_TRACE(ggml_type_name(type));
@@ -2125,6 +2133,18 @@ TEST(Gemma4DecodeGraphTest, CanonicalQ4KProjectionMatchesOwnedSingleColumnsAtEve
                 const auto lora_single=run(1,c,5,true,densecore::env::RuntimeToggleMode::On,true);
                 EXPECT_EQ(std::memcmp(lora_batch.data()+c*outputs,lora_single.data(),outputs*sizeof(float)),0);
             }
+            // A real packed-cache refusal must preserve the raw M=1 oracle,
+            // rather than mixing packed and raw accumulation across widths.
+            densecore::kernels::RetireRepackedWeightCaches();
+            densecore::kernels::Q4KRepackedGemvSetRuntimeCacheBudgetFloor(0);
+            for(auto mode:{densecore::env::RuntimeToggleMode::On,densecore::env::RuntimeToggleMode::Auto}) {
+                const auto refused=run(4,0,5,true,mode);
+                for(int c=0;c<4;++c) {
+                    const auto raw=run(1,c,5,true,densecore::env::RuntimeToggleMode::Off);
+                    EXPECT_EQ(std::memcmp(refused.data()+c*outputs,raw.data(),outputs*sizeof(float)),0);
+                }
+            }
+            densecore::kernels::Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(64*1024*1024);
         }
     }
 }

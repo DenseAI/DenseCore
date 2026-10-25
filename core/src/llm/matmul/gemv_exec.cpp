@@ -347,7 +347,10 @@ void cb_gemv_custom(struct ggml_tensor* dst, int ith, int nth, void* userdata) {
     if (ith == 0 && quant_input) {
         densecore::llm::attention::RecordSharedQuantReuse(used_shared_quant_buffer);
     }
-    const bool q4k_candidate_shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && (K % 8) == 0;
+    // Repacking consumes adjacent physical rows, unlike vec_dot which accepts
+    // the tensor's explicit row stride. Never reinterpret a padded row view.
+    const bool q4k_candidate_shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && (K % 8) == 0 &&
+                                        weight_tensor->nb[1] == ggml_row_size(weight_type, N);
     const bool q4k_repacked_candidate = weight_type == GGML_TYPE_Q4_K && ud->input_quant_type == GGML_TYPE_Q8_K &&
                                         quant_input && q4k_candidate_shape_ok;
     const bool q6k_candidate_shape_ok = N > 0 && K > 0 && (N % QK_K) == 0 && K >= 1024 && N >= 1024;
