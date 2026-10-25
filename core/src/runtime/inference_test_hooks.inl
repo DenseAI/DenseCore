@@ -14,28 +14,6 @@ ggml_tensor* BuildFp8MatmulForExtractionTest(ggml_context* ctx, ggml_tensor* wei
     return ggml_mul_mat_fp8(ctx, weight, input, binding);
 }
 
-bool CachedGraphExecutionBindingForTest(bool replay) {
-    const std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
-        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
-    BatchSpec batch{};
-    batch.tokens = {7};
-    batch.seq_id = {0};
-    batch.pos = {13};
-    {
-        ScopedBatchWorkContext build(work.get(), &batch, InferenceExecutionPhase::Decode,
-                                     true, ModelVariant::QWEN35);
-    }
-    if (GetInferenceWorkContextBatch(work.get()) != nullptr ||
-        GetInferenceWorkContextPhase(work.get()) != InferenceExecutionPhase::Unknown) return false;
-    if (replay) ResetCachedDecodeGraphWorkContext(work.get());
-    ScopedBatchWorkContext execution(work.get(), &batch, InferenceExecutionPhase::Decode,
-                                     false, ModelVariant::QWEN35);
-    return GetCurrentWorkContext() == work.get() &&
-           GetInferenceWorkContextBatch(work.get()) == &batch &&
-           GetInferenceWorkContextPhase(work.get()) == InferenceExecutionPhase::Decode &&
-           GetInferenceWorkContextModelVariant(work.get()) == ModelVariant::QWEN35;
-}
-
 int ModelVariantAfterWorkContextResetForTest(int kind) {
     const std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
         CreateInferenceWorkContext(), DestroyInferenceWorkContext);
