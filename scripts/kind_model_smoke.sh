@@ -103,6 +103,34 @@ status = pod['status']['initContainerStatuses'][0]
 assert status['state']['terminated']['exitCode'] == 0, status
 PY
 limits_status=pass
+# Preserve the successful original download before deletion creates a replacement
+# pod. Cleanup logs select by deployment and can otherwise belong to that new pod.
+init_container=$(kubectl --context "kind-$cluster" -n "$namespace" get pod "$pod" -o jsonpath='{.spec.initContainers[0].name}')
+kubectl --context "kind-$cluster" -n "$namespace" logs "$pod" -c "$init_container" > "$artifacts/original-model-init.log" 2>&1
+kubectl --context "kind-$cluster" -n "$namespace" get pod "$pod" -o json > "$artifacts/pod-after-init-log.json"
+python3 - "$artifacts" "$init_container" <<'PYINIT'
+import hashlib, json, sys
+from pathlib import Path
+artifacts = Path(sys.argv[1])
+before = json.loads((artifacts / 'pod-before.json').read_text())
+after = json.loads((artifacts / 'pod-after-init-log.json').read_text())
+assert before['metadata']['uid'] == after['metadata']['uid'], 'original pod changed during init log capture'
+initial = next(status for status in before['status']['initContainerStatuses'] if status['name'] == sys.argv[2])
+final = next(status for status in after['status']['initContainerStatuses'] if status['name'] == sys.argv[2])
+assert initial['containerID'] == final['containerID'], 'init container changed during log capture'
+assert initial['state']['terminated']['exitCode'] == final['state']['terminated']['exitCode'] == 0
+server = before['status']['containerStatuses'][0]
+identity = {
+    'pod_name': before['metadata']['name'], 'namespace': before['metadata']['namespace'],
+    'pod_uid': before['metadata']['uid'], 'runtime': 'kind/containerd',
+    'server_image_config_digest': server['imageID'],
+    'init_container_name': initial['name'], 'init_container_id': initial['containerID'],
+    'init_image_config_digest': initial['imageID'], 'init_termination': initial['state']['terminated'],
+    'log_file': 'original-model-init.log',
+    'log_sha256': hashlib.sha256((artifacts / 'original-model-init.log').read_bytes()).hexdigest(),
+}
+(artifacts / 'original-model-init-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+PYINIT
 kubectl --context "kind-$cluster" -n "$namespace" port-forward "pod/$pod" 18081:8080 > "$artifacts/port-forward.log" 2>&1 &
 forward_pid=$!
 for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18081/health/ready > /dev/null && break; sleep 1; done
