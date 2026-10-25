@@ -4089,7 +4089,7 @@ TEST(NumaStickyRouting, DequantCacheRejectsExpertReplacementAndRetiresRegistrati
     };
     backend.InitMoEProfiler(&layer, 1);
     backend.RegisterMoEExperts(&layer, {first.expert});
-    backend.GetMoEProfiler(&layer)->SetExpertNumaNode(0, 0);
+    backend.GetProfiler(&layer)->SetExpertNumaNode(0, 0);
     const auto before = backend.GetMoERuntimeStatsSnapshot().total_cached_experts;
     run(first);
     run(first);
@@ -4109,7 +4109,7 @@ TEST(NumaStickyRouting, DequantCacheRejectsExpertReplacementAndRetiresRegistrati
     smaller.w3_ref = replacement.w3_ref;
     backend.InitMoEProfiler(&layer, 1);
     backend.RegisterMoEExperts(&layer, {smaller.expert});
-    backend.GetMoEProfiler(&layer)->SetExpertNumaNode(0, 0);
+    backend.GetProfiler(&layer)->SetExpertNumaNode(0, 0);
     run(smaller);
 }
 
