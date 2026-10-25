@@ -55,7 +55,7 @@ func TestDenseCloudRunnerOptionsPreservePreShutdownHooks(t *testing.T) {
 		nil,
 	)
 
-	if len(options.PreShutdownHooks) != 1 {
-		t.Fatalf("PreShutdownHooks length = %d, want 1", len(options.PreShutdownHooks))
+	if len(options.PreShutdownHooks) != 2 {
+		t.Fatalf("PreShutdownHooks length = %d, want runtime readiness + product hook (2)", len(options.PreShutdownHooks))
 	}
 }

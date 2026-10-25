@@ -28,12 +28,20 @@ func denseCloudRunnerOptions(cfg *config.ServerConfig, httpSetup httpRuntimeBoot
 		cloudGRPC = grpcSetup.server
 	}
 
+	// The SDK runs pre-hooks before waiting for HTTP handlers to drain. Mark
+	// shared readiness down before the native pre-hook can block on accepted
+	// requests; HTTPRuntime.Shutdown runs too late for that (after transport).
+	orderedPreShutdown := make([]cloudserver.ShutdownHook, 0, len(preShutdownHooks)+1)
+	if httpSetup.runtime != nil {
+		orderedPreShutdown = append(orderedPreShutdown, httpSetup.runtime.BeginShutdown)
+	}
+	orderedPreShutdown = append(orderedPreShutdown, preShutdownHooks...)
 	return cloudserver.Options{
 		HTTPServer:       httpSetup.server,
 		GRPCServer:       cloudGRPC,
 		EnableGRPC:       grpcSetup.config.Enabled,
 		ShutdownTimeout:  effectiveRunnerShutdownTimeout(cfg.ShutdownTimeout),
-		PreShutdownHooks: preShutdownHooks,
+		PreShutdownHooks: orderedPreShutdown,
 		StartupHooks: []cloudserver.StartupHook{
 			httpSetup.runtime.Startup,
 		},
