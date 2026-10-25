@@ -1025,6 +1025,105 @@ TEST(GraphCacheOwnershipTest, MeasuredNoAllocArenaAllocatesComputesAndReusesBack
     ggml_backend_free(backend);
 }
 
+TEST(GraphCacheOwnershipTest, IdleTransientArenaRekeysUnderSharedPoolPressureAndComputesAlternatingShapes) {
+    using namespace densecore::llm::graph;
+    using namespace densecore::runtime;
+    constexpr uint64_t MB = 1024*1024;
+    const auto before = ResourceLedgerUsageSnapshot();
+    RuntimeMemoryPlan plan;
+    plan.graph_bytes = before.graph_bytes + 4*MB;
+    plan.available_bytes = plan.RequiredBytes();
+    plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+    ResourcePlanLease reservation(plan);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend,nullptr);
+    {
+        // Independent legacy decode and cached graph owners stay charged while
+        // transient prefill keys change. Their capacity must not be spent twice.
+        auto legacy = ResourceAllocationLease::Acquire(AllocationCategory::Graph,MB);
+        CachedGraphStorage cached;
+        cached.allocation_lease = ResourceAllocationLease::Acquire(AllocationCategory::Graph,MB);
+        ASSERT_TRUE(legacy);
+        ASSERT_TRUE(cached.allocation_lease);
+        GraphCache cache;
+        ScopedGgmlGraphArena* first = nullptr;
+        int iteration = 0;
+        for (int width : {4,64,4,128,4}) {
+            PrefillGraphCacheKey key{};
+            key.tokens = width;
+            key.n_past = iteration++;
+            bool hit = true;
+            // Pin lasts through the final output read, then expires before the
+            // next shape's acquisition. Rekeying remains a cache miss.
+            auto arena = cache.AcquireArena(key,MB,32,&hit).arena;
+            EXPECT_FALSE(hit);
+            if (!first) first = arena.get();
+            EXPECT_EQ(arena.get(),first);
+            ASSERT_TRUE(arena->Ensure(MB,backend)) << arena->LastError();
+            auto* input = ggml_new_tensor_1d(arena->ctx(),GGML_TYPE_F32,width);
+            ggml_set_input(input);
+            auto* output = ggml_add(arena->ctx(),input,input);
+            ggml_set_output(output);
+            auto* graph = ggml_new_graph_custom(arena->ctx(),32,false);
+            ggml_build_forward_expand(graph,output);
+            ASSERT_TRUE(arena->AllocGraph(graph)) << arena->LastError();
+            std::vector<float> values(width),actual(width);
+            for (int i=0;i<width;++i) values[i]=static_cast<float>(i+iteration);
+            ggml_backend_tensor_set(input,values.data(),0,values.size()*sizeof(float));
+            ASSERT_EQ(ggml_backend_graph_compute(backend,graph),GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(output,actual.data(),0,actual.size()*sizeof(float));
+            for (int i=0;i<width;++i) EXPECT_FLOAT_EQ(actual[i],2*values[i]);
+            EXPECT_TRUE(cached.allocation_lease);
+            EXPECT_LT(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+4*MB);
+        }
+        EXPECT_EQ(cache.ReleaseIdleArenasExcept(nullptr),1u);
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+2*MB);
+    }
+    ggml_backend_free(backend);
+    EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+}
+
+TEST(GraphCacheOwnershipTest, ActiveArenaCannotBeRekeyedResetOrEvictedAndDenialReportsExactPool) {
+    using namespace densecore::llm::graph;
+    using namespace densecore::runtime;
+    constexpr uint64_t MB = 1024*1024;
+    const auto before = ResourceLedgerUsageSnapshot();
+    RuntimeMemoryPlan plan;
+    plan.graph_bytes = before.graph_bytes + MB;
+    plan.available_bytes = plan.RequiredBytes();
+    plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+    ResourcePlanLease reservation(plan);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend,nullptr);
+    {
+        GraphCache cache;
+        PrefillGraphCacheKey first{}, second{};
+        second.tokens = 2;
+        auto active = cache.AcquireArena(first,MB,1,nullptr).arena;
+        ASSERT_TRUE(active->Ensure(MB,backend));
+        auto* tensor = ggml_new_tensor_1d(active->ctx(),GGML_TYPE_F32,4);
+        ASSERT_NE(tensor,nullptr);
+        EXPECT_THROW(cache.AcquireArena(first,MB,1,nullptr),std::logic_error);
+        EXPECT_THROW(cache.AcquireArena(second,MB,1,nullptr),densecore::OutOfMemoryException);
+        EXPECT_EQ(cache.ReleaseIdleArenasExcept(nullptr),0u);
+        auto rejected = cache.AcquireArena(second,MB,2,nullptr).arena;
+        EXPECT_FALSE(rejected->Ensure(MB,backend));
+        EXPECT_NE(rejected->LastError().find("stage=metadata_lease_denied"),std::string::npos);
+        ResourceAllocationRejection snapshot;
+        EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Graph,MB,&snapshot));
+        EXPECT_EQ(snapshot.requested_bytes,MB);
+        EXPECT_EQ(snapshot.capacity_bytes,before.graph_bytes+MB);
+        EXPECT_EQ(snapshot.used_bytes,before.graph_bytes+MB);
+        EXPECT_EQ(snapshot.available_bytes,0u);
+        EXPECT_EQ(tensor->ne[0],4);  // The pinned graph metadata is still alive.
+        cache.ClearArenas();
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+MB);
+        active.reset();
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+    }
+    ggml_backend_free(backend);
+}
+
 namespace {
 struct HistoryGraphContext {
     ggml_context* ctx = ggml_init({4 * 1024 * 1024, nullptr, false});

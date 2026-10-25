@@ -84,12 +84,15 @@ bool ScopedGgmlGraphArena::Init(size_t metadata_bytes, ggml_backend_t backend) {
 #if defined(_WIN32)
     metadata_buffer_ = _aligned_malloc(metadata_bytes, 64);
 #else
-    if (posix_memalign(&metadata_buffer_, 64, metadata_bytes) != 0) {
+    const int allocation_error = posix_memalign(&metadata_buffer_, 64, metadata_bytes);
+    if (allocation_error != 0) {
+        last_error_ = "stage=metadata_host_allocation_failed code=" + std::to_string(allocation_error) +
+                      " requested_bytes=" + std::to_string(metadata_bytes);
         metadata_buffer_ = nullptr;
     }
 #endif
     if (!metadata_buffer_) {
-        last_error_ = "stage=metadata_host_allocation_failed requested_bytes=" + std::to_string(metadata_bytes);
+        if (last_error_.empty()) last_error_ = "stage=metadata_host_allocation_failed requested_bytes=" + std::to_string(metadata_bytes);
         Reset();
         return false;
     }
@@ -326,22 +329,54 @@ bool GraphCache::MarkUncacheable(const DecodeGraphCacheKey& key, size_t max_entr
     return true;
 }
 
+size_t GraphCache::ReleaseIdleArenasExcept(const ScopedGgmlGraphArena* keep) {
+    size_t released = 0;
+    for (auto it = arenas.begin(); it != arenas.end();) {
+        if (it->second.arena.get() != keep && it->second.arena.use_count() == 1) {
+            arena_lru.erase(it->second.lru_it);
+            it = arenas.erase(it);
+            ++released;
+        } else {
+            ++it;
+        }
+    }
+    return released;
+}
+
 PrefillArenaEntry& GraphCache::AcquireArena(const PrefillGraphCacheKey& key, size_t metadata_bytes, size_t max_entries,
                                             bool* reused) {
     if (max_entries == 0) throw std::invalid_argument("prefill arena cache requires a positive entry limit");
     auto it = arenas.find(key);
     if (it != arenas.end()) {
+        if (it->second.arena.use_count() != 1)
+            throw std::logic_error("prefill arena is still owned by an active batch");
         Touch(&it->second);
         if (reused) *reused = true;
         return it->second;
     }
     if (reused) *reused = false;
-    while (arenas.size() >= max_entries && !arena_lru.empty()) {
-        arenas.erase(arena_lru.back());
-        arena_lru.pop_back();
-    }
     PrefillArenaEntry candidate;
-    candidate.arena = std::make_unique<ScopedGgmlGraphArena>();
+    const bool pressure = densecore::runtime::ResourceAllocationLease::AvailableBytes(
+                              densecore::runtime::AllocationCategory::Graph) < metadata_bytes;
+    // Rekey an idle arena rather than allocating a second metadata/payload peak
+    // that the shared plan cannot admit. Its graph is transient, never a cached
+    // graph entry; Ensure resets topology before the next construction.
+    if (pressure || arenas.size() >= max_entries) {
+        auto victim = arena_lru.end();
+        for (auto cursor = arena_lru.rbegin(); cursor != arena_lru.rend(); ++cursor) {
+            auto found = arenas.find(*cursor);
+            if (found->second.arena.use_count() == 1) { victim = std::prev(cursor.base()); break; }
+        }
+        if (victim != arena_lru.end()) {
+            auto found = arenas.find(*victim);
+            candidate.arena = std::move(found->second.arena);
+            arenas.erase(found);
+            arena_lru.erase(victim);
+        } else if (arenas.size() >= max_entries) {
+            throw densecore::OutOfMemoryException("prefill arena entry limit reached with all arenas active");
+        }
+    }
+    if (!candidate.arena) candidate.arena = std::make_shared<ScopedGgmlGraphArena>();
     candidate.metadata_bytes = metadata_bytes;
     arena_lru.push_front(key);
     try {

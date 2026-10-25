@@ -2716,6 +2716,7 @@ void EngineLoop(EngineState* state) {
             bool using_cached_decode_graph = false;
             bool cached_graph_verified_paged_decode_op = false;
             bool using_transient_graph_arena = false;
+            std::shared_ptr<ScopedGgmlGraphArena> transient_graph_arena_owner;
             ScopedGgmlGraphArena* transient_graph_arena = nullptr;
             uint64_t graph_runtime_rebind_ns = 0;
             const auto build_transformer_graph_or_fail =
@@ -3440,8 +3441,17 @@ void EngineLoop(EngineState* state) {
                             GetDecodeWorkerStats().prefill_graph_reuse_skip_model.fetch_add(1,
                                                                                             std::memory_order_relaxed);
                         }
-                        transient_graph_arena = arena_entry ? arena_entry->arena.get() : nullptr;
-                        if (!transient_graph_arena || !transient_graph_arena->Ensure(metadata_bytes, active_backend)) {
+                        transient_graph_arena_owner = arena_entry->arena;
+                        transient_graph_arena = transient_graph_arena_owner.get();
+                        bool arena_ready = transient_graph_arena && transient_graph_arena->Ensure(metadata_bytes, active_backend);
+                        if (!arena_ready && transient_graph_arena &&
+                            transient_graph_arena->LastError().find("stage=metadata_lease_denied") == 0) {
+                            const auto rejection = transient_graph_arena->LastError();
+                            const size_t released = graph_cache.ReleaseIdleArenasExcept(transient_graph_arena);
+                            LOG_INFO("Gemma4 prefill arena pressure released_idle={} {}", released, rejection);
+                            if (released > 0) arena_ready = transient_graph_arena->Ensure(metadata_bytes, active_backend);
+                        }
+                        if (!arena_ready) {
                             throw densecore::OutOfMemoryException(
                                 "Gemma4 prefill graph arena metadata allocation failed " +
                                 (transient_graph_arena ? transient_graph_arena->LastError() : "stage=arena_missing"));
@@ -3453,7 +3463,16 @@ void EngineLoop(EngineState* state) {
                         if (!build_transformer_graph_or_fail(ctx_nodes, gf, &output, &embd_inp, &pos)) {
                             continue;
                         }
-                        if (!output || !embd_inp || !pos || !transient_graph_arena->AllocGraph(gf)) {
+                        bool arena_allocated = output && embd_inp && pos && transient_graph_arena->AllocGraph(gf);
+                        if (!arena_allocated && transient_graph_arena->LastError().find("stage=payload_lease_denied") == 0) {
+                            // Current graph, callback userdata and outputs remain pinned.
+                            // Only unrelated idle transient arenas can release capacity.
+                            const auto rejection = transient_graph_arena->LastError();
+                            const size_t released = graph_cache.ReleaseIdleArenasExcept(transient_graph_arena);
+                            LOG_INFO("Gemma4 prefill arena pressure released_idle={} {}", released, rejection);
+                            if (released > 0) arena_allocated = transient_graph_arena->AllocGraph(gf);
+                        }
+                        if (!arena_allocated) {
                             throw densecore::OutOfMemoryException("Gemma4 prefill graph arena allocation failed " + transient_graph_arena->LastError());
                         }
                         graph_build_end = std::chrono::steady_clock::now();

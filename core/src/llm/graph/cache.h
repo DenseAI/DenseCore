@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -153,7 +154,7 @@ private:
 };
 
 struct PrefillArenaEntry {
-    std::unique_ptr<ScopedGgmlGraphArena> arena;
+    std::shared_ptr<ScopedGgmlGraphArena> arena;
     size_t metadata_bytes = 0;
 
 private:
@@ -174,6 +175,8 @@ public:
     void ClearDecode();
     void ClearPrefill();
     void ClearArenas();
+    // Active batches retain an arena pin through their final tensor consumer.
+    size_t ReleaseIdleArenasExcept(const ScopedGgmlGraphArena* keep);
     DecodeGraphCacheEntry* FindDecode(const DecodeGraphCacheKey& key);
     PrefillGraphCacheEntry* FindPrefill(const PrefillGraphCacheKey& key);
     void EraseDecode(const DecodeGraphCacheKey& key);
