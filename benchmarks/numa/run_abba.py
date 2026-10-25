@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -17,6 +18,73 @@ import urllib.request
 
 spec = importlib.util.spec_from_file_location('measure', Path(__file__).parents[1] / 'personal' / 'compare_servers.py')
 measure = importlib.util.module_from_spec(spec); spec.loader.exec_module(measure)
+
+
+def dense_controls(case):
+    if case not in ('off', 'on'):
+        raise ValueError('dense NUMA case must be off or on')
+    # Native graph policy requires the operational opt-in. Both the native
+    # graph and small-decode backend honor the diagnostic disable in a fresh
+    # debug-enabled process; the latter has a separate maintained default ON.
+    return {'DENSECORE_EXPERIMENTAL_MOE_NUMA_STICKY': '1' if case == 'on' else '0',
+        'DENSECORE_DEBUG_DISABLE_MOE_NUMA_STICKY': '0' if case == 'on' else '1'}
+
+
+def build_environment(config, case, threads):
+    env = os.environ.copy()
+    env.update(config.get('env', {}))
+    if case == 'llama':
+        # Never load DenseCore's different ggml ABI into the baseline process.
+        env.pop('LD_PRELOAD', None)
+        env['LD_LIBRARY_PATH'] = str(Path(config['llama_command'][0]).resolve().parent)
+        env.update(config.get('llama_env', {}))
+    else:
+        env.update(config.get('dense_env', {}))
+        env.update(dense_controls(case))
+    env.update({'THREADS': str(threads), 'OMP_NUM_THREADS': str(threads),
+        'DENSECORE_MAX_NUM_SEQS': '1', 'DENSECORE_MAX_SEQ_LEN': str(config['context']),
+        'MAIN_MODEL_PATH': config['model'], 'DENSECORE_PREFIX_CACHE_REUSE': '0',
+        'DENSECORE_NUMA_WEIGHTS': 'round_robin', 'HOST': '127.0.0.1',
+        'PORT': str(config.get('port', 18082))})
+    return env
+
+
+def require_debug_build(config):
+    path = Path(config['dense_build_cache'])
+    text = path.read_text()
+    if not re.search(r'^DENSECORE_ENABLE_DEBUG_ENV:BOOL=(ON|TRUE|1)$', text, re.MULTILINE):
+        raise ValueError('NUMA OFF control requires a server configured with -DDENSECORE_ENABLE_DEBUG_ENV=ON')
+    with path.open('rb') as handle:
+        digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+    return {'path': str(path.resolve()), 'sha256': digest, 'diagnostic_env_enabled': True}
+
+
+def verify_dispatch_policy(text, case, minimum_records=1):
+    rows = []
+    for line in text.splitlines():
+        state = re.search(r'\bnative_moe_numa_sticky_state=(\w+)', line)
+        sticky = re.search(r'\bnative_moe_numa_sticky_dispatch_ops=(\d+)', line)
+        legacy = re.search(r'\bnative_moe_numa_legacy_dispatch_ops=(\d+)', line)
+        if not (state and sticky and legacy):
+            continue
+        histogram = re.search(r'\bnative_moe_numa_node_dispatch_ops=(\S+)', line)
+        rows.append({'state': state[1], 'sticky_dispatch_ops': int(sticky[1]),
+            'legacy_dispatch_ops': int(legacy[1]),
+            'node_dispatch_ops': histogram[1] if histogram else None})
+    if len(rows) < minimum_records:
+        raise ValueError('missing native NUMA state/dispatch evidence; no speed claim is valid')
+    if case == 'off':
+        if any(row['state'] != 'disabled_by_debug' or row['sticky_dispatch_ops'] != 0 or
+                row['legacy_dispatch_ops'] <= 0 for row in rows):
+            raise ValueError('NUMA OFF was not proven disabled by the live diagnostic control')
+        if 'MoE sticky decode dispatch active' in text:
+            raise ValueError('small-decode sticky path remained active in the OFF process')
+    elif case == 'on':
+        if any(row['state'] != 'enabled' or row['sticky_dispatch_ops'] <= 0 for row in rows):
+            raise ValueError('NUMA ON not proven: unsupported/degenerate/unqualified model or zero dispatch')
+    else:
+        raise ValueError('NUMA proof applies only to dense off/on cases')
+    return {'verified': True, 'case': case, 'observations': rows}
 
 
 def physical_cpus(threads):
@@ -41,13 +109,7 @@ def physical_cpus(threads):
 def sample(config, case, threads, cpus, out):
     port = config.get('port', 18082)
     command = config['dense_command'] if case != 'llama' else config['llama_command']
-    env = os.environ.copy()
-    env.update(config.get('env', {}))
-    env.update({'THREADS': str(threads), 'DENSECORE_MAX_NUM_SEQS': '1',
-        'DENSECORE_MAX_SEQ_LEN': str(config['context']), 'MAIN_MODEL_PATH': config['model'],
-        'DENSECORE_PREFIX_CACHE_REUSE': '0', 'DENSECORE_NUMA_WEIGHTS': 'round_robin',
-        'DENSECORE_EXPERIMENTAL_MOE_NUMA_STICKY': '1' if case == 'on' else '0',
-        'HOST': '127.0.0.1', 'PORT': str(port)})
+    env = build_environment(config, case, threads)
     if case == 'llama':
         command = command + ['-m', config['model'], '-t', str(threads), '-tb', str(threads),
             '-c', str(config['context']), '--host', '127.0.0.1', '--port', str(port), '--jinja']
@@ -59,7 +121,9 @@ def sample(config, case, threads, cpus, out):
     command = ['taskset', '-c', ','.join(map(str, cpus))] + command
     metadata = {'case': case, 'threads': threads, 'cpus': cpus, 'command': command,
         'environment_overrides': {key: env[key] for key in ('THREADS', 'DENSECORE_MAX_NUM_SEQS',
-            'DENSECORE_MAX_SEQ_LEN', 'DENSECORE_EXPERIMENTAL_MOE_NUMA_STICKY')},
+            'DENSECORE_MAX_SEQ_LEN', 'OMP_NUM_THREADS', 'DENSECORE_PREFIX_CACHE_REUSE',
+            'DENSECORE_NUMA_WEIGHTS', 'LD_LIBRARY_PATH', 'LD_PRELOAD',
+            'DENSECORE_EXPERIMENTAL_MOE_NUMA_STICKY', 'DENSECORE_DEBUG_DISABLE_MOE_NUMA_STICKY') if key in env},
         'llama_numa': config['llama_numa'], 'llama_mtp': config.get('llama_mtp', False)}
     with out.with_suffix('.server.log').open('wb') as log:
         process = subprocess.Popen(command, env=env, stdout=log, stderr=log, start_new_session=True)
@@ -90,8 +154,24 @@ def sample(config, case, threads, cpus, out):
             result = measure.group(f'http://127.0.0.1:{port}', config['prompts'], 1,
                 config.get('max_tokens', 1024), config['expected_pattern'])
             result['provenance'] = metadata
+            if case != 'llama':
+                # Native summaries may flush just after the HTTP terminal event.
+                proof_deadline = time.monotonic() + 2
+                while True:
+                    log.flush()
+                    try:
+                        result['dispatch_policy_proof'] = verify_dispatch_policy(
+                            out.with_suffix('.server.log').read_text(errors='replace'), case, len(config['prompts']))
+                        break
+                    except ValueError as error:
+                        if time.monotonic() >= proof_deadline:
+                            result['dispatch_policy_error'] = str(error)
+                            break
+                        time.sleep(.05)
             out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n')
             if not result['quality_pass']: raise RuntimeError(f'quality gate failed; raw sample: {out}')
+            if result.get('dispatch_policy_error'):
+                raise RuntimeError(f"{result['dispatch_policy_error']}; raw sample: {out}")
             return result
         finally:
             os.killpg(process.pid, signal.SIGTERM) if process.poll() is None else None
@@ -110,6 +190,7 @@ def main():
     config = json.loads(args.config.read_text())
     if config['llama_numa'] not in ('none', 'distribute', 'isolate', 'numactl'):
         parser.error('llama_numa must be selected before the scored comparison')
+    config['dense_build_evidence'] = require_debug_build(config)
     args.out.mkdir(parents=True, exist_ok=False)
     # Verify model bytes once per invocation; a supplied digest alone is not verification.
     with Path(config['model']).open('rb') as handle:
