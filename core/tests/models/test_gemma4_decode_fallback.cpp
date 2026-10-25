@@ -1439,3 +1439,67 @@ TEST(Gemma4FallbackDecodeTest, SharedKvSourceValidatesE4BIndexTypeAndHeadShape) 
     wrong_history.v = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F32, 256, 2, 2);
     EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 22, &wrong_history, 3), densecore::InvalidArgumentException);
 }
+
+TEST(Gemma4FallbackDecodeTest, E4BQ4ZeroProjectionUsesNativeQuantWithPreparedAliases) {
+    std::unique_ptr<InferenceWorkContext, void (*)(InferenceWorkContext*)> work_ctx(CreateInferenceWorkContext(),
+                                                                                 DestroyInferenceWorkContext);
+    ASSERT_NE(work_ctx, nullptr);
+    struct RestoreContext {
+        InferenceWorkContext* previous = GetCurrentWorkContext();
+        ~RestoreContext() { SetCurrentWorkContext(previous); }
+    } restore;
+    SetCurrentWorkContext(work_ctx.get());
+    constexpr int k = 2560;
+    constexpr int rows = 2048;
+    for (int tokens : {1, 4, 25}) {
+        SCOPED_TRACE(tokens);
+        ggml_init_params params{64 * 1024 * 1024, nullptr, false};
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+        ASSERT_NE(ctx, nullptr);
+        auto* weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_0, k, rows);
+        auto* alias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_0, k, rows);
+        auto* input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, tokens);
+        ggml_set_name(weight, "blk.24.attn_q.weight");
+        ggml_set_name(alias, "blk.24.attn_q.weight.cpu_repack_2d");
+        std::vector<float> represented(static_cast<size_t>(k) * rows);
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < k; ++col) represented[row * k + col] = ((col + row) % 16 - 8) / 8.0f;
+        }
+        ASSERT_EQ(ggml_quantize_chunk(GGML_TYPE_Q4_0, represented.data(), weight->data, 0, rows, k, nullptr),
+                  ggml_nbytes(weight));
+        // An unused alias deliberately differs from the standard-layout source.
+        // Native quant callbacks must not interpret backend-repacked storage.
+        std::memset(alias->data, 0, ggml_nbytes(alias));
+        constexpr float values[] = {-127.0f / 32, -64.0f / 32, 64.0f / 32, 127.0f / 32};
+        auto* input_data = static_cast<float*>(input->data);
+        for (int token = 0; token < tokens; ++token) {
+            for (int col = 0; col < k; ++col) input_data[token * k + col] = values[(col + token) % 4];
+        }
+        TransformerModel model{};
+        model.variant = ModelVariant::GEMMA4;
+        model.arch_flags.is_gemma4 = true;
+        model.hparams.n_layer = 42;
+        model.hparams.n_embd = k;
+        model.hparams.n_head = 8;
+        model.hparams.n_head_kv = 2;
+        model.hparams.n_embd_head_k = model.hparams.n_embd_head_v = 256;
+        model.prepared_weights.cpu_repack_aliases[weight] = alias;
+        model.prepared_weights.cpu_decode_repack_aliases[weight] = alias;
+        auto* result = densecore::testing::SmartMulMatWithPhaseTest(
+            ctx.get(), weight, input, &model,
+            static_cast<int>(tokens <= 4 ? InferenceExecutionPhase::Decode : InferenceExecutionPhase::Prefill));
+        ASSERT_NE(result, nullptr);
+        ASSERT_EQ(result->op, GGML_OP_CUSTOM);
+        auto* graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, result);
+        ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
+        const auto* output = static_cast<const float*>(result->data);
+        for (int token = 0; token < tokens; ++token) {
+            for (int row = 0; row < rows; ++row) {
+                double reference = 0;
+                for (int col = 0; col < k; ++col) reference += represented[row * k + col] * input_data[token * k + col];
+                EXPECT_NEAR(output[token * rows + row], reference, 1e-5);
+            }
+        }
+    }
+}

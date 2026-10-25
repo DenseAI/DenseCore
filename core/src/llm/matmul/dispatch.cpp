@@ -328,12 +328,14 @@ static SmartMatmulAliasSelection ResolveSmartMatmulAliasSelection(TransformerMod
         (input->ne[0] % QK_K == 0) && IsQ4KTrueBatchedKernelEnabled();
     const bool prefer_gemma4_quant_prefill_densecore_path =
         dispatch_is_prefill_phase && model->arch_flags.is_gemma4 &&
-        (selection.weight->type == GGML_TYPE_Q4_K || selection.weight->type == GGML_TYPE_Q8_0) && input->ne[1] > 1 &&
+        (selection.weight->type == GGML_TYPE_Q4_K || selection.weight->type == GGML_TYPE_Q8_0 ||
+         selection.weight->type == GGML_TYPE_Q4_0) && input->ne[1] > 1 &&
         input->ne[0] == selection.weight->ne[0] &&
         (selection.weight->type != GGML_TYPE_Q4_K || IsQ4KTrueBatchedKernelEnabled());
     const bool prefer_gemma4_quant_decode_densecore_path = model->arch_flags.is_gemma4 &&
                                                            ggml_is_quantized(selection.weight->type) &&
-                                                           input->ne[1] <= 1 && input->ne[0] == selection.weight->ne[0];
+                                                           (!dispatch_is_prefill_phase || input->ne[1] <= 1) &&
+                                                           input->ne[1] > 0 && input->ne[0] == selection.weight->ne[0];
     const bool prefer_lfm2_quant_prefill_densecore_path =
         dispatch_is_prefill_phase && original.lfm2_shortconv_semantic && ggml_is_quantized(selection.weight->type) &&
         input->ne[1] > 1 && input->ne[0] == selection.weight->ne[0];
