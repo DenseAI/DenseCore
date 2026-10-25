@@ -818,15 +818,7 @@ int ResolveEngineThreadCount(int threads) {
     if (threads > 0) {
         return threads;
     }
-    auto& topo = densecore::HardwareTopology::GetInstance();
-    threads = topo.GetPhysicalCoreCount();
-    if (threads <= 0) {
-        threads = topo.GetLogicalCoreCount();
-    }
-    if (threads <= 0) {
-        threads = densecore::simd::GetNumCores();
-    }
-    return std::max(1, std::min(threads, densecore::runtime::DetectResourceBudget().effective_threads));
+    return densecore::runtime::DetectResourceBudget().effective_threads;
 }
 
 void InitializeRuntimeBackends(int threads) {
