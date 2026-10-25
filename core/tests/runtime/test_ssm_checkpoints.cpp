@@ -261,7 +261,8 @@ TEST(SSMCheckpointTest, TargetBankPreflightsEveryLayerBeforeAnyRestore) {
 
 TEST(SSMCheckpointTest, TargetTransactionCrossesKVBlockAndRestoresEveryAcceptanceBoundary) {
     for (int draft = 1; draft <= 3; ++draft) for (int accepted = 0; accepted <= draft; ++accepted) {
-        SCOPED_TRACE(draft); SCOPED_TRACE(accepted);
+        SCOPED_TRACE(draft);
+        SCOPED_TRACE(accepted);
         TransformerModel model;
         model.arch_flags.is_hybrid_ssm = true;
         model.hparams.n_layer = 1;

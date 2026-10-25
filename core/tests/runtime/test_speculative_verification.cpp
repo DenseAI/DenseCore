@@ -17,6 +17,28 @@
 
 #include "llm/speculative/verification.h"
 
+namespace densecore::llm::speculative {
+struct ReferenceSessionTestAccess {
+    static void TrimToTargetBoundary(ReferenceSession& session) {
+        if (!session.cache_->block_manager->RollbackExclusiveSuffix(&session.blocks_, session.target_seen_))
+            throw std::runtime_error("test head rollback failed");
+        session.head_past_ = session.target_seen_;
+    }
+    static void AppendExpected(ReferenceSession& session, int token, const std::vector<float>& input_hidden,
+                               const std::vector<float>& resulting_target_hidden) {
+        session.ForwardHead({token}, input_hidden, nullptr, nullptr);
+        ++session.target_seen_;
+        session.last_hidden_ = resulting_target_hidden;
+    }
+    static std::vector<float> Probe(ReferenceSession& session, int token) {
+        TrimToTargetBoundary(session);
+        std::vector<float> logits;
+        session.ForwardHead({token}, session.last_hidden_, nullptr, nullptr, &logits);
+        return logits;
+    }
+};
+}
+
 namespace {
 using namespace densecore::llm::speculative;
 
@@ -119,7 +141,8 @@ TEST(MtpReferenceSession, VerifiesGreedyProposalsAndRecoversFromRejection) {
 
 TEST(MtpBatchedSession, EveryAcceptanceBoundaryAndFullAcceptCatchupSupportsAllDraftLimits) {
     for (int maximum = 1; maximum <= 3; ++maximum) for (int accept = 0; accept <= maximum; ++accept) {
-        SCOPED_TRACE(maximum); SCOPED_TRACE(accept);
+        SCOPED_TRACE(maximum);
+        SCOPED_TRACE(accept);
         auto source = MakeTinyNextNSource();
         auto* ctx = ggml_init({1024*1024, nullptr, false});
         ASSERT_NE(ctx, nullptr);
@@ -193,6 +216,62 @@ TEST(MtpBatchedSession, AcceptedEosDoesNotReadOrSampleThePostEosBonusDistributio
     EXPECT_NO_THROW(session.CompleteBatched(input, states, 2, result, params, nullptr, cancelled));
     EXPECT_TRUE(session.VerificationDraft(3).empty());
     ggml_free(ctx);
+}
+
+TEST(MtpBatchedSession, AcceptedHeadPrefixMatchesSequentialActualTargetHiddenLogits) {
+    for (int maximum = 1; maximum <= 3; ++maximum) for (int accept = 0; accept <= maximum; ++accept) {
+        SCOPED_TRACE(maximum);
+        SCOPED_TRACE(accept);
+        auto source = MakeTinyNextNSource();
+        auto& tensors = source->mtp_heads[0].tensors;
+        const float identity[] = {1,0,0,1};
+        for (const char* name : {"attn_k.weight", "attn_v.weight", "attn_output.weight"})
+            std::memcpy(tensors[name]->data, identity, sizeof(identity));
+        const float query[] = {1,0,0,1,0,0,0,0};
+        std::memcpy(tensors["attn_q.weight"]->data, query, sizeof(query));
+        auto* ctx = ggml_init({1024*1024, nullptr, false});
+        ASSERT_NE(ctx, nullptr);
+        auto* initial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+        static_cast<float*>(initial->data)[0] = 1; static_cast<float*>(initial->data)[1] = 3;
+        ReferenceSession batched(*source, 16, maximum, 1234, 1), sequential(*source, 16, maximum, 1234, 1);
+        SamplingParams params; params.temperature = 0;
+        std::vector<int> history;
+        params.token_history = &history;
+        std::atomic<bool> cancelled{false};
+        std::mt19937 rng(7), other_rng(7);
+        const int prompt = 1;
+        const std::vector<float> anchor{3,4};
+        batched.ObserveTarget(&prompt, anchor.data(), 2, 1, true);
+        sequential.ObserveTarget(&prompt, anchor.data(), 2, 1, true);
+        ASSERT_EQ(batched.Sample(initial, 0, params, rng, nullptr, cancelled), 1);
+        ASSERT_EQ(sequential.Sample(initial, 0, params, other_rng, nullptr, cancelled), 1);
+        history.push_back(1);
+        const auto proposals = batched.VerificationDraft(maximum);
+        ASSERT_EQ(proposals.size(), static_cast<size_t>(maximum));
+        auto* logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, maximum+1);
+        for (int row = 0; row <= maximum; ++row) {
+            const int selected = row < accept ? proposals[row] : (row < maximum ? 1-proposals[row] : 0);
+            auto* values = reinterpret_cast<float*>(static_cast<char*>(logits->data) + row*logits->nb[1]);
+            values[selected] = 3; values[1-selected] = 1;
+        }
+        const auto result = batched.VerifyBatched(logits, 0, maximum, params, rng);
+        ASSERT_EQ(result.accepted_draft_tokens, static_cast<size_t>(accept));
+        std::vector<int> inputs{1}; inputs.insert(inputs.end(), proposals.begin(), proposals.end());
+        const std::vector<float> target_hidden{-4,1, 1,-5, -2,-1, 3,2};
+        batched.CompleteBatched(inputs.data(), target_hidden.data(), 2, result, params, nullptr, cancelled);
+        ReferenceSessionTestAccess::TrimToTargetBoundary(sequential);
+        for (int row = 0; row <= accept; ++row) {
+            const std::vector<float> input = row == 0 ? anchor :
+                std::vector<float>(target_hidden.begin()+(row-1)*2, target_hidden.begin()+row*2);
+            const std::vector<float> output(target_hidden.begin()+row*2, target_hidden.begin()+(row+1)*2);
+            ReferenceSessionTestAccess::AppendExpected(sequential, inputs[row], input, output);
+        }
+        const auto actual = ReferenceSessionTestAccess::Probe(batched, 0);
+        const auto expected = ReferenceSessionTestAccess::Probe(sequential, 0);
+        ASSERT_EQ(actual.size(), expected.size());
+        for (size_t token = 0; token < actual.size(); ++token) EXPECT_NEAR(actual[token], expected[token], 2e-5f);
+        ggml_free(ctx);
+    }
 }
 
 TEST(MtpConfiguration, KeepsAutomaticModeOffAndRejectsUnsupportedOrUnbudgetedExplicitMode) {

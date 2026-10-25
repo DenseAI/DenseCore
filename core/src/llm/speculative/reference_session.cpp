@@ -73,6 +73,16 @@ void ReferenceSession::ObserveTarget(const int* tokens, const float* hidden, siz
                                   hidden + static_cast<size_t>(i) * stride + embd);
         }
     }
+    if (!prefill) {
+        if (last_hidden_.size() != embd || !observed_target_tokens_.empty())
+            throw std::runtime_error("MTP target observation must follow the previous head replay");
+        observed_target_tokens_.assign(tokens, tokens + count);
+        observed_target_inputs_.resize(static_cast<size_t>(count) * embd);
+        std::copy(last_hidden_.begin(), last_hidden_.end(), observed_target_inputs_.begin());
+        for (int row = 1; row < count; ++row)
+            std::copy_n(hidden + static_cast<size_t>(row-1)*stride, embd,
+                        observed_target_inputs_.data() + static_cast<size_t>(row)*embd);
+    }
     last_hidden_.assign(hidden + static_cast<size_t>(count - 1) * stride,
                         hidden + static_cast<size_t>(count - 1) * stride + embd);
     target_seen_ += count;
@@ -80,7 +90,8 @@ void ReferenceSession::ObserveTarget(const int* tokens, const float* hidden, siz
 ReferenceSession::HeadOutput ReferenceSession::ForwardHead(const std::vector<int>& tokens,
                                                            const std::vector<float>& hidden,
                                                            const SamplingParams* params,
-                                                           const InferenceDependencies* deps) {
+                                                           const InferenceDependencies* deps,
+                                                           std::vector<float>* raw_logits) {
     const size_t embd = source_.hparams.n_embd;
     if (tokens.empty() || hidden.size() != tokens.size() * embd ||
         tokens.size() > static_cast<size_t>(max_context_ - head_past_)) {
@@ -123,6 +134,11 @@ ReferenceSession::HeadOutput ReferenceSession::ForwardHead(const std::vector<int
     const auto* h = reinterpret_cast<const float*>(static_cast<const char*>(next_hidden->data) +
                           (next_hidden->ne[1] - 1) * next_hidden->nb[1]);
     result.hidden.assign(h, h + embd);
+    if (raw_logits) {
+        const auto* row = reinterpret_cast<const float*>(static_cast<const char*>(logits->data) +
+            (logits->ne[1]-1)*logits->nb[1]);
+        raw_logits->assign(row, row + logits->ne[0]);
+    }
     if (params) {
         result.distribution = BuildSamplingDistribution(logits, static_cast<int>(logits->ne[1] - 1), *params);
         result.token = SampleTokenWithRng(logits, static_cast<int>(logits->ne[1] - 1), *params, draft_rng_);
@@ -149,6 +165,20 @@ void ReferenceSession::Bootstrap(const InferenceDependencies* deps, const std::a
     prompt_tokens_.clear(); prompt_tokens_.shrink_to_fit();
     prompt_hidden_.clear(); prompt_hidden_.shrink_to_fit();
     bootstrapped_ = true;
+}
+void ReferenceSession::ReplayObservedTarget(const InferenceDependencies* deps, const std::atomic<bool>& cancelled) {
+    if (observed_target_tokens_.empty()) return;
+    CheckCancelled(cancelled);
+    const int keep = target_seen_ - static_cast<int>(observed_target_tokens_.size());
+    if (keep < 0 || keep > head_past_ || !cache_->block_manager->RollbackExclusiveSuffix(&blocks_, keep))
+        throw std::runtime_error("MTP accepted head-prefix rollback failed");
+    head_past_ = keep;
+    // Draft rollout used approximate hidden feedback. Accepted prefix KV must
+    // instead use previous actual target h followed by current target h[0..j-1],
+    // matching pinned llama speculative process(), not just the newest anchor.
+    ForwardHead(observed_target_tokens_, observed_target_inputs_, nullptr, deps);
+    observed_target_tokens_.clear();
+    observed_target_inputs_.clear();
 }
 void ReferenceSession::MakeProposals(int selected_token, const SamplingParams& params,
                                      const InferenceDependencies* deps, const std::atomic<bool>& cancelled) {
@@ -231,17 +261,7 @@ void ReferenceSession::CompleteBatched(const int* inputs, const float* hidden, s
     if (result.tokens.size() != result.accepted_draft_tokens + 1 || result.tokens.empty())
         throw std::invalid_argument("invalid verification output boundary");
     ObserveTarget(inputs, hidden, stride, static_cast<int>(result.accepted_draft_tokens + 1), false);
-    if (target_seen_ > head_past_) {
-        // K proposals processed head inputs x0..x(K-1), whereas the K+1
-        // target graph also consumed xK to produce the bonus distribution.
-        // Catch that last accepted input up before starting the next head run.
-        const size_t last = result.accepted_draft_tokens;
-        if (!last || target_seen_ != head_past_ + 1)
-            throw std::runtime_error("MTP head/target acceptance boundary mismatch");
-        std::vector<float> previous(hidden + (last-1)*stride,
-                                    hidden + (last-1)*stride + source_.hparams.n_embd);
-        ForwardHead({inputs[last]}, previous, nullptr, deps);
-    }
+    ReplayObservedTarget(deps, cancelled);
     auto history = params.token_history ? *params.token_history : std::vector<int>{};
     GrammarConstraint grammar = params.grammar ? *params.grammar : GrammarConstraint{};
     for (size_t i = 0; i + 1 < result.tokens.size(); ++i) {
@@ -279,6 +299,7 @@ int ReferenceSession::Sample(ggml_tensor* target_logits, int column, const Sampl
         else { ++rejected_; pending_.clear(); }
     }
     Bootstrap(deps, cancelled);
+    ReplayObservedTarget(deps, cancelled);
     if (pending_.empty() && target_seen_ < max_context_ && selected != source_.eos_token_id &&
         std::find(source_.stop_token_ids.begin(), source_.stop_token_ids.end(), selected) == source_.stop_token_ids.end()) {
         MakeProposals(selected, params, deps, cancelled);

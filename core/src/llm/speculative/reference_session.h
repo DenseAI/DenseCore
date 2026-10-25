@@ -44,11 +44,14 @@ public:
     uint64_t TargetRollbacks() const { return target_rollbacks_; }
     void NoteTargetRollback() { ++target_rollbacks_; }
 private:
+    friend struct ReferenceSessionTestAccess;
     struct HeadOutput { std::vector<float> hidden; Distribution distribution; int token = -1; };
     struct Proposal { int token; Distribution distribution; };
     HeadOutput ForwardHead(const std::vector<int>& tokens, const std::vector<float>& hidden,
-                           const SamplingParams* params, const InferenceDependencies* deps);
+                           const SamplingParams* params, const InferenceDependencies* deps,
+                           std::vector<float>* raw_logits = nullptr);
     void Bootstrap(const InferenceDependencies* deps, const std::atomic<bool>& cancelled);
+    void ReplayObservedTarget(const InferenceDependencies* deps, const std::atomic<bool>& cancelled);
     void MakeProposals(int selected_token, const SamplingParams& params, const InferenceDependencies* deps,
                        const std::atomic<bool>& cancelled);
     TransformerModel& source_;
@@ -57,6 +60,8 @@ private:
     std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work_;
     std::vector<int> blocks_, prompt_tokens_;
     std::vector<float> prompt_hidden_, last_hidden_;
+    std::vector<int> observed_target_tokens_;
+    std::vector<float> observed_target_inputs_;
     std::deque<Proposal> pending_;
     std::mt19937 draft_rng_, accept_rng_;
     int max_context_, draft_n_max_, threads_, head_past_ = 0, target_seen_ = 0;
