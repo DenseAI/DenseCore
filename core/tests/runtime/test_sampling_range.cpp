@@ -66,7 +66,9 @@ TEST(JsonGrammarConstraint, RejectsCombinedStructuralTokensAndConsumesWholeToken
     EXPECT_EQ(grammar.state, JSONState::COMPLETED);
 }
 
-int SampleTokenLegacyReference(ggml_tensor* logits, int idx, const SamplingParams& params) {
+// Materialize probabilities independently of the fused heap-based sampler.
+// Nucleus probability is conditional on the support left by earlier filters.
+int SampleTokenReference(ggml_tensor* logits, int idx, const SamplingParams& params) {
     if (!logits || !logits->data) return 0;
 
     float* logits_data = static_cast<float*>(logits->data);
@@ -257,12 +259,14 @@ int SampleTokenLegacyReference(ggml_tensor* logits, int idx, const SamplingParam
         prob_idx.erase(it, prob_idx.end());
     }
     if (params.top_p < 1.0f && !prob_idx.empty()) {
+        float retained_probability = 0.0f;
+        for (const auto& candidate : prob_idx) retained_probability += candidate.first;
         float cumulative = 0.0f;
         size_t cutoff = 0;
         for (size_t i = 0; i < prob_idx.size(); ++i) {
             cumulative += prob_idx[i].first;
             cutoff = i + 1;
-            if (cumulative >= params.top_p) break;
+            if (cumulative >= params.top_p * retained_probability) break;
         }
         prob_idx.resize(cutoff);
     }
@@ -347,7 +351,7 @@ TEST(SamplingRangeTest, InvalidRangeFallsBackToFullVocab) {
     EXPECT_EQ(token, 6);
 }
 
-TEST(SamplingRangeTest, FusedTopKTopPMatchesLegacyReference) {
+TEST(SamplingRangeTest, FusedTopKTopPMatchesConditionalReference) {
     ggml_init_params p = {
         .mem_size = 1024 * 1024,
         .mem_buffer = nullptr,
@@ -367,10 +371,10 @@ TEST(SamplingRangeTest, FusedTopKTopPMatchesLegacyReference) {
     params.top_p = 0.72f;
     params.seed = 42;
 
-    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenLegacyReference(logits, 0, params));
+    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenReference(logits, 0, params));
 }
 
-TEST(SamplingRangeTest, FusedMinPMatchesLegacyReference) {
+TEST(SamplingRangeTest, FusedMinPMatchesConditionalReference) {
     ggml_init_params p = {
         .mem_size = 1024 * 1024,
         .mem_buffer = nullptr,
@@ -391,7 +395,7 @@ TEST(SamplingRangeTest, FusedMinPMatchesLegacyReference) {
     params.min_p = 0.18f;
     params.seed = 7;
 
-    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenLegacyReference(logits, 0, params));
+    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenReference(logits, 0, params));
 }
 
 TEST(SamplingRangeTest, PenaltiesAndDisallowedMatchLegacyReference) {
@@ -423,10 +427,10 @@ TEST(SamplingRangeTest, PenaltiesAndDisallowedMatchLegacyReference) {
     params.disallowed_token_ids = &disallowed;
     params.seed = 19;
 
-    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenLegacyReference(logits, 0, params));
+    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenReference(logits, 0, params));
 }
 
-TEST(SamplingRangeTest, ActionRangeWithPenaltiesMatchesLegacyReference) {
+TEST(SamplingRangeTest, ActionRangeWithPenaltiesMatchesConditionalReference) {
     ggml_init_params p = {
         .mem_size = 1024 * 1024,
         .mem_buffer = nullptr,
@@ -453,7 +457,7 @@ TEST(SamplingRangeTest, ActionRangeWithPenaltiesMatchesLegacyReference) {
     params.token_history = &token_history;
     params.seed = 123;
 
-    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenLegacyReference(logits, 0, params));
+    EXPECT_EQ(SampleToken(logits, 0, params), SampleTokenReference(logits, 0, params));
 }
 
 TEST(SamplingRangeTest, TemperatureZeroUsesGreedyEvenWithTopKAndTopP) {
