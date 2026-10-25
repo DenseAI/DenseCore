@@ -16,6 +16,7 @@ struct AutomaticCaptureFixture : testing::Test {
         inputs.pool_threads=4;inputs.physical_cores=4;
         inputs.simd=densecore::simd::SimdLevel::AVX2;
         inputs.affinity={0,1,2,3};inputs.build_sha256=std::string(64,'a');
+        inputs.dependency_sha256=qualification::Sha256Hex("resolved GGML object bytes");
         inputs.resources.cpu_quota_state=ResourceState::Unlimited;
         inputs.resources.effective_threads=4;
         files["/sys/devices/system/node/online"]="0\n";
@@ -78,6 +79,16 @@ TEST_F(AutomaticCaptureFixture, AllCpuFeatureWordsAndMultiwordKeysAreRetained) {
     text.replace(at,8,"fpu avx2 avx512f");
     const auto changed=Capture();ASSERT_TRUE(changed.Complete());
     EXPECT_NE(original.cpu.cpu_identity,changed.cpu.cpu_identity);
+}
+TEST_F(AutomaticCaptureFixture, LinkedDependencyBytesAndAllocatorInterpositionAreQualified) {
+    const auto before=Capture();ASSERT_TRUE(before.Complete());
+    inputs.dependency_sha256=qualification::Sha256Hex("alternate ABI-compatible GGML");
+    EXPECT_NE(before.cpu.build_sha256,Capture().cpu.build_sha256);
+    inputs.dependency_sha256.clear();EXPECT_FALSE(Capture().Complete());
+    inputs.dependency_sha256=qualification::Sha256Hex("resolved GGML object bytes");
+    for(const char* key:{"LD_PRELOAD","MIMALLOC_SHOW_STATS","MI_OPTION_VERBOSE","GLIBC_TUNABLES"}) {
+        inputs.environment={{key,"1"}};EXPECT_FALSE(Capture().Complete())<<key;
+    }
 }
 TEST_F(AutomaticCaptureFixture, InvalidDtypeAndZeroDimensionsFailClosed) {
     EXPECT_FALSE(detail::Capture(state,model,2048,1,static_cast<ggml_type>(GGML_TYPE_COUNT),inputs).Complete());

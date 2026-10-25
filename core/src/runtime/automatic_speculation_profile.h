@@ -19,6 +19,9 @@ inline constexpr std::array<const char*,0> kKnownNativeEnvironment{};
 #endif
 #if defined(__linux__)
 #include <sched.h>
+#include <dlfcn.h>
+#include <sys/sysmacros.h>
+#include "ggml-cpu.h"
 extern char** environ;
 #endif
 
@@ -33,7 +36,7 @@ struct Inputs {
     Environment environment;
     int pool_threads=0,physical_cores=0;
     densecore::simd::SimdLevel simd=densecore::simd::SimdLevel::NONE;
-    std::string build_sha256;
+    std::string build_sha256, dependency_sha256;
 };
 inline bool CpuIds(const std::string& text,std::vector<int>& ids) {
     ids.clear();
@@ -176,11 +179,58 @@ inline void EffectivePolicy(std::ostringstream& out,const EngineState& state) {
     DC_PROFILE(f.matmul_dispatch_census);DC_PROFILE(f.bench_respect_threads);DC_PROFILE(state.numa_node_id);DC_PROFILE(state.pinning_policy);
 #undef DC_PROFILE
 }
+// Bind the linked GGML ABI to actual resolved objects, not just CMake inputs.
+// Static linkage into DenseCore cannot be independently hashed without making
+// registry DATA self-referential, so that configuration remains unqualified.
+inline std::string LoadedDependencyIdentity() {
+#if defined(__linux__)
+    Dl_info self{};
+    if(!dladdr(reinterpret_cast<const void*>(&LoadedDependencyIdentity),&self))return {};
+    std::string mappings;if(!ReadResourceFile("/proc/self/maps",mappings))return {};
+    std::ostringstream manifest;
+    const std::pair<const char*,const void*> symbols[]={
+        {"ggml-base",reinterpret_cast<const void*>(&ggml_init)},
+        {"ggml-cpu",reinterpret_cast<const void*>(&ggml_backend_cpu_init)},
+        {"ggml-registry",reinterpret_cast<const void*>(&ggml_backend_reg_count)}};
+    for(const auto& symbol:symbols) {
+        Dl_info owner{};
+        if(!dladdr(symbol.second,&owner)||!owner.dli_fname||owner.dli_fbase==self.dli_fbase)return {};
+        std::error_code error;
+        const auto path=std::filesystem::canonical(owner.dli_fname,error);
+        if(error)return {};
+        const auto stamp=qualification::CaptureFileStamp(path.string());if(!stamp)return {};
+        bool matched=false;std::istringstream lines(mappings);std::string line;
+        while(std::getline(lines,line)) {
+            std::istringstream fields(line);std::string range,permissions,offset,device,inode;
+            if(!(fields>>range>>permissions>>offset>>device>>inode))continue;
+            const auto dash=range.find('-'),colon=device.find(':');
+            if(dash==std::string::npos||colon==std::string::npos)continue;
+            try {
+                const auto address=reinterpret_cast<uintptr_t>(symbol.second);
+                const auto begin=std::stoull(range.substr(0,dash),nullptr,16);
+                const auto end=std::stoull(range.substr(dash+1),nullptr,16);
+                if(address<begin||address>=end)continue;
+                const auto dev=makedev(std::stoul(device.substr(0,colon),nullptr,16),std::stoul(device.substr(colon+1),nullptr,16));
+                matched=permissions.find('x')!=std::string::npos && stamp->inode==std::stoull(inode) && stamp->device==dev;
+            } catch(...) { return {}; }
+            if(matched)break;
+        }
+        if(!matched)return {};
+        const auto identity=qualification::HashLoadedModel(path.string(),*stamp,false);
+        if(!identity.stable_single_file||!identity.matches_loaded_file)return {};
+        Field(manifest,symbol.first,identity.sha256);
+    }
+    return qualification::Sha256Hex(manifest.str());
+#else
+    return {};
+#endif
+}
 inline qualification::RuntimeConditions Capture(const EngineState& state,const TransformerModel& model,
     uint32_t context,uint32_t concurrency,ggml_type kv,const Inputs& in) {
     qualification::RuntimeConditions result;
     if(!context||!concurrency||concurrency>8||kv<0||kv>=GGML_TYPE_COUNT||state.n_threads<=0||in.pool_threads<=0||in.physical_cores<=0||
        !qualification::CanonicalIds(in.affinity)||!qualification::IsDigest(in.build_sha256)||
+       !qualification::IsDigest(in.dependency_sha256)||
        in.resources.cpu_quota_state==ResourceState::Unknown) return result;
     // Initial qualified policy deliberately excludes partial affinity/cpuset masks:
     // lazy pool affinity may otherwise differ from the calling thread.
@@ -191,7 +241,10 @@ inline qualification::RuntimeConditions Capture(const EngineState& state,const T
        !in.read_file("/sys/devices/system/node/node0/cpulist",node_cpus)||!CpuIds(node_cpus,node_cpu_ids)||
        in.affinity!=online_ids||in.affinity!=node_cpu_ids||state.numa_node_id>0||state.numa_node_id < -1) return result;
     std::ostringstream policy;policy.imbue(std::locale::classic());
-    for(const auto& item:in.environment) if(Relevant(item.first)) {
+    for(const auto& item:in.environment) {
+        if(item.first=="LD_PRELOAD" || item.first=="GLIBC_TUNABLES" ||
+           item.first.rfind("MIMALLOC_",0)==0 || item.first.rfind("MI_",0)==0)return result;
+        if(!Relevant(item.first))continue;
         if(std::find_if(kKnownNativeEnvironment.begin(),kKnownNativeEnvironment.end(),
               [&](const char* key){return item.first==key;})==kKnownNativeEnvironment.end())return result;
         if(!ModeOnly(item.first))Field(policy,item.first,item.second);
@@ -229,7 +282,7 @@ inline qualification::RuntimeConditions Capture(const EngineState& state,const T
         if(batch==1){result.cpu.prefill_threads=prefill;result.cpu.decode_threads=decode;}
     }
     result.cpu.cpu_identity=CpuIdentity(in);if(result.cpu.cpu_identity.empty())return {};
-    result.cpu.build_sha256=qualification::Sha256Hex(in.build_sha256+CompiledIsa());
+    result.cpu.build_sha256=qualification::Sha256Hex(in.build_sha256+CompiledIsa()+in.dependency_sha256);
     result.cpu.simd=densecore::simd::SimdLevelName(simd);
     result.cpu.runtime_policy_sha256=qualification::Sha256Hex(policy.str());
     result.cpu.pool_threads=in.pool_threads;result.cpu.affinity_cpus=in.affinity;result.cpu.numa_nodes={0};
@@ -247,7 +300,7 @@ inline densecore::llm::speculative::qualification::RuntimeConditions CaptureAuto
     const EngineState& state,const TransformerModel& model,uint32_t context,uint32_t concurrency,ggml_type kv) {
     using namespace automatic_profile_detail;
     Inputs in;in.read_file=ReadResourceFile;in.resources=DetectResourceBudget();in.environment=ReadEnvironment();
-    in.build_sha256=kNativeBuildFingerprint;in.simd=densecore::simd::DetectSimdLevel();
+    in.build_sha256=kNativeBuildFingerprint;in.dependency_sha256=LoadedDependencyIdentity();in.simd=densecore::simd::DetectSimdLevel();
 #if defined(__linux__)
     cpu_set_t cpus;CPU_ZERO(&cpus);
     if(sched_getaffinity(0,sizeof(cpus),&cpus)!=0)return {};
