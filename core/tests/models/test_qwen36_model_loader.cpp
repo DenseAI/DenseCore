@@ -289,7 +289,8 @@ void SetBaseQwen38AuxMetadata(gguf_context* ctx, const char* metadata_prefix = "
     SetTokenizerMetadata(ctx);
 }
 
-bool WriteGguf(const std::string& path, void (*fill)(gguf_context*)) {
+template <typename Fill>
+bool WriteGguf(const std::string& path, Fill fill) {
     gguf_context* ctx = gguf_init_empty();
     fill(ctx);
     const bool ok = gguf_write_to_file(ctx, path.c_str(), false);
@@ -318,6 +319,24 @@ bool WriteMetadataFirstSplitGguf(const TempSplitPaths& paths) {
 }
 
 }  // namespace
+
+TEST(Qwen36ModelLoaderTest, PreservesExplicitAndMissingTokenizerEosPolicy) {
+    for (int policy : {-1, 0, 1}) {
+        SCOPED_TRACE(policy);
+        TempPath tmp;
+        ASSERT_TRUE(WriteGguf(tmp.path(), [policy](gguf_context* ctx) {
+            SetBaseQwen36AuxMetadata(ctx, "qwen35", /*include_interval=*/true);
+            if (policy >= 0) {
+                gguf_set_val_bool(ctx, "tokenizer.ggml.add_eos_token", policy != 0);
+            }
+            AddMinimalHybridTensors(ctx, /*n_layers=*/4, /*include_moe=*/false);
+        }));
+        std::unique_ptr<TransformerModel> model(LoadGGUFModel(tmp.path().c_str()));
+        ASSERT_NE(model, nullptr);
+        EXPECT_EQ(model->tokenizer_add_eos, policy == 1);
+        EXPECT_FALSE(model->tokenizer_add_bos);
+    }
+}
 
 TEST(Qwen36ModelLoaderTest, Dense27bMetadataMapsModelToQwen36HybridSsmFamily) {
     TempPath tmp;

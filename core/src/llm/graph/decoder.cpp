@@ -1419,11 +1419,15 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             }
 
             if (!skip_rope) {
-                const int rope_mode = model->arch_flags.is_gemma4 ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL;
+                const bool qwen3_neox_rope = model->arch == ModelArch::QWEN3;
+                const int rope_mode = (model->arch_flags.is_gemma4 || qwen3_neox_rope) ? GGML_ROPE_TYPE_NEOX
+                                                                                   : GGML_ROPE_TYPE_NORMAL;
                 struct ggml_tensor* Q_rope_fast = nullptr;
                 struct ggml_tensor* K_rope_fast = nullptr;
                 const bool can_use_precomputed_rope =
-                    (DENSECORE_DEFAULT_PRECOMPUTED_ROPE != 0) &&
+                    // The precomputed kernel currently uses adjacent pairs, while
+                    // Qwen3 GGUF Q/K tensors retain Hugging Face split-half order.
+                    (DENSECORE_DEFAULT_PRECOMPUTED_ROPE != 0) && !qwen3_neox_rope &&
                     (!model->arch_flags.is_gemma4 ||
                      (use_gemma4_proportional_rope && rope_freq_factors == nullptr && !gemma4_shared_kv_layer));
                 if (can_use_precomputed_rope) {
@@ -2950,7 +2954,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     }
 
     const bool per_sequence_prefill_logits =
-        ShouldUsePrefillPerSequenceLastLogits(model, batch, static_cast<int>(cur->ne[1]));
+        !embedding_mode && ShouldUsePrefillPerSequenceLastLogits(model, batch, static_cast<int>(cur->ne[1]));
     if (per_sequence_prefill_logits) {
         struct ggml_tensor* gathered = nullptr;
         for (int seq = 0; seq < batch.num_seqs; ++seq) {
@@ -2970,6 +2974,9 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
     cur = apply_weighted_rms_norm(cur, model->output_norm, "output_norm", static_cast<int>(model->layers.size()));
 
     if (embedding_mode) {
+        if (gf) {
+            ggml_build_forward_expand(gf, cur);
+        }
         return cur;
     }
 

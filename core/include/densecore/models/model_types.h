@@ -714,6 +714,7 @@ struct TransformerModel {
     int32_t mask_token_id = -1;
     std::string tokenizer_type;
     bool tokenizer_add_bos = false;
+    bool tokenizer_add_eos = false;
 
     // Pre-computed RoPE cos/sin table (interleaved: [cos, sin, cos, sin, ...])
     // Layout: [max_seq_len, head_dim] where each pair is (cos, sin)

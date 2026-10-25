@@ -459,9 +459,7 @@ static std::vector<float> ExecuteTransformerGraphForTestImpl(TransformerModel* m
     struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
     struct ggml_tensor* output = BuildTransformerGraph(model, cache, ctx, batch, embedding_mode, gf, nullptr, nullptr);
     if (output) {
-        if (ggml_graph_n_nodes(gf) == 0) {
-            ggml_build_forward_expand(gf, output);
-        }
+        // Match production: the builder must register its output in the graph.
         ggml_graph_compute_with_ctx(ctx, gf, std::max(1, num_threads));
         if (output->data && output->type == GGML_TYPE_F32) {
             const int rows = static_cast<int>(output->ne[0]);

@@ -3336,6 +3336,10 @@ TransformerModel* LoadGGUFModel(const char* path) {
     }
 
     model->tokenizer_add_bos = add_bos;
+    const int idx_add_eos = gguf_find_key(ctx_gguf, "tokenizer.ggml.add_eos_token");
+    model->tokenizer_add_eos = idx_add_eos != -1 && gguf_get_kv_type(ctx_gguf, idx_add_eos) == GGUF_TYPE_BOOL &&
+                               gguf_get_val_bool(ctx_gguf, idx_add_eos);
+
 
     // 2. Load Vocab
     int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");

@@ -399,6 +399,31 @@ std::vector<float> ApplyWeightedRmsNormRef(const std::vector<float>& input, cons
 
 }  // namespace
 
+TEST(Gemma4FallbackDecodeTest, EmbeddingGraphComputesEveryPromptTokenWithoutLogitProjection) {
+    auto model = MakeBaseGemma4GraphModel(/*n_layer=*/0);
+    model->hparams.n_experts = 128;
+    SetTensorData(model->tok_embeddings, {1.0f, 2.0f, 3.0f, 1.0f});
+    // A zero LM head ensures hidden embeddings cannot come from projected logits.
+    BatchSpec batch = MakeSingleSequencePrefillBatch({0, 1, 1, 0});
+    batch.num_seqs = 2;
+    batch.seq_id = {0, 0, 1, 1};
+    batch.pos = {0, 1, 0, 1};
+    batch.n_past = {0, 0};
+    batch.block_tables = {{0}, {1}};
+    const auto embeddings = densecore::testing::ExecuteTransformerGraphEmbeddingsForTest(
+        model.get(), nullptr, batch, /*num_threads=*/1);
+    ASSERT_EQ(embeddings.size(), 8u);
+    const float scale = std::sqrt(static_cast<float>(model->hparams.n_embd));
+    for (size_t token = 0; token < batch.tokens.size(); ++token) {
+        const std::vector<float> input = batch.tokens[token] == 0 ? std::vector<float>{scale, 2.0f * scale}
+                                                   : std::vector<float>{3.0f * scale, scale};
+        const auto expected = ApplyWeightedRmsNormRef(input, {1.0f, 1.0f});
+        for (size_t dim = 0; dim < 2; ++dim) {
+            EXPECT_NEAR(embeddings[token * 2 + dim], expected[dim], 1e-5f);
+        }
+    }
+}
+
 TEST(Gemma4FallbackDecodeTest, LayerOutputScaleAppliesAfterResidualAddition) {
     auto model = MakeBaseGemma4GraphModel(/*n_layer=*/1);
     model->gemma4_layer_is_sliding[0] = 0u;
@@ -955,5 +980,126 @@ TEST(Gemma4FallbackDecodeTest, GqaDecodeFallbackMatchesFlashReference) {
     ASSERT_EQ(runtime.size(), reference.size());
     for (size_t i = 0; i < runtime.size(); ++i) {
         EXPECT_NEAR(runtime[i], reference[i], 1e-5f) << "index=" << i;
+    }
+}
+
+namespace {
+
+// Keep HF's split-half Q/K layout: the GGUF converter does not interleave
+// Qwen3 projection rows. A four-dimensional head distinguishes the two layouts.
+std::unique_ptr<TransformerModel> MakeQwen3RotaryRegressionModel() {
+    constexpr int dim = 4;
+    auto model = std::make_unique<TransformerModel>();
+    model->arch = ModelArch::QWEN3;
+    model->variant = ModelVariant::QWEN3;
+    model->hparams.n_vocab = 2;
+    model->hparams.n_ctx = 8;
+    model->hparams.n_embd = dim;
+    model->hparams.n_head = 1;
+    model->hparams.n_head_kv = 1;
+    model->hparams.n_layer = 1;
+    model->hparams.n_rot = dim;
+    model->hparams.n_embd_head_k = dim;
+    model->hparams.n_embd_head_v = dim;
+    model->hparams.f_norm_rms_eps = 1e-5f;
+    model->hparams.rope_freq_base = 100.0f;
+    model->hparams.rope_freq_scale = 1.0f;
+    model->ctx_w = ggml_init({2ull * 1024ull * 1024ull, nullptr, false});
+    if (!model->ctx_w) return model;
+    auto ones = [&]() {
+        auto* tensor = ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, dim);
+        SetTensorData(tensor, std::vector<float>(dim, 1.0f));
+        return tensor;
+    };
+    auto matrix = [&](int inputs, int outputs, bool identity = false) {
+        auto* tensor = ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_F32, inputs, outputs);
+        std::vector<float> values(static_cast<size_t>(inputs * outputs), 0.0f);
+        if (identity) {
+            for (int i = 0; i < inputs; ++i) values[static_cast<size_t>(i * inputs + i)] = 1.0f;
+        }
+        SetTensorData(tensor, values);
+        return tensor;
+    };
+    model->tok_embeddings = matrix(dim, 2);
+    SetTensorData(model->tok_embeddings, {1.0f, 0.2f, -0.7f, 2.0f, -0.5f, 1.3f, 0.4f, -0.9f});
+    model->output_norm = ones();
+    model->output = matrix(dim, 2);
+    model->layers.resize(1);
+    auto& layer = model->layers[0];
+    layer.Set(model_keys::kAttnNorm, ones());
+    layer.Set(model_keys::kFfnNorm, ones());
+    layer.Set(model_keys::kAttnQNorm, ones());
+    layer.Set(model_keys::kAttnKNorm, ones());
+    for (const char* key : {model_keys::kAttnQWeight, model_keys::kAttnKWeight,
+                            model_keys::kAttnVWeight, model_keys::kAttnOWeight}) {
+        layer.Set(key, matrix(dim, dim, true));
+    }
+    layer.Set(model_keys::kFfnGate, matrix(dim, dim * 4));
+    layer.Set(model_keys::kFfnUp, matrix(dim, dim * 4));
+    layer.Set(model_keys::kFfnDown, matrix(dim * 4, dim));
+    // Populate the legacy table too: selecting its adjacent-pair kernel would
+    // still be incorrect even if the ordinary GGML path uses NEOX correctly.
+    InitRoPETable(model.get());
+    return model;
+}
+
+std::vector<float> Qwen3CausalRotaryReference() {
+    const std::array<std::vector<float>, 2> input = {
+        std::vector<float>{1.0f, 0.2f, -0.7f, 2.0f},
+        std::vector<float>{-0.5f, 1.3f, 0.4f, -0.9f}};
+    const std::vector<float> weight(4, 1.0f);
+    std::array<std::vector<float>, 2> value, rotated;
+    for (int token = 0; token < 2; ++token) {
+        value[token] = ApplyWeightedRmsNormRef(input[token], weight);
+        const auto qk = ApplyWeightedRmsNormRef(value[token], weight);
+        rotated[token].resize(4);
+        for (int pair = 0; pair < 2; ++pair) {
+            const double angle = token * std::pow(100.0, -2.0 * pair / 4.0);
+            rotated[token][pair] = static_cast<float>(qk[pair] * std::cos(angle) - qk[pair + 2] * std::sin(angle));
+            rotated[token][pair + 2] = static_cast<float>(qk[pair + 2] * std::cos(angle) + qk[pair] * std::sin(angle));
+        }
+    }
+    std::vector<float> result;
+    for (int token = 0; token < 2; ++token) {
+        std::vector<double> scores(static_cast<size_t>(token + 1));
+        double denominator = 0.0;
+        for (int previous = 0; previous <= token; ++previous) {
+            double score = 0.0;
+            for (int dim = 0; dim < 4; ++dim) score += rotated[token][dim] * rotated[previous][dim];
+            scores[previous] = std::exp(score / std::sqrt(4.0));
+            denominator += scores[previous];
+        }
+        std::vector<float> residual = input[token];
+        for (int dim = 0; dim < 4; ++dim) {
+            double attention = 0.0;
+            for (int previous = 0; previous <= token; ++previous) {
+                attention += scores[previous] / denominator * value[previous][dim];
+            }
+            residual[dim] += static_cast<float>(attention);
+        }
+        const auto hidden = ApplyWeightedRmsNormRef(residual, weight);
+        result.insert(result.end(), hidden.begin(), hidden.end());
+    }
+    return result;
+}
+
+}  // namespace
+
+TEST(Qwen3EmbeddingGraphTest, SplitHalfRotaryMatchesCausalAttentionReference) {
+    ScopedFlashAttentionDisableForTest standard_attention;
+    auto model = MakeQwen3RotaryRegressionModel();
+    ASSERT_NE(model->ctx_w, nullptr);
+    auto cache = MakeTinyGraphCache(model.get());
+    ASSERT_NE(cache, nullptr);
+    const int block_id = cache->block_manager->AllocateSingle();
+    ASSERT_GE(block_id, 0);
+    auto batch = MakeSingleSequencePrefillBatch({0, 1});
+    batch.block_tables = {{block_id}};
+    const auto actual = densecore::testing::ExecuteTransformerGraphEmbeddingsForTest(
+        model.get(), cache.get(), batch, /*num_threads=*/1);
+    const auto expected = Qwen3CausalRotaryReference();
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(actual[i], expected[i], 2e-4f) << "hidden index=" << i;
     }
 }
