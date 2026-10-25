@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -164,4 +166,88 @@ TEST(Qwen35CanonicalMatmulTest, AdmissionRequiresActualOrdinaryOwnershipAndExclu
     model->layers[0].Set(model_keys::kFfnGate,weight);
     auto* half_input=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,1024,4);
     EXPECT_FALSE(densecore::testing::IsQwen35OrdinaryDenseQ4KProjectionForTest(model.get(),weight,half_input));
+}
+
+namespace {
+constexpr int kSsmQ5Input = 1024, kSsmQ5Output = 6144;
+std::vector<float> RunSsmQ5(TransformerModel* model, ggml_tensor* weight,
+                            const std::vector<float>& values, int columns, int first, int threads, bool padded) {
+    std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(
+        CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+    struct Restore { InferenceWorkContext* previous; ~Restore(){SetCurrentWorkContext(previous);} } restore{GetCurrentWorkContext()};
+    SetCurrentWorkContext(work.get()); ResetInferenceWorkContext(work.get()); work->model_variant=ModelVariant::QWEN35;
+    BatchSpec batch{}; batch.num_seqs=columns; batch.tokens.assign(columns,0);
+    for(int c=0;c<columns;++c) {batch.seq_id.push_back(c);batch.pos.push_back(37+c);batch.n_past.push_back(37+c);}
+    densecore::llm::config::FastPathRuntimeConfig config;
+    InferenceDependencies deps;deps.fast_path_config=&config;batch.deps=&deps;
+    SetCurrentBatch(&batch);SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({2*1024*1024,nullptr,false}),ggml_free);
+    auto* storage=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,kSsmQ5Input+(padded?16:0),columns);
+    std::fill_n(static_cast<float*>(storage->data),ggml_nelements(storage),std::numeric_limits<float>::quiet_NaN());
+    auto* input=padded?ggml_view_2d(ctx.get(),storage,kSsmQ5Input,columns,storage->nb[1],0):storage;
+    for(int c=0;c<columns;++c)
+        std::memcpy(static_cast<char*>(input->data)+c*input->nb[1],values.data()+(first+c)*kSsmQ5Input,kSsmQ5Input*sizeof(float));
+    auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(),weight,input,model,static_cast<int>(InferenceExecutionPhase::Decode));
+    struct Params {ggml_custom_op_t fun;int tasks;void* userdata;} params{};
+    if(output->op!=GGML_OP_CUSTOM)throw std::runtime_error("SSM Q5 fixture lost native custom callback");
+    std::memcpy(&params,output->op_params,sizeof(params));
+    if(columns==1)EXPECT_EQ(params.fun,cb_gemv_custom); // Protect the untouched old singleton selector.
+    params.tasks=threads;std::memcpy(output->op_params,&params,sizeof(params));
+    auto* graph=ggml_new_graph_custom(ctx.get(),128,false);ggml_build_forward_expand(graph,output);
+    EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,threads),GGML_STATUS_SUCCESS);
+    std::vector<float> result(kSsmQ5Output*columns);
+    for(int c=0;c<columns;++c)
+        std::memcpy(result.data()+c*kSsmQ5Output,static_cast<char*>(output->data)+c*output->nb[1],kSsmQ5Output*sizeof(float));
+    return result;
+}
+}
+
+TEST(Qwen35CanonicalMatmulTest, SsmQ5ProjectionMatchesInitializedCpuPrimitiveAndOwnedOldM1Bits) {
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({16*1024*1024,nullptr,false}),ggml_free);
+    ASSERT_NE(ctx,nullptr); // Initializes the GGML scalar/FP16 conversion tables before quantization.
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(),ggml_backend_free);
+    ASSERT_NE(cpu,nullptr);
+    const auto* q5=ggml_get_type_traits_cpu(GGML_TYPE_Q5_K);
+    const auto* q8=ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    ASSERT_NE(q5,nullptr);ASSERT_NE(q8,nullptr);ASSERT_NE(q5->vec_dot,nullptr);ASSERT_NE(q8->from_float,nullptr);
+    ASSERT_EQ(q5->vec_dot_type,GGML_TYPE_Q8_K);
+    ASSERT_EQ(ggml_row_size(GGML_TYPE_Q8_K,kSsmQ5Input),1168u);
+    std::vector<float> values(8*kSsmQ5Input),row(kSsmQ5Input);
+    for(int c=0;c<8;++c)for(int i=0;i<kSsmQ5Input;++i)
+        values[c*kSsmQ5Input+i]=std::sin((i+1)*.017f+c*.31f)+.37f*std::cos((i+7)*.031f-c*.13f);
+    for(bool padded_weight:{false,true}) {
+        SCOPED_TRACE(padded_weight);
+        auto* storage=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_Q5_K,kSsmQ5Input,kSsmQ5Output*(padded_weight?2:1));
+        std::memset(storage->data,0xA5,ggml_nbytes(storage)); // Poison gaps that are not semantic Q5 rows.
+        auto* weight=padded_weight?ggml_view_2d(ctx.get(),storage,kSsmQ5Input,kSsmQ5Output,2*storage->nb[1],0):storage;
+        ggml_set_name(weight,"blk.0.attn_qkv.weight");
+        for(int out=0;out<kSsmQ5Output;++out) {
+            for(int i=0;i<kSsmQ5Input;++i)
+                row[i]=.31f*std::sin((i+7)*(out+3)*.0017f)+.125f*std::cos((i%37-out%19)*.11f);
+            ggml_quantize_chunk(GGML_TYPE_Q5_K,row.data(),static_cast<char*>(weight->data)+out*weight->nb[1],0,1,kSsmQ5Input,nullptr);
+        }
+        auto model=MakePoint8B();model->layers[0].Set(model_keys::kAttnQkvWeight,weight);
+        std::vector<std::vector<float>> expected;
+        for(int c=0;c<8;++c) {
+            alignas(64) std::array<unsigned char,1168> quant{};
+            q8->from_float(values.data()+c*kSsmQ5Input,quant.data(),kSsmQ5Input);
+            std::vector<float> reference(kSsmQ5Output);
+            for(int out=0;out<kSsmQ5Output;++out)
+                q5->vec_dot(kSsmQ5Input,&reference[out],0,static_cast<char*>(weight->data)+out*weight->nb[1],0,quant.data(),0,1);
+            ASSERT_TRUE(std::all_of(reference.begin(),reference.end(),[](float x){return std::isfinite(x);}));
+            ASSERT_GT(std::abs(*std::max_element(reference.begin(),reference.end(),[](float a,float b){return std::abs(a)<std::abs(b);})),1e-3f);
+            const auto singleton=RunSsmQ5(model.get(),weight,values,1,c,1,false);
+            ASSERT_EQ(std::memcmp(singleton.data(),reference.data(),kSsmQ5Output*sizeof(float)),0)
+                <<"old M1 must first equal initialized independent CPU nrc1; column="<<c;
+            expected.push_back(std::move(reference));
+        }
+        for(int threads:{1,4,5,8})for(bool padded_input:{false,true})for(int columns:{1,2,3,4,8}) {
+            SCOPED_TRACE(threads);
+            SCOPED_TRACE(padded_input);
+            SCOPED_TRACE(columns);
+            const auto actual=RunSsmQ5(model.get(),weight,values,columns,0,threads,padded_input);
+            for(int c=0;c<columns;++c)
+                EXPECT_EQ(std::memcmp(actual.data()+c*kSsmQ5Output,expected[c].data(),kSsmQ5Output*sizeof(float)),0)<<"column="<<c;
+        }
+    }
 }
