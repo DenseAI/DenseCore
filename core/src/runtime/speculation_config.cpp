@@ -14,7 +14,7 @@ uint64_t Mul(uint64_t a, uint64_t b) {
 }
 }
 uint64_t SpeculationMemoryCost::Total() const {
-    return Add(Add(head_kv, prompt_hidden), Add(Add(graph, distributions), checkpoints));
+    return Add(Add(Add(head_kv, prompt_hidden), prompt_tokens), Add(Add(graph, distributions), checkpoints));
 }
 SpeculationMemoryCost CalculateSpeculationMemory(const TransformerModel& model, uint64_t context,
                                                  uint64_t concurrency, int draft_n_max) {
@@ -32,6 +32,7 @@ SpeculationMemoryCost CalculateSpeculationMemory(const TransformerModel& model, 
     SpeculationMemoryCost cost;
     cost.head_kv = Mul(Mul(head_bpt, rounded), concurrency);
     cost.prompt_hidden = Mul(Mul(Mul(context, model.hparams.n_embd), sizeof(float)), concurrency);
+    cost.prompt_tokens = Mul(Mul(context, sizeof(int)), concurrency);
     const uint64_t scores = Mul(Mul(16, model.hparams.n_head), context);
     cost.graph = Add(64ULL * 1024 * 1024,
         Mul(sizeof(float), Add(Mul(Mul(16, model.hparams.n_embd), 32), scores)));

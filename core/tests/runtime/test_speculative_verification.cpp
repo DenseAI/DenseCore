@@ -19,6 +19,9 @@
 
 namespace densecore::llm::speculative {
 struct ReferenceSessionTestAccess {
+    static std::pair<size_t, size_t> PromptCapacity(const ReferenceSession& session) {
+        return {session.prompt_tokens_.capacity(), session.prompt_hidden_.capacity()};
+    }
     static void TrimToTargetBoundary(ReferenceSession& session) {
         if (!session.cache_->block_manager->RollbackExclusiveSuffix(&session.blocks_, session.target_seen_))
             throw std::runtime_error("test head rollback failed");
@@ -271,6 +274,20 @@ TEST(MtpBatchedSession, AcceptedHeadPrefixMatchesSequentialActualTargetHiddenLog
         ASSERT_EQ(actual.size(), expected.size());
         for (size_t token = 0; token < actual.size(); ++token) EXPECT_NEAR(actual[token], expected[token], 2e-5f);
         ggml_free(ctx);
+    }
+}
+
+TEST(MtpBatchedSession, NonPowerOfTwoPromptKeepsItsChargedReservedCapacity) {
+    auto source = MakeTinyNextNSource();
+    constexpr size_t context = 17;
+    ReferenceSession session(*source, context, 3, 1234, 1);
+    const auto charged = std::make_pair(context, context * source->hparams.n_embd);
+    EXPECT_EQ(ReferenceSessionTestAccess::PromptCapacity(session), charged);
+    const int token = 1;
+    const float hidden[] = {3,4};
+    for (size_t row = 0; row < context; ++row) {
+        session.ObserveTarget(&token, hidden, 2, 1, true);
+        EXPECT_EQ(ReferenceSessionTestAccess::PromptCapacity(session), charged);
     }
 }
 

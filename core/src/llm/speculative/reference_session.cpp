@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace densecore::llm::speculative {
@@ -53,6 +54,15 @@ ReferenceSession::ReferenceSession(TransformerModel& model, int max_context, int
     if (max_context < 1 || draft_n_max < 1 || draft_n_max > 3 || !work_) {
         throw std::invalid_argument("invalid MTP reference session configuration");
     }
+    const size_t embedding = source_.hparams.n_embd;
+    if (!embedding || static_cast<size_t>(max_context_) > std::numeric_limits<size_t>::max() / embedding)
+        throw std::overflow_error("MTP prompt storage size overflow");
+    // Reserve the charged maximum once: row-by-row insert must not grow a
+    // geometric capacity or retain old+new context-sized buffers at its peak.
+    prompt_tokens_.reserve(static_cast<size_t>(max_context_));
+    prompt_hidden_.reserve(static_cast<size_t>(max_context_) * embedding);
+    observed_target_tokens_.reserve(static_cast<size_t>(draft_n_max_) + 1);
+    observed_target_inputs_.reserve((static_cast<size_t>(draft_n_max_) + 1) * embedding);
     // Keep streams separate from ordinary target sampling and other requests.
     if (seed == 0) seed = (static_cast<uint64_t>(std::random_device{}()) << 32) | std::random_device{}();
     std::seed_seq draft_seed{static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32), 0x4d545044u};

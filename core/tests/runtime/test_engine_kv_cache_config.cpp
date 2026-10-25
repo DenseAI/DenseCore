@@ -831,4 +831,5 @@ TEST(EngineKVCacheConfig, MtpMemoryCostChecksOverflowAndResolvesValueHeadDefault
     EXPECT_THROW(CalculateSpeculationMemory(model, UINT64_MAX, 1, 2), std::overflow_error);
     EXPECT_THROW(CalculateSpeculationMemory(model, 16, 0, 2), std::invalid_argument);
     EXPECT_THROW(CalculateSpeculationMemory(model, 16, 1, 4), std::invalid_argument);
+    EXPECT_EQ(cost.prompt_tokens, 16u * sizeof(int) * 2);
 }
