@@ -13,6 +13,7 @@
 #include "densecore/backend/flash_attention.h"
 #include "runtime/inference_types_internal.h"
 #include "llm/runtime/work_context_internal.h"
+#include "llm/runtime/work_context.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
@@ -2027,26 +2028,33 @@ TEST(Gemma4DecodeGraphTest, CanonicalQ8KActivationCacheBytesMatchSingleAndMatrix
 TEST(Gemma4DecodeGraphTest, CanonicalQ4KProjectionMatchesOwnedSingleColumnsAtEveryWidth) {
     constexpr int reduction=1536, max_columns=8;
     const auto values=MakeQ4KCanonicalInputs(max_columns);
-    std::unique_ptr<ggml_context,decltype(&ggml_free)> weights_ctx(ggml_init({16*1024*1024,nullptr,false}),ggml_free);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> weights_ctx(ggml_init({32*1024*1024,nullptr,false}),ggml_free);
     ASSERT_NE(weights_ctx,nullptr);
     struct Retire { ~Retire(){densecore::kernels::RetireRepackedWeightCaches();} } retire;
     densecore::kernels::RetireRepackedWeightCaches();
     const auto old_floor=densecore::kernels::Q4KRepackedGemvRuntimeCacheBudgetFloorBytes();
     struct Floor { size_t previous;~Floor(){densecore::kernels::Q4KRepackedGemvSetRuntimeCacheBudgetFloor(previous);} } floor{old_floor};
     densecore::kernels::Q4KRepackedGemvRaiseRuntimeCacheBudgetFloor(64*1024*1024);
-    for(auto type:{GGML_TYPE_Q4_K,GGML_TYPE_Q6_K})for(int outputs:{256,2048}) {
+    for(auto type:{GGML_TYPE_Q4_K,GGML_TYPE_Q6_K})for(int outputs:{256,2048})for(bool weight_strided:{false,true}) {
         SCOPED_TRACE(ggml_type_name(type));
         SCOPED_TRACE(outputs);
         auto model=MakeBaseGemma4GraphModel(1);
         model->variant=ModelVariant::GEMMA4;model->hparams.n_embd=reduction;
-        auto* weight=ggml_new_tensor_2d(weights_ctx.get(),type,reduction,outputs);
+        if (weight_strided && type != GGML_TYPE_Q4_K) continue;
+        auto* backing_weight=ggml_new_tensor_2d(weights_ctx.get(),type,reduction,outputs*(weight_strided?2:1));
+        auto* weight=weight_strided?ggml_view_2d(weights_ctx.get(),backing_weight,reduction,outputs,2*backing_weight->nb[1],0):backing_weight;
+        std::memset(backing_weight->data,0,ggml_nbytes(backing_weight));
         ggml_set_name(weight,outputs==256?"blk.0.attn_k.weight":"blk.0.attn_q.weight");
         std::vector<float> row(reduction);
         for(int out=0;out<outputs;++out) {
             for(int i=0;i<reduction;++i)row[i]=.75f*std::sin((i+7)*(out+3)*.0017f)+.125f*std::cos((i%37-out%19)*.11f);
             ggml_quantize_chunk(type,row.data(),static_cast<char*>(weight->data)+out*weight->nb[1],0,1,reduction,nullptr);
         }
-        const auto run=[&](int columns,int first_column,int threads,bool strided) {
+        const auto run=[&](int columns,int first_column,int threads,bool strided,
+                           densecore::env::RuntimeToggleMode mode=densecore::env::RuntimeToggleMode::On,
+                           bool lora=false,bool force_reference=false,
+                           InferenceExecutionPhase phase=InferenceExecutionPhase::Decode,
+                           bool disable_canonical=false) {
             std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
             struct Restore {InferenceWorkContext* previous;~Restore(){SetCurrentWorkContext(previous);}} restore{GetCurrentWorkContext()};
             SetCurrentWorkContext(work.get());ResetInferenceWorkContext(work.get());
@@ -2054,33 +2062,68 @@ TEST(Gemma4DecodeGraphTest, CanonicalQ4KProjectionMatchesOwnedSingleColumnsAtEve
             BatchSpec batch{};batch.num_seqs=columns;batch.tokens.assign(columns,0);
             for(int c=0;c<columns;++c){batch.seq_id.push_back(c);batch.pos.push_back(35+first_column+c);batch.n_past.push_back(35+first_column+c);}
             densecore::llm::config::FastPathRuntimeConfig config;
-            config.q4k_repacked_gemv=densecore::env::RuntimeToggleMode::On;
+            config.q4k_repacked_gemv=mode;
             config.q4k_repacked_gemv_allow_prefill=true;config.q4k_repacked_gemv_probe=false;config.q4k_repacked_gemv_disable_on_thrash=false;
             InferenceDependencies deps;deps.fast_path_config=&config;batch.deps=&deps;
-            SetCurrentBatch(&batch);SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+            if(lora)batch.lora_map[nullptr]={0}; // only policy presence; no adapter execution in smart matmul.
+            SetCurrentBatch(&batch);SetCurrentExecutionPhase(phase);
             std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({2*1024*1024,nullptr,false}),ggml_free);
             auto* backing=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,reduction+(strided?16:0),columns);
             auto* input=strided?ggml_view_2d(ctx.get(),backing,reduction,columns,backing->nb[1],0):backing;
             for(int c=0;c<columns;++c)std::memcpy(static_cast<char*>(input->data)+c*input->nb[1],values.data()+(first_column+c)*reduction,reduction*sizeof(float));
-            auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(),weight,input,model.get(),static_cast<int>(InferenceExecutionPhase::Decode));
+            auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(),weight,input,model.get(),static_cast<int>(phase));
+            struct Params {ggml_custom_op_t fun;int n_tasks;void* userdata;};
+            if(output->op==GGML_OP_CUSTOM) {
+                Params params{};std::memcpy(&params,output->op_params,sizeof(params));
+                params.n_tasks=threads; // exercise the actual five-worker partition, including K=256.
+                if(params.fun==cb_gemv_batched_custom) {
+                    auto* ud=static_cast<GemvBatchedUserData*>(params.userdata);
+                    ud->force_reference_scalar=force_reference;
+                    if(disable_canonical)ud->gemma4_canonical_q4k_columns=false;
+                }
+                std::memcpy(output->op_params,&params,sizeof(params));
+            }
             auto* graph=ggml_new_graph_custom(ctx.get(),128,false);ggml_build_forward_expand(graph,output);
             EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(),graph,threads),GGML_STATUS_SUCCESS);
+            if(columns>1 && (phase!=InferenceExecutionPhase::Decode || force_reference || disable_canonical))
+                EXPECT_EQ((*GetInferenceWorkContextProfile(work.get())).gemv_custom_total_ops.load(),0);
+            if(lora && type==GGML_TYPE_Q4_K)
+                EXPECT_EQ((*GetInferenceWorkContextProfile(work.get())).q4k_repacked_gemv_used_ops.load(),0);
             std::vector<float> result(outputs*columns);
             for(int c=0;c<columns;++c)std::memcpy(result.data()+c*outputs,static_cast<char*>(output->data)+c*output->nb[1],outputs*sizeof(float));
             return result;
         };
-        std::vector<std::vector<float>> baseline;
-        for(int c=0;c<max_columns;++c)baseline.push_back(run(1,c,1,false));
-        for(int threads:{1,4,5,8})for(bool strided:{false,true})for(int columns:{1,2,3,4,8}) {
-            SCOPED_TRACE(threads);
-            SCOPED_TRACE(strided);
-            SCOPED_TRACE(columns);
-            const auto actual=run(columns,0,threads,strided);
-            for(int c=0;c<columns;++c) {
-                const float* begin=actual.data()+c*outputs;
-                const auto& expected=baseline[c];
-                const auto first=std::mismatch(expected.begin(),expected.end(),begin,[](float a,float b){return std::memcmp(&a,&b,sizeof(float))==0;});
-                EXPECT_TRUE(first.first==expected.end())<<"column="<<c<<" first_unequal_output="<<std::distance(expected.begin(),first.first);
+        for(auto mode:{densecore::env::RuntimeToggleMode::On,densecore::env::RuntimeToggleMode::Off,
+                       densecore::env::RuntimeToggleMode::Auto}) {
+            SCOPED_TRACE(static_cast<int>(mode));
+            SCOPED_TRACE(weight_strided);
+            std::vector<std::vector<float>> baseline;
+            for(int c=0;c<max_columns;++c)baseline.push_back(run(1,c,1,false,
+                weight_strided?densecore::env::RuntimeToggleMode::Off:mode));
+            for(int threads:{1,4,5,8})for(bool strided:{false,true})for(int columns:{1,2,3,4,8}) {
+                SCOPED_TRACE(threads);
+                SCOPED_TRACE(strided);
+                SCOPED_TRACE(columns);
+                const auto actual=run(columns,0,threads,strided,mode);
+                for(int c=0;c<columns;++c) {
+                    const float* begin=actual.data()+c*outputs;
+                    const auto& expected=baseline[c];
+                    const auto first=std::mismatch(expected.begin(),expected.end(),begin,[](float a,float b){return std::memcmp(&a,&b,sizeof(float))==0;});
+                    EXPECT_TRUE(first.first==expected.end())<<"column="<<c<<" first_unequal_output="<<std::distance(expected.begin(),first.first);
+                }
+            }
+        }
+        if(!weight_strided && type==GGML_TYPE_Q4_K) {
+            for(bool reference:{false,true})for(auto phase:{InferenceExecutionPhase::Decode,InferenceExecutionPhase::Prefill}) {
+                const auto actual=run(4,0,5,true,densecore::env::RuntimeToggleMode::On,false,reference,phase);
+                const auto unchanged=run(4,0,5,true,densecore::env::RuntimeToggleMode::On,false,reference,phase,true);
+                if(reference || phase==InferenceExecutionPhase::Prefill)
+                    EXPECT_EQ(std::memcmp(actual.data(),unchanged.data(),actual.size()*sizeof(float)),0);
+            }
+            const auto lora_batch=run(4,0,5,true,densecore::env::RuntimeToggleMode::On,true);
+            for(int c=0;c<4;++c) {
+                const auto lora_single=run(1,c,5,true,densecore::env::RuntimeToggleMode::On,true);
+                EXPECT_EQ(std::memcmp(lora_batch.data()+c*outputs,lora_single.data(),outputs*sizeof(float)),0);
             }
         }
     }
