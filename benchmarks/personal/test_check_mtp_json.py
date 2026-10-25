@@ -332,4 +332,86 @@ class ArtifactGateTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'old4545'): probe.verify_qualified(args)
 
 
+class ExecutionCoverageTest(unittest.TestCase):
+    source = 'a'*40
+    grammar = '[Qwen35DecodeSummary] req=9 finish_cause=grammar_complete sampled_tokens=2\n'
+    mtp = '[MTPVerify] request_id=9 target_width=3 verified=1 accepted=1 rejected=0 accepted_draft_tokens=0\n'
+
+    def observe(self, text, mode='mtp'):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'native-mtp-c1.log'
+            path.write_text(text)
+            return probe.observe_execution_log(path, mode, self.source)
+
+    def test_selected_mtp_flag_without_work_is_explicit_failure(self):
+        row = self.observe('spec_selected=2\n' + self.grammar)
+        self.assertFalse(row['passed'])
+        self.assertEqual(set(row['missing_coverage']), {'batched_target_observed', 'target_verification_observed', 'algorithm_acceptance_observed'})
+
+    def test_each_actual_mtp_counter_is_required_independently(self):
+        for old, new, missing in [('target_width=3', 'target_width=1', 'batched_target_observed'),
+                                  ('verified=1', 'verified=0', 'target_verification_observed'),
+                                  ('accepted=1', 'accepted=0', 'algorithm_acceptance_observed')]:
+            with self.subTest(missing=missing):
+                row = self.observe(self.grammar + self.mtp.replace(old, new))
+                self.assertFalse(row['passed'])
+                self.assertEqual(row['missing_coverage'], [missing])
+
+    def test_terminal_algorithm_acceptance_does_not_require_retained_inputs_or_rejection(self):
+        row = self.observe(self.grammar + self.mtp)
+        self.assertTrue(row['passed'])
+        self.assertEqual(row['mtp_counters']['accepted'], 1)
+        self.assertEqual(row['mtp_counters']['requests'][9]['accepted_draft_tokens'], 0)
+        self.assertEqual(row['mtp_counters']['rejected'], 0)
+        self.assertIn('not retained', row['acceptance_scope'])
+
+    def test_api_stop_or_untagged_or_inexact_cause_cannot_prove_policy(self):
+        for line in ['finish_reason=stop\n', 'finish_cause=grammar_complete\n',
+                     '[Qwen35DecodeSummary] req=9 finish_cause=grammar_complete_extra\n']:
+            with self.subTest(line=line):
+                row = self.observe(line, 'none')
+                self.assertFalse(row['passed'])
+                self.assertEqual(row['missing_coverage'], ['grammar_completion_policy_observed'])
+        self.assertTrue(self.observe(self.grammar, 'none')['passed'])
+
+    def test_http_counters_and_cause_are_aggregate_not_bound_to_response_rows(self):
+        text = self.grammar + self.mtp + '[MTPVerify] request_id=9 target_width=1 verified=2 accepted=1 rejected=0\n'
+        row = self.observe(text)
+        self.assertTrue(row['passed'])
+        self.assertEqual(row['mtp_counters']['verified'], 2)
+        self.assertEqual(row['mtp_counters']['accepted'], 1)
+        self.assertEqual(row['grammar_complete_events'][0]['request_id'], '9')
+        self.assertIn('not mapped to concurrent HTTP rows', row['attribution_scope'])
+
+    def test_provenance_log_hash_and_mutation_are_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'http-mtp.log'
+            path.write_text(self.grammar+self.mtp)
+            manifest = {'execution_logs': [], 'failures': []}
+            row = probe.attach_execution_log(manifest, path, 'mtp', 'HTTPmtp', self.source)
+            self.assertEqual(row['source_revision'], self.source)
+            self.assertEqual(row['path'], str(path.resolve()))
+            self.assertEqual(row['sha256'], probe.protocol.digest(path))
+            self.assertEqual(probe.verify_execution_log_hashes(manifest['execution_logs']), [])
+            path.write_text('changed')
+            self.assertIn('changed after observation', probe.verify_execution_log_hashes(manifest['execution_logs'])[0])
+
+    def test_missing_log_and_missing_coverage_are_reported_as_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = {'execution_logs': [], 'failures': []}
+            row = probe.attach_execution_log(manifest, Path(directory)/'missing.log', 'mtp', 'nativemtp/c1', self.source)
+            self.assertFalse(row['passed'])
+            self.assertEqual(row['missing_coverage'], ['execution_log_available'])
+            self.assertIn('missing actual execution coverage', manifest['failures'][0])
+            path = Path(directory)/'empty.log'
+            path.write_text('')
+            probe.attach_execution_log(manifest, path, 'none', 'HTTPnone', self.source)
+            self.assertEqual(len(manifest['failures']), 2)
+            self.assertIn('grammar_completion_policy_observed', manifest['failures'][1])
+
+    def test_log_source_binding_requires_full_sha(self):
+        with self.assertRaisesRegex(ValueError, 'full qualified'):
+            probe.observe_execution_log(Path('unused.log'), 'mtp', 'short')
+
+
 if __name__ == '__main__': unittest.main()

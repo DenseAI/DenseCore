@@ -319,6 +319,62 @@ def verify_qualified(args):
     return canonical, local_dependencies
 
 
+def observe_execution_log(path, mode, source):
+    """Observe actual work; profile flags and API finish=stop are insufficient."""
+    if not re.fullmatch(r'[0-9a-f]{40}', source):
+        raise ValueError('execution log requires the full qualified artifact source SHA')
+    path = Path(path).resolve()
+    evidence = {'path': str(path), 'source_revision': source,
+                'source_binding': 'Verified canonical artifact revision, not inferred from log text.',
+                'attribution_scope': 'Aggregate process log only; native/log-local IDs are not mapped to concurrent HTTP rows.',
+                'acceptance_scope': 'Algorithm acceptance including terminal EOS/JSON closing tokens, not retained speculative inputs.',
+                'grammar_complete_events': []}
+    try:
+        text = path.read_text(errors='replace')
+        evidence['sha256'] = protocol.digest(path)
+    except OSError as error:
+        evidence.update(error=str(error), passed=False, missing_coverage=['execution_log_available'])
+        return evidence
+    for number, line in enumerate(text.splitlines(), 1):
+        summary = re.search(r'\[([A-Za-z0-9_]*DecodeSummary)\]', line)
+        if not summary:
+            continue
+        fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        if fields.get('finish_cause') == 'grammar_complete':
+            evidence['grammar_complete_events'].append({'line': number, 'summary': summary.group(1),
+                                                        'request_id': fields.get('req')})
+    counters = protocol.extract_mtp_counters(text)
+    evidence['mtp_counters'] = counters
+    required = {'grammar_completion_policy_observed': bool(evidence['grammar_complete_events'])}
+    if mode == 'mtp':
+        required.update(batched_target_observed=counters['maximum_target_width'] > 1,
+                        target_verification_observed=counters['verified'] > 0,
+                        algorithm_acceptance_observed=counters['accepted'] > 0)
+    evidence.update(coverage=required, missing_coverage=[name for name, passed in required.items() if not passed])
+    evidence['passed'] = not evidence['missing_coverage']
+    return evidence
+
+
+def attach_execution_log(manifest, path, mode, label, source):
+    evidence = observe_execution_log(path, mode, source)
+    evidence['profile'] = label
+    manifest['execution_logs'].append(evidence)
+    if not evidence['passed']:
+        manifest['failures'].append(label + ': missing actual execution coverage: ' + ', '.join(evidence['missing_coverage']))
+    return evidence
+
+
+def verify_execution_log_hashes(evidence):
+    failures = []
+    for row in evidence:
+        try:
+            if row.get('sha256') != protocol.digest(Path(row['path'])):
+                failures.append(row['profile'] + ': execution log changed after observation')
+        except OSError as error:
+            failures.append(row['profile'] + ': execution log unavailable: ' + str(error))
+    return failures
+
+
 def parent(args):
     canonical, dependencies = verify_qualified(args)
     out = args.out.resolve()
@@ -337,7 +393,7 @@ def parent(args):
                 'requested_context': args.context, 'requested_threads': args.threads, 'concurrency': args.concurrency,
                 'http_engine_concurrency_ceiling': max(args.concurrency),
                 'host': platform.uname()._asdict(), 'cpu_affinity': sorted(os.sched_getaffinity(0)),
-                'native': [], 'http': [], 'failures': [],
+                'native': [], 'http': [], 'execution_logs': [], 'failures': [],
                 'scope': 'JSON semantic/protocol/isolation smoke; no same-seed, full sample-ID parity, distribution, speed or automatic promotion claim. Global action range is fixture-only, not public API.'}
     cache = args.library.parent / 'CMakeCache.txt'
     if cache.exists(): manifest['cmake_cache_sha256'] = protocol.digest(cache)
@@ -359,12 +415,17 @@ def parent(args):
                 child_env = dict(env, DENSECORE_MAX_NUM_SEQS=str(concurrency))
                 if platform.system() == 'Linux':
                     child_env['LD_PRELOAD'] = ' '.join(dict.fromkeys([str(args.library.resolve()), *env.get('LD_PRELOAD', '').split()]))
-                with (out / f'native-{mode}-c{concurrency}.log').open('w') as log:
-                    run = subprocess.run(command, check=False, env=child_env, stdout=log, stderr=subprocess.STDOUT,
-                                         timeout=args.timeout * (len(CASES) * args.repeats + 4))
+                native_log = out / f'native-{mode}-c{concurrency}.log'
+                try:
+                    with native_log.open('w') as log:
+                        run = subprocess.run(command, check=False, env=child_env, stdout=log, stderr=subprocess.STDOUT,
+                                             timeout=args.timeout * (len(CASES) * args.repeats + 4))
+                finally:
+                    execution = attach_execution_log(manifest, native_log, mode, f'native{mode}/c{concurrency}', args.qualified_source)
                 row = json.loads(result_path.read_text()) if result_path.exists() else {'error': 'child produced no report'}
                 row.update(mode=mode, concurrency=concurrency)
-                row['mtp_counters'] = protocol.extract_mtp_counters((out / f'native-{mode}-c{concurrency}.log').read_text())
+                row['execution_evidence'] = execution
+                row['mtp_counters'] = execution.get('mtp_counters', {})
                 manifest['native'].append(row)
                 if run.returncode or row.get('error'):
                     manifest['failures'].append(f'native{mode}/c{concurrency}: {row.get("error", "child failed")}')
@@ -379,8 +440,12 @@ def parent(args):
             cases = [dict(case, brace_token_ids=brace_mask) for case in CASES]
             probe = dict(probability(args), response_format={'type': 'json_object'},
                          messages=[{'role': 'user', 'content': CANCEL_PROMPT}])
-            http = protocol.http_mode(args, mode, out, env, request_fn=functools.partial(http_request, probability=probability(args), capture_dir=out / f'http-{mode}-requests'),
-                                      cases=cases, probe_sampling=probe)
+            try:
+                http = protocol.http_mode(args, mode, out, env, request_fn=functools.partial(http_request, probability=probability(args), capture_dir=out / f'http-{mode}-requests'),
+                                          cases=cases, probe_sampling=probe)
+            finally:
+                execution = attach_execution_log(manifest, out / f'http-{mode}.log', mode, f'HTTP{mode}', args.qualified_source)
+            http['execution_evidence'] = execution
             manifest['http'].append(http)
             for group in http['groups']:
                 for row in group['requests']:
@@ -397,6 +462,7 @@ def parent(args):
             if after != canonical or after_deps != dependencies: raise ValueError('canonical manifest/dependencies changed')
         except Exception as error:  # noqa: BLE001 -- preserve raw probe failures, including callback boundaries.
             manifest['failures'].append(str(error))
+        manifest['failures'].extend(verify_execution_log_hashes(manifest['execution_logs']))
         manifest['passed'] = not manifest['failures']
         protocol.write(out / 'summary.json', manifest)
     return int(not manifest['passed'])
