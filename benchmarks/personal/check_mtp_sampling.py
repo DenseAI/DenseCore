@@ -203,7 +203,11 @@ def parent(args, cases):
                 'canonical_artifact_manifest': canonical,
                 'other_penalties': {'frequency_penalty': 0.0, 'presence_penalty': 0.0},
                 'min_p': {'value': 0.0, 'configurable': False, 'source': 'native SamplingParams default; public C/HTTP do not expose it'},
-                'native_seed_api': False, 'native': [], 'http': [], 'failures': [],
+                'native_seed_api': False, 'draft_n_max': args.draft,
+                'requested_context': args.context, 'requested_threads': args.threads,
+                'native_concurrency_cells': args.concurrency,
+                'http_engine_concurrency_ceiling': max(args.concurrency),
+                'native': [], 'http': [], 'failures': [],
                 'interpretation': 'Integration smoke only; no ID equality, same-seed or population distribution equivalence claim.'}
     manifest['dependencies'] = {str(path): protocol.digest(path) for path in sorted({
         entry.resolve() for entry in library.parent.glob('lib*.so*') if entry.is_file()})}
