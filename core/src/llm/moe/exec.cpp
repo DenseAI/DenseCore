@@ -990,6 +990,14 @@ void cb_moe_forward(struct ggml_tensor* dst, const struct ggml_tensor* src0, con
     }
 }
 
+namespace {
+std::atomic<uint64_t> g_gpt_oss_native_moe_calls{0};
+}
+
+uint64_t GetGptOssNativeMoECallCount() {
+    return g_gpt_oss_native_moe_calls.load(std::memory_order_relaxed);
+}
+
 // GPT-OSS expert execution deliberately bypasses the generic SiLU and expert
 // dequantization routes. Quantized weights remain in the mapped GGUF.
 void cb_gpt_oss_moe(ggml_tensor* dst, const ggml_tensor* input, const ggml_tensor* logits,
@@ -1000,6 +1008,12 @@ void cb_gpt_oss_moe(ggml_tensor* dst, const ggml_tensor* input, const ggml_tenso
         throw std::invalid_argument("gpt-oss MoE: invalid callback state");
     }
     const auto& layer = *state->layer;
+    if (ith == 0) {
+        const auto previous = g_gpt_oss_native_moe_calls.fetch_add(1, std::memory_order_relaxed);
+        if (previous == 0) {
+            std::fprintf(stderr, "[GptOssNativeMoE] packed_type=mxfp4 top_k=%d full_expert_f32_expansion=0\n", state->k);
+        }
+    }
     const size_t experts = state->model->hparams.n_experts;
     if (logits->ne[0] != static_cast<int64_t>(experts) || logits->ne[1] != input->ne[1] ||
         dst->ne[0] != input->ne[0] || dst->ne[1] != input->ne[1] || input->nb[0] != sizeof(float) ||

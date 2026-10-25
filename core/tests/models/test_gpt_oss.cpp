@@ -16,6 +16,7 @@
 #include "densecore/models/model_graph_capabilities.h"
 #include "densecore/models/model_loader.h"
 #include "models/model_prompt_templates.h"
+#include "llm/moe/exec.h"
 #include "runtime/inference_types_internal.h"
 TEST(GptOssMathTest, RouterSelectsBiasedLogitsThenNormalizesSelectedOnly) {
     const float logits[] = {1.0f, 2.0f, 4.0f, 3.0f};
@@ -239,7 +240,9 @@ TEST(GptOssGraphTest, NativeQuantizedLayerMatchesIndependentFirstTokenLogits) {
     BatchSpec batch{};
     batch.num_seqs = 1; batch.tokens = {0}; batch.seq_id = {0}; batch.pos = {0};
     batch.block_tables = {{0}}; batch.n_past = {0};
+    const auto native_calls_before = GetGptOssNativeMoECallCount();
     const auto logits = densecore::testing::ExecuteTransformerGraphForTest(model.get(), cache.get(), batch, 2);
+    EXPECT_GT(GetGptOssNativeMoECallCount(), native_calls_before);
     const auto expected = GptOssTinyFirstTokenReference();
     ASSERT_EQ(logits.size(), expected.size());
     for (size_t i = 0; i < logits.size(); ++i) EXPECT_NEAR(logits[i], expected[i], 2e-5f);
@@ -367,4 +370,34 @@ TEST(GptOssGraphTest, LayerContractAlternatesMetadataWindowAndFullAttention) {
     EXPECT_EQ(spec->layers[0].ffn.router, densecore::models::DecoderMoERouter::SelectedLogitsSoftmax);
     const auto generic = densecore::models::MakeDenseDecoderGenericSupport("test generic");
     EXPECT_FALSE(densecore::models::AdmitGraphBuilder(densecore::models::ResolveGraphFamily(model.get()), generic).admitted);
+}
+
+TEST(GptOssGraphTest, SlidingWindowIncludesQueryAndDropsOldestKeyAtBoundary) {
+    auto model = MakeGptOssTinyGraph();
+    std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(model.get(), 1, 16, GGML_TYPE_F32, -1));
+    BatchSpec batch{};
+    batch.num_seqs = 1; batch.tokens = {0, 0, 0, 1, 1}; batch.seq_id = {0, 0, 0, 0, 0};
+    batch.pos = {0, 1, 2, 3, 4}; batch.n_past = {0}; batch.block_tables = {{0}};
+    const auto actual = densecore::testing::ExecuteTransformerGraphForTest(model.get(), cache.get(), batch, 2);
+    ASSERT_EQ(actual.size(), 10u);
+    const float embed_scale = 1.0f / std::sqrt(1.25f / 32.0f + 1e-5f);
+    std::vector<float> residual(32, 0.125f);
+    // Last four keys are [token0, token0, token1, token1]. Each has weight1/5
+    // because the fifth denominator term is the learned zero sink.
+    residual[0] += 0.5f + 3.0f * embed_scale / 5.0f;
+    residual[1] += 1.0f + 3.0f * embed_scale / 5.0f;
+    auto norm = [](std::vector<float> values) {
+        double sum = 0.0;
+        for (float x : values) sum += x * x;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(sum / values.size()) + 1e-5f);
+        for (float& x : values) x *= scale;
+        return values;
+    };
+    const auto ffn = norm(residual);
+    for (size_t i = 0; i < residual.size(); ++i) {
+        residual[i] += densecore::models::gpt_oss::SwiGlu(ffn[i] + 0.25f, ffn[i] - 0.5f) + 0.0625f;
+    }
+    const auto expected = norm(residual);
+    EXPECT_NEAR(actual[8], expected[0], 2e-5f);
+    EXPECT_NEAR(actual[9], expected[1], 2e-5f);
 }

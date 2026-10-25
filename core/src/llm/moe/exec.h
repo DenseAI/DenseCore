@@ -29,3 +29,5 @@ bool RouteMoEGemma4TopK(const struct ggml_tensor* gate_logits, const MoEUserData
 
 void cb_gpt_oss_moe(struct ggml_tensor* dst, const struct ggml_tensor* input,
                     const struct ggml_tensor* logits, int ith, int nth, void* userdata);
+
+uint64_t GetGptOssNativeMoECallCount();
