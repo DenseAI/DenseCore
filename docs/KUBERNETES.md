@@ -26,11 +26,17 @@ kubeconfig in the artifact directory; it preserves your existing cluster context
 chart, runs the downloader, waits for ready, checks installed resource limits,
 opens a real generation stream, deletes the pod while generating, and requires
 that the accepted stream finishes while readiness and new admission disappear.
-The positive drain request is explicitly bounded to 32 output tokens so it can
-finish within the configured 30-second shutdown budget. The standalone drain
+The positive drain request is explicitly bounded to 32 output tokens; its actual
+completion must still fit the configured 30-second shutdown budget. The standalone drain
 client keeps its 256-token default and accepts `--max-tokens`; it records the
 request bound, first-token/signal times, the native active-request gauge before
-SIGTERM and exactly one terminal event. An unfinished buffered HTTP stream alone
+SIGTERM and exactly one terminal event. Signal delivery, readiness/admission probes
+and stream completion share one absolute deadline starting at the signal command.
+Probe records preserve response status or transport error; a timeout or DNS error
+does not prove shutdown. The artifact labels the legacy five-second regression
+window as exercised only when the observed stream continues more than five seconds
+after the signal command completes. A faster successful drain leaves that specific
+regression unexercised; token count never substitutes for observed duration. An unfinished buffered HTTP stream alone
 does not qualify as proof that native inference is still active. This is
 evidence for the bounded request, not a promise that an unbounded request can
 always complete before termination.
@@ -55,7 +61,10 @@ repack or allocator headroom.
 DenseCore handles SIGTERM and drains accepted requests. The runtime image is
 distroless and has no shell: `preStopSleepSeconds` must remain `0` with this image.
 Set `terminationGracePeriodSeconds` longer than `SHUTDOWN_TIMEOUT`; the example
-uses 40 seconds and 30 seconds. A preStop sleep cannot prove active drain. Test
+uses 40 seconds and 30 seconds. Configure the server budget through the
+`SHUTDOWN_TIMEOUT` environment variable (for example `30s`); the `serve` entry
+loads it into the runner and forwards the remaining deadline to native shutdown.
+A preStop sleep cannot prove active drain. Test
 with a request that is still generating when termination begins.
 
 Portable amd64/arm64 and optimized amd64-v3/arm64 profiles have separate native

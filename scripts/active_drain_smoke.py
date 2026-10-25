@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Verify a real accepted stream survives SIGTERM while new admission stops."""
 import argparse
+import errno
+import http.client
 import json
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -11,14 +14,25 @@ import urllib.request
 from pathlib import Path
 
 
+def connection_closed(error):
+    """Only explicit transport closure proves unavailability; timeouts do not."""
+    cause = error.reason if isinstance(error, urllib.error.URLError) else error
+    return (isinstance(cause, http.client.RemoteDisconnected) or
+        isinstance(cause, OSError) and not isinstance(cause, (TimeoutError, socket.timeout))
+        and cause.errno in (errno.ECONNREFUSED, errno.ECONNRESET, errno.EPIPE))
+
+
 def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric="densecore_active_requests"):
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
     if max_tokens < 1:
         raise ValueError("max_tokens must be positive")
     began = time.monotonic()
     observed = threading.Event()
     completed = threading.Event()
     result = {"events": [], "ready_removed": False, "admission_blocked": False,
-        "request_max_tokens": max_tokens, "done_count": 0, "finish_count": 0}
+        "probe_events": [], "shutdown_timeout_seconds": timeout,
+        "legacy_5s_regression": "not_exercised", "request_max_tokens": max_tokens, "done_count": 0, "finish_count": 0}
     payload = json.dumps({"model": "densecore", "messages": [{"role": "user", "content":
         "List the integers from 1 to 200, one at a time, without skipping any."}],
         "max_tokens": max_tokens, "temperature": 0, "stream": True,
@@ -57,6 +71,7 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
         except Exception as error:
             result["error"] = str(error)
         finally:
+            result["stream_completed_seconds"] = time.monotonic() - began
             completed.set()
 
     thread = threading.Thread(target=stream, daemon=True)
@@ -81,32 +96,60 @@ def run(base_url, signal_command, output, timeout, max_tokens=256, active_metric
         result["signal_seconds"] = time.monotonic() - began
         result["events_before_signal"] = len(result["events"])
         started = time.monotonic()
-        subprocess.run(signal_command, check=True, timeout=10)
-        while time.monotonic() - started < min(timeout, 10):
+        deadline = started + timeout
+
+        def remaining():
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise RuntimeError("accepted request exceeded drain deadline")
+            return budget
+
+        def probe_unavailable(path, data=None):
+            event = {"path": path, "started_seconds": time.monotonic() - began}
+            unavailable = False
             try:
-                with urllib.request.urlopen(base_url + "/health/ready", timeout=1) as ready:
-                    result["ready_removed"] = ready.status != 200
-            except (urllib.error.URLError, OSError):
-                result["ready_removed"] = True
+                request = urllib.request.Request(base_url + path, data=data,
+                    headers={"Content-Type": "application/json"} if data else {})
+                with urllib.request.urlopen(request, timeout=min(1, remaining())) as response:
+                    event["status"] = response.status
+                    unavailable = response.status == 503
+            except urllib.error.HTTPError as error:
+                event.update(status=error.code, body=error.read(2048).decode(errors="replace"))
+                unavailable = error.code == 503
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+                event.update(error_type=type(error).__name__, error=str(error))
+                unavailable = connection_closed(error)
+            finally:
+                event.update(completed_seconds=time.monotonic() - began, unavailable=unavailable)
+                result["probe_events"].append(event)
+            return unavailable
+
+        subprocess.run(signal_command, check=True, timeout=min(10, remaining()))
+        result["signal_command_completed_seconds"] = time.monotonic() - began
+        readiness_deadline = min(deadline, started + 10)
+        while time.monotonic() < readiness_deadline:
+            result["ready_removed"] = probe_unavailable("/health/ready")
             if result["ready_removed"]:
                 break
-            time.sleep(0.05)
-        try:
-            probe = urllib.request.Request(base_url + "/v1/chat/completions", data=payload,
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(probe, timeout=2) as response:
-                result["admission_blocked"] = response.status == 503
-        except urllib.error.HTTPError as error:
-            result["admission_blocked"] = error.code == 503
-        except (urllib.error.URLError, OSError):
-            result["admission_blocked"] = True
-        if not completed.wait(timeout):
+            time.sleep(min(0.05, remaining()))
+        result["admission_blocked"] = probe_unavailable("/v1/chat/completions", payload)
+        if not completed.wait(remaining()):
             raise RuntimeError("accepted request exceeded drain deadline")
+        remaining()  # Probes and signal delivery consume the same overall budget.
         result["drain_seconds"] = time.monotonic() - started
+        # Command completion is a conservative delivery boundary. This is observed
+        # client stream lifetime, not an estimate based on token count or speed.
+        result["observed_stream_seconds_after_signal_command"] = max(0,
+            result["stream_completed_seconds"] - result["signal_command_completed_seconds"])
+        if result["observed_stream_seconds_after_signal_command"] > 5:
+            result["legacy_5s_regression"] = "exercised_client_stream_window"
         if result["done_count"] != 1 or result["finish_count"] != 1 or result.get("finish_reason") not in ("stop", "length") or result.get("error"):
             raise RuntimeError("accepted request did not finish successfully during drain")
         if not result["ready_removed"] or not result["admission_blocked"]:
             raise RuntimeError("readiness or new admission stayed available during drain")
+    except Exception as error:
+        result["failure"] = str(error)
+        raise
     finally:
         Path(output).write_text(json.dumps(result, indent=2) + "\n")
 
