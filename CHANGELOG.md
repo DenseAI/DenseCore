@@ -29,7 +29,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   image-profile, limited-pod, drain and reproducible CPU comparison gates.
   Canonical image components passed 4 GiB serving, 1 GiB explicit rejection and
   kind checksum checks; strict Count and full active drain failed. A separate
-  Go-only readiness fix has race-test evidence, with image validation pending.
+  A separate Go-only image withdrew readiness and completed its active stream,
+  but new requests returned 500 instead of required 503; full drain still fails
+  and repeat container/kind validation awaits the typed admission fix.
 - Revalidate pinned 0.8B/2B prefix restoration/eviction and embedding AUTO/LAST
   (12 bitwise comparisons). Canonical native tests passed 1263 with 14 existing
   skips; ASAN/LSan passed 600 with 9 existing skips and zero reports. Real-model

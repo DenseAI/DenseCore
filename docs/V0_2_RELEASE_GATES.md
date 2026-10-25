@@ -22,7 +22,7 @@ binary and model/package checks.
 | B Gemma | Pinned E2B c=1 long-answer/repeat HTTP quality passed 6/6 | E2B c=4 same-prompt outputs differ by slot despite 24 semantic/EOS successes; native-ID investigation and E4B canonical long/repeat/c=1/4 qualification remain |
 | C | README-pinned 0.8B and plain 2B combined strict checks passed: c=1/2/4, five-turn final answers, actual restore/skipped prefill, cancellation/recovery and real snapshot/KV eviction | Qwen3.6 model-specific qualification; matched performance and default-policy promotion remain separate |
 | D | 0.8B/2B MTP files, K=2, c=1/c=4: same-file NONE/MTP 128 native IDs and HTTP/stream/cancel/recovery passed | Actual stochastic 0.8B c=1 fails HTTP stop handling (NONE 3 leaks, MTP 2); remaining stochastic cells, current K=1/3, real 35B MoE head and performance qualification remain |
-| E | Local portable amd64 image built; 4 GiB serving/1 GiB rejection and kind chart/downloader/limits/checksum components passed | Strict Count and full active drain fail. Go-only readiness fix plus stricter active-observation harness is a separate pending image validation; final integrated package and native Arm remain unqualified |
+| E | Local portable amd64 image built; 4 GiB serving/1 GiB rejection and kind chart/downloader/limits/checksum components passed | Strict Count and full active drain fail. Separate f50 image improves active readiness/grace but returns 500 instead of required 503 to new requests; typed admission fix and new container/kind validation remain pending. Final package/native Arm remain unqualified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Real-model HTTP/long output/c=1/4/stop/stream and peak RSS/context unavailable on this host; safe capacity refusal is not inference support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual two-socket 35B/122B measurements, 16/48 physical-core placement and remote-memory penalty; no default promotion |
 
@@ -110,8 +110,15 @@ remove a track or turn fixture passes into real-model support.
   includes early readiness withdrawal, drain-time read-only diagnostics and a
   harness requiring same-round readiness 503/new-admission refusal while an
   accepted request is active. Focused repeated and full relevant Go race checks
-  passed. Its core tree is identical to `7ecaf86`; actual image/container/kind
-  validation is pending. This is not the final image for later Gemma/stop fixes.
+  passed. Its core tree is identical to `7ecaf86`. The actual f50 container
+  observed readiness 503 and native-active=1 while the accepted 32-token stream
+  remained active. That stream finished normally by length with one finish and
+  one DONE, 7.962 seconds after the signal command (over five seconds, within the
+  configured 30-second grace). However, all 149 new chat POST probes returned
+  HTTP 500 (`no model loaded`) rather than required 503. Full active drain still
+  fails. A typed closing/admission error fix and repeat container/kind proof are
+  pending; the obsolete f50 kind waiter was canceled before it acquired the
+  execution slot. This is not the final image for later Gemma/stop fixes.
 
 Local raw ledger filenames (not published artifact download links):
 
@@ -131,7 +138,9 @@ Local raw ledger filenames (not published artifact download links):
   `v02-canonical7ec-e2b-c4-qa.json`: c=1 quality and c=4 isolation failure.
 - `v02-packaging-canonical7ec-reviewed-components.json` and
   `v02-readiness-evidence.json`: reviewed package failures and the separate
-  Go-only fix boundary. An older component summary's drain “pass” is superseded
+  Go-only fix boundary. Local `densecore-container-smoke.oBcKiV/drain.json`
+  records the actual f50 readiness/grace successes and 149 admission-status
+  failures. An older component summary's drain “pass” is superseded
   by the reviewed full-lifecycle failure.
 
 Archive raw results with their identities before publishing claims. Public

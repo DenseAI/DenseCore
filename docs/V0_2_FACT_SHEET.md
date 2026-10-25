@@ -26,8 +26,10 @@ and [model catalog](MODEL_CATALOG.md) for exact scope.
   failed despite semantic/EOS successes. Canonical E4B qualification is pending.
 - Local portable amd64 image components passed 4 GiB serving, explicit 1 GiB
   rejection and kind checksum checks. Strict Count and full active drain failed.
-  Separate Go-only readiness candidate `f50d958` has race-test evidence; its
-  image validation is pending and cannot qualify the later final package.
+  Separate Go-only candidate `f50d958` observed active readiness 503 and normal
+  accepted-stream completion after 7.962 seconds, but 149 new POST probes returned
+  500 instead of required 503: full drain still fails. Its obsolete kind run was
+  canceled; the admission fix and repeat image/kind validation remain pending.
 
 No new speed headline is supported. Historical TTFT gains do not establish
 aggregate throughput or completion-time superiority. MTP/NUMA defaults remain
