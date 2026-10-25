@@ -58,6 +58,7 @@ struct HiddenSnapshotUserData {
     const int* token_seq_ids = nullptr;
     const char* stage = nullptr;
     const char* var_name = nullptr;
+    bool graph_no_alloc = false;
 };
 
 struct Gemma4KVSummaryUserData {

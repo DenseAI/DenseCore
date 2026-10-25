@@ -207,9 +207,6 @@ bool ShouldRunHiddenSnapshotProbe(int layer, const char* stage) {
     if (!IsDebugHiddenSnapshotEnabled()) {
         return false;
     }
-    if (IsCurrentGraphBuildNoAlloc()) {
-        return false;
-    }
 
     static const int target_layer = densecore::env::ParseDiagnosticEnvInt("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_LAYER", -2);
     if (target_layer >= -1 && layer != target_layer) {

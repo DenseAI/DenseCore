@@ -318,17 +318,29 @@ HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_context* ctx_
     if (!ctx_c) {
         return nullptr;
     }
-    if (ggml_get_no_alloc(ctx_c)) {
-        thread_local HiddenSnapshotUserData dry_run_storage;
-        dry_run_storage = HiddenSnapshotUserData{};
-        return &dry_run_storage;
+    // Userdata belongs to the graph's already budgeted metadata context,
+    // including when tensor payloads are deferred to gallocr. A shared TLS
+    // placeholder cannot retain distinct layer/stage identities.
+    const size_t required = ggml_tensor_overhead() + sizeof(HiddenSnapshotUserData) + GGML_MEM_ALIGN;
+    const size_t used = ggml_used_mem(ctx_c);
+    const size_t capacity = ggml_get_mem_size(ctx_c);
+    if (used > capacity || required > capacity - used) {
+        throw std::runtime_error("Hidden snapshot metadata capacity exhausted: required=" +
+                                 std::to_string(required) + " available=" +
+                                 std::to_string(used > capacity ? 0 : capacity - used));
     }
+    struct RestoreNoAlloc {
+        ggml_context* ctx;
+        bool previous;
+        ~RestoreNoAlloc() { ggml_set_no_alloc(ctx, previous); }
+    } restore{ctx_c, ggml_get_no_alloc(ctx_c)};
+    ggml_set_no_alloc(ctx_c, false);
     struct ggml_tensor* storage = ggml_new_tensor_1d(ctx_c, GGML_TYPE_I8, sizeof(HiddenSnapshotUserData));
-    if (!storage || !storage->data) {
-        return nullptr;
-    }
+    if (!storage || !storage->data) throw std::runtime_error("Hidden snapshot metadata allocation failed");
     std::memset(storage->data, 0, sizeof(HiddenSnapshotUserData));
-    return reinterpret_cast<HiddenSnapshotUserData*>(storage->data);
+    auto* result = reinterpret_cast<HiddenSnapshotUserData*>(storage->data);
+    result->graph_no_alloc = restore.previous;
+    return result;
 }
 
 Gemma4KVSummaryUserData* AllocateGemma4KVSummaryUserData(struct ggml_context* ctx_c) {
@@ -551,14 +563,59 @@ void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_tensor*
     if (!ud || !dst || !src || !src->data || src->type != GGML_TYPE_F32) {
         return;
     }
-    if (dst->data && src->data) {
-        std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    }
+    if (!dst->data || dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(dst, src)) return;
+    // Views may have row/head gaps; ggml_nbytes(src) includes those gaps and
+    // cannot be copied into a contiguous duplicate's smaller allocation.
+    for (int64_t i3 = 0; i3 < src->ne[3]; ++i3)
+        for (int64_t i2 = 0; i2 < src->ne[2]; ++i2)
+            for (int64_t i1 = 0; i1 < src->ne[1]; ++i1)
+                for (int64_t i0 = 0; i0 < src->ne[0]; ++i0) {
+                    const size_t si = i0*src->nb[0]+i1*src->nb[1]+i2*src->nb[2]+i3*src->nb[3];
+                    const size_t di = i0*dst->nb[0]+i1*dst->nb[1]+i2*dst->nb[2]+i3*dst->nb[3];
+                    std::memcpy(static_cast<char*>(dst->data)+di,
+                                static_cast<const char*>(src->data)+si, sizeof(float));
+                }
 
     const int width = static_cast<int>(src->ne[0]);
     const int tokens = static_cast<int>(std::max<int64_t>(1, src->ne[1]));
     if (width <= 0 || tokens <= 0) {
         return;
+    }
+
+    const char* capture_dir = densecore::env::GetDiagnosticEnv("DENSECORE_DEBUG_HIDDEN_SNAPSHOT_CAPTURE_DIR");
+    if (capture_dir && capture_dir[0]) try {
+        const BatchSpec* batch = GetCurrentBatch();
+        // Paired decode replay has one tensor row per input token. Reject
+        // compacted/prefill layouts rather than attach incorrect identities.
+        if (batch && GetCurrentExecutionPhase() == InferenceExecutionPhase::Decode &&
+            tokens == static_cast<int>(batch->tokens.size()) && src->ne[2] == 1 && src->ne[3] == 1 &&
+            batch->seq_id.size() == batch->tokens.size() && batch->pos.size() == batch->tokens.size()) {
+            static std::atomic<uint64_t> capture_id{0};
+            for (int row = 0; row < tokens; ++row) {
+                const int seq = batch->seq_id[row];
+                const int scheduler_seq = seq >= 0 && seq < static_cast<int>(batch->scheduler_seq_ids.size())
+                    ? batch->scheduler_seq_ids[seq] : -1;
+                const uint64_t id = capture_id.fetch_add(1, std::memory_order_relaxed);
+                const std::string path = std::string(capture_dir) + "/" + std::to_string(id) + ".f32";
+                FILE* file = std::fopen(path.c_str(), "wb");
+                if (!file) { std::fprintf(stderr, "[HIDDEN_CAPTURE_ERROR] cannot open %s\n", path.c_str()); continue; }
+                bool ok = true;
+                for (int d = 0; d < width; ++d) {
+                    const char* ptr = static_cast<const char*>(src->data) + row*src->nb[1] + d*src->nb[0];
+                    if (std::fwrite(ptr, sizeof(float), 1, file) != 1) { ok = false; break; }
+                }
+                if (std::fclose(file) != 0) ok = false;
+                std::fprintf(stderr,
+                    "[HIDDEN_CAPTURE%s] id=%llu batch=%d row=%d seq=%d scheduler_seq=%d pos=%d token=%d layer=%d stage=%s no_alloc=%d width=%d path=%s\n",
+                    ok ? "" : "_ERROR", static_cast<unsigned long long>(id), batch->num_seqs, row, seq,
+                    scheduler_seq, batch->pos[row], batch->tokens[row], ud->layer_idx,
+                    ud->stage ? ud->stage : "unknown", static_cast<int>(ud->graph_no_alloc), width, path.c_str());
+            }
+        }
+    } catch (...) {
+        // Never unwind through a custom GGML callback/barrier. The capture
+        // harness treats this explicit marker as an invalid diagnostic run.
+        std::fprintf(stderr, "[HIDDEN_CAPTURE_ERROR] capture allocation or IO failure\n");
     }
 
     int token_idx = ud->token_idx;
@@ -597,8 +654,15 @@ void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_tensor*
     if (!std::isfinite(min_v)) min_v = 0.0f;
     if (!std::isfinite(max_v)) max_v = 0.0f;
 
-    const int token_id = (ud->token_ids && token_idx >= 0) ? ud->token_ids[token_idx] : -1;
-    const int seq_id = (ud->token_seq_ids && token_idx >= 0) ? ud->token_seq_ids[token_idx] : -1;
+    const BatchSpec* live_batch = GetCurrentBatch();
+    const bool live_row = live_batch && tokens == static_cast<int>(live_batch->tokens.size()) &&
+                          token_idx < static_cast<int>(live_batch->seq_id.size());
+    // Cached diagnostic graphs retain tensor userdata across batches; their
+    // build-time token-array pointers must never be dereferenced on reuse.
+    const int token_id = live_row ? live_batch->tokens[token_idx]
+        : (!live_batch && ud->token_ids ? ud->token_ids[token_idx] : -1);
+    const int seq_id = live_row ? live_batch->seq_id[token_idx]
+        : (!live_batch && ud->token_seq_ids ? ud->token_seq_ids[token_idx] : -1);
     std::fprintf(
         stderr,
         "[HIDDEN_SNAPSHOT] layer=%d stage=%s var=%s token=%d token_id=%d seq=%d width=%d nan=%d inf=%d min=%.8g "

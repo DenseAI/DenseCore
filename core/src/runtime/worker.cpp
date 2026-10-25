@@ -1,4 +1,5 @@
 #include "densecore/runtime/resource_budget.h"
+#include "runtime/batched_decode_diagnostic.h"
 #include <ggml-cpu.h>
 
 #include <algorithm>
@@ -5889,7 +5890,7 @@ void EngineLoop(EngineState* state) {
                                   << " argmax(batch/ref)=" << worst_batch_argmax << "/" << worst_ref_argmax
                                   << std::endl;
                         if (IsBatchedDecodeCorrectnessAbortEnabled()) {
-                            throw densecore::InvalidArgumentException(
+                            throw BatchedDecodeDiagnosticAbort(
                                 "Batched decode correctness check failed (set DENSECORE_CHECK_BATCHED_DECODE_ABORT=0 "
                                 "to continue).");
                         }
@@ -5902,6 +5903,7 @@ void EngineLoop(EngineState* state) {
                     SetCurrentWorkContext(work_ctx.get());
                     SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
                     SetCurrentBatch(&batch);
+                    PropagateBatchedDecodeDiagnosticAbort(std::current_exception());
                     std::cerr << "[DecodeCorrectness] skipped: " << e.what() << std::endl;
                 }
             }

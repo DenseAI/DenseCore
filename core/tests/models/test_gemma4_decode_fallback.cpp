@@ -17,6 +17,8 @@
 #include "ggml-cpu.h"
 #include "llm/graph/checked_ops.h"
 #include "llm/attention/exec.h"
+#include "llm/graph/construction_ops.h"
+#include "runtime/batched_decode_diagnostic.h"
 #include "llm/graph/gemma4_shared_kv.h"
 #include "llm/config/runtime_config.h"
 #include "densecore/runtime/inference.h"
@@ -1815,4 +1817,56 @@ TEST(Gemma4DecodeGraphTest, WideSharedLayerLogitsMatchFourIndependentRequests) {
         ASSERT_EQ(actual.size(), expected.size());
         for (size_t i = 0; i < actual.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 1e-5) << "logit=" << i;
     }
+}
+
+
+TEST(Gemma4DecodeGraphTest, NoAllocSnapshotMetadataIsDistinctOwnedAndRestoresFlag) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({64*1024, nullptr, true}), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* first = AllocateHiddenSnapshotUserData(ctx.get());
+    ASSERT_NE(first, nullptr);
+    first->layer_idx = 17;
+    auto* second = AllocateHiddenSnapshotUserData(ctx.get());
+    ASSERT_NE(second, nullptr);
+    EXPECT_NE(first, second);
+    EXPECT_EQ(first->layer_idx, 17);
+    EXPECT_TRUE(first->graph_no_alloc);
+    EXPECT_TRUE(second->graph_no_alloc);
+    EXPECT_EQ(second->layer_idx, 0); // Initialized storage, no shared TLS state.
+    EXPECT_TRUE(ggml_get_no_alloc(ctx.get()));
+    EXPECT_GT(ggml_used_mem(ctx.get()), 2*sizeof(HiddenSnapshotUserData));
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> small(
+        ggml_init({ggml_tensor_overhead()+GGML_MEM_ALIGN, nullptr, true}), ggml_free);
+    ASSERT_NE(small, nullptr);
+    EXPECT_THROW(AllocateHiddenSnapshotUserData(small.get()), std::runtime_error);
+    EXPECT_TRUE(ggml_get_no_alloc(small.get()));
+}
+
+TEST(Gemma4DecodeGraphTest, SnapshotCopiesStridedViewsWithoutTouchingDestinationCanary) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({64*1024, nullptr, false}), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* backing = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 3);
+    for (int i=0; i<24; ++i) static_cast<float*>(backing->data)[i] = i*.25f;
+    auto* src = ggml_view_2d(ctx.get(), backing, 4, 3, backing->nb[1], 0);
+    std::array<float,20> output; output.fill(12345.f);
+    ggml_tensor dst = *src;
+    dst.data = output.data(); dst.nb[0]=sizeof(float); dst.nb[1]=4*sizeof(float);
+    dst.nb[2]=dst.nb[3]=12*sizeof(float);
+    HiddenSnapshotUserData ud{}; ud.stage="strided_test";
+    cb_hidden_snapshot_probe(&dst, src, 0, 1, &ud);
+    for (int row=0; row<3; ++row) for (int col=0; col<4; ++col)
+        EXPECT_FLOAT_EQ(output[row*4+col], static_cast<float*>(backing->data)[row*8+col]);
+    for (size_t i=12; i<output.size(); ++i) EXPECT_FLOAT_EQ(output[i], 12345.f);
+}
+
+TEST(Gemma4DecodeGraphTest, IntendedBatchedDiagnosticAbortPropagatesThroughReplayCatch) {
+    std::exception_ptr requested;
+    try { throw BatchedDecodeDiagnosticAbort("controlled logits mismatch"); }
+    catch (...) { requested=std::current_exception(); }
+    EXPECT_THROW(PropagateBatchedDecodeDiagnosticAbort(requested), BatchedDecodeDiagnosticAbort);
+    std::exception_ptr unavailable;
+    try { throw std::runtime_error("reference diagnostic unavailable"); }
+    catch (...) { unavailable=std::current_exception(); }
+    EXPECT_NO_THROW(PropagateBatchedDecodeDiagnosticAbort(unavailable));
+    EXPECT_NO_THROW(PropagateBatchedDecodeDiagnosticAbort(nullptr));
 }
