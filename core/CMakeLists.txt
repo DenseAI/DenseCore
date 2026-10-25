@@ -1403,6 +1403,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_speculative_verification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_nextn_moe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_mtp_qualification.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_automatic_speculation_profile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_sampling_and_moe_trace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_normalization.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_ops.cpp
@@ -1654,3 +1655,7 @@ message(STATUS "GGML_CPU_REPACK: ${GGML_CPU_REPACK}")
 message(STATUS "GGML_CPU_KLEIDIAI: ${GGML_CPU_KLEIDIAI}")
 message(STATUS "C4A maintained configure: cmake --preset c4a-perf")
 message(STATUS "==========================================")
+
+# Registry DATA does not participate in the native code/compiler contract.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/native_fingerprint.cmake)
+densecore_generate_native_fingerprint()

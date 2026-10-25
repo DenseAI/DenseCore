@@ -1,0 +1,7 @@
+#pragma once
+#include <array>
+namespace densecore::runtime::automatic_profile_detail {
+inline constexpr const char* kNativeBuildFingerprint = "@DENSECORE_NATIVE_BUILD_FINGERPRINT@";
+inline constexpr std::array<const char*,@DENSECORE_NATIVE_ENVIRONMENT_COUNT@> kKnownNativeEnvironment{{
+@DENSECORE_NATIVE_ENVIRONMENT_INITIALIZER@}};
+}
