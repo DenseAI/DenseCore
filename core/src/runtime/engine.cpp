@@ -1681,7 +1681,9 @@ int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_pa
         // Additional models would bypass that initialization contract.
         if (state->speculation_selected.load(std::memory_order_acquire) == DENSECORE_SPEC_MTP) {
             SetError(DENSECORE_STATUS_UNSUPPORTED_OPERATION,
-                     "LoadModel: MTP does not support additional models");
+                     state->speculation_requested.load(std::memory_order_relaxed) == DENSECORE_SPEC_AUTO
+                         ? "LoadModel: qualified automatic MTP does not support additional models"
+                         : "LoadModel: explicit MTP does not support additional models");
             return DENSECORE_STATUS_UNSUPPORTED_OPERATION;
         }
         std::string canonical_model_path;
