@@ -159,7 +159,7 @@ Important server variables include:
 | `CORS_ENABLED`, `CORS_ALLOWED_ORIGINS` | explicit browser-origin allowlist |
 
 `DENSECORE_SERVER_INFLIGHT` bounds the priority queue before native submission.
-A full queue returns HTTP 503 with `service_busy` and `Retry-After: 1`, including
+A full queue returns HTTP 503 with `service_unavailable` and `Retry-After: 1`, including
 streaming requests before SSE starts. Go workers submit asynchronously, so the
 queue can empty while generation remains active. This setting does not bound
 the sum of active requests and native pending requests; reducing
