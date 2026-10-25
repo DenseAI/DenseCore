@@ -30,10 +30,21 @@ func RunJSON(ctx context.Context, b Backend, in io.Reader, out io.Writer) error 
 }
 
 // Serve owns the listener, while the caller owns the backend. On cancellation it
-// stops admission and drains requests; Close on the native backend waits for any
-// C inference still running after the HTTP drain deadline.
+// stops admission and waits for admitted native work before starting the bounded
+// HTTP connection shutdown. Returning guarantees the backend may be closed.
 func Serve(ctx context.Context, b Backend, address string, log io.Writer) error {
-	h := NewHandler(b)
+	return ServeWithOptions(ctx, b, address, log, ServeOptions{})
+}
+
+func ServeWithOptions(ctx context.Context, b Backend, address string, log io.Writer, options ServeOptions) error {
+	h, err := NewHandlerWithOptions(b, options)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		h.Drain()
+		_ = h.Wait(context.Background())
+	}()
 	srv := &http.Server{Addr: address, Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -41,7 +52,7 @@ func Serve(ctx context.Context, b Backend, address string, log io.Writer) error 
 	}
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(listener) }()
-	fmt.Fprintf(log, "Laya decision server listening on %s\n", listener.Addr())
+	fmt.Fprintf(log, "%s decision server listening on %s\n", b.Config().ModelID(), listener.Addr())
 	select {
 	case err = <-done:
 		if err == http.ErrServerClosed {
@@ -50,6 +61,9 @@ func Serve(ctx context.Context, b Backend, address string, log io.Writer) error 
 		return err
 	case <-ctx.Done():
 		h.Drain()
+		// Native latency is deliberately unbounded. The HTTP network deadline
+		// starts only after every admitted inference and queued job has drained.
+		_ = h.Wait(context.Background())
 		shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err = srv.Shutdown(shutdown); err != nil {

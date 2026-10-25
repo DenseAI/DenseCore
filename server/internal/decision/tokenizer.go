@@ -21,13 +21,14 @@ type addedToken struct {
 	Normalized bool   `json:"normalized"`
 }
 
-// Tokenizer implements the NFC and byte-level BPE contract embedded in Laya GGUFs.
+// Tokenizer implements the validated Laya byte-level or Julia Metaspace BPE contract.
 // Encode does not add CLS/SEP: the decision prompt builder owns those markers.
 type Tokenizer struct {
-	vocab map[string]int32
-	ranks map[[2]string]int
-	added [2][]addedToken
-	bytes [256]string
+	vocab     map[string]int32
+	ranks     map[[2]string]int
+	added     [2][]addedToken
+	bytes     [256]string
+	metaspace bool
 }
 
 func NewTokenizer(raw []byte) (*Tokenizer, error) {
@@ -122,9 +123,23 @@ func (t *Tokenizer) Encode(text string) ([]int32, error) {
 	var split func(string, int) error
 	split = func(s string, phase int) error {
 		if phase == 1 {
-			s = norm.NFC.String(s)
+			if t.metaspace {
+				s = strings.ReplaceAll(s, " ", "▁")
+			} else {
+				s = norm.NFC.String(s)
+			}
 		}
 		if phase == 2 {
+			if t.metaspace {
+				for _, piece := range metaspacePieces(s) {
+					ids, err := t.encodeMetaspacePiece(piece)
+					if err != nil {
+						return err
+					}
+					result = append(result, ids...)
+				}
+				return nil
+			}
 			for _, piece := range gpt2Pieces(s) {
 				ids, err := t.encodePiece(piece)
 				if err != nil {
@@ -251,14 +266,24 @@ func (t *Tokenizer) encodePiece(piece string) ([]int32, error) {
 	if piece == "" {
 		return nil, nil
 	}
+	symbols := make([]string, len(piece))
+	for i := range symbols {
+		symbols[i] = t.bytes[piece[i]]
+	}
+	return t.encodeSymbols(symbols)
+}
+func (t *Tokenizer) encodeSymbols(symbols []string) ([]int32, error) {
+	if len(symbols) == 0 {
+		return nil, nil
+	}
 	type node struct {
 		value                  string
 		prev, next, generation int
 		alive                  bool
 	}
-	nodes := make([]node, len(piece))
-	for i := range nodes {
-		nodes[i] = node{t.bytes[piece[i]], i - 1, i + 1, 0, true}
+	nodes := make([]node, len(symbols))
+	for i, value := range symbols {
+		nodes[i] = node{value, i - 1, i + 1, 0, true}
 	}
 	nodes[len(nodes)-1].next = -1
 	q := &mergeHeap{}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-10-16",
+  "repository": "SupersonicLabs/Julia-1",
+  "revision": "a85b127321d580d65176c89ced8273f305745d85",
+  "weights_sha256_reported": "df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72",
+  "variant": "posttrained-candidate",
+  "quality_gate_reported": false,
+  "config": {
+    "format_version": 1,
+    "architecture": "JuliaDecisionModel",
+    "weight_dtype": "float32",
+    "head_layers": 2,
+    "n_act": 2,
+    "dropout": 0.1
+  },
+  "gpu_throughput_baseline": {
+    "status": "unavailable",
+    "reason": "Model card publishes H200 BF16 accuracy; no matching throughput/raw timing baseline established."
+  },
+  "source_files": [
+    {
+      "path": "provenance.json",
+      "url": "https://huggingface.co/SupersonicLabs/Julia-1/raw/a85b127321d580d65176c89ced8273f305745d85/provenance.json",
+      "sha256": "d3322e07820ad33b38e4bf5b4c4833c6b7e858ca553754fb8cac682ee802fd25"
+    },
+    {
+      "path": "julia_config.json",
+      "url": "https://huggingface.co/SupersonicLabs/Julia-1/raw/a85b127321d580d65176c89ced8273f305745d85/julia_config.json",
+      "sha256": "b9b881646beeac5414eaa78b39d3fe89ff8a2c062731ad718432620f9aee6bf7"
+    }
+  ],
+  "warning": "Historical model-card accuracy does not establish the quality of this posttrained-candidate checkpoint. Local weight integrity was independently verified; this is not task-quality qualification.",
+  "acquisition": {
+    "status": "downloaded_sha256_verified",
+    "bytes": 577189056,
+    "sha256_verified": "df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72",
+    "local_source_path": "/tmp/densecore-julia-source/model.safetensors",
+    "receipt": "private/benchmarks/encoder-economics-20261016/julia-conversion.json",
+    "does_not_establish": "task quality or GPU economics"
+  }
+}

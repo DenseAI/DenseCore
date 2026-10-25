@@ -1,0 +1,3375 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-10-16",
+  "source_repository": "https://github.com/bhushankinge/laya-cuda-bench",
+  "source_revision": "3520301f965434e1c4235941cd0121c0a3017bed",
+  "checkpoint": {
+    "hf_repo": "convaiinnovations/laya",
+    "requested_revision": "c5d78730f3493e4fe16d61507ef4b78eef7318cf",
+    "files": {
+      "encoder/config.json": {
+        "bytes": 2083
+      },
+      "eval/results.json": {
+        "bytes": 2976
+      },
+      "model.safetensors": {
+        "bytes": 842609210,
+        "sha256": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c"
+      },
+      "multilingual/encoder/config.json": {
+        "bytes": 1938
+      },
+      "multilingual/model.safetensors": {
+        "bytes": 643835514,
+        "sha256": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+      },
+      "multilingual/rl_agent_config.json": {
+        "bytes": 472
+      },
+      "multilingual/tokenizer/tokenizer.json": {
+        "bytes": 34363188
+      },
+      "multilingual/tokenizer/tokenizer_config.json": {
+        "bytes": 524
+      },
+      "rl_agent_config.json": {
+        "bytes": 745
+      },
+      "tokenizer/tokenizer.json": {
+        "bytes": 3583228
+      },
+      "tokenizer/tokenizer_config.json": {
+        "bytes": 308
+      },
+      "typed-decisions/encoder/config.json": {
+        "bytes": 2084
+      },
+      "typed-decisions/model.safetensors": {
+        "bytes": 842609220,
+        "sha256": "4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
+      },
+      "typed-decisions/rl_agent_config.json": {
+        "bytes": 847
+      },
+      "typed-decisions/tokenizer/tokenizer.json": {
+        "bytes": 3583228
+      },
+      "typed-decisions/tokenizer/tokenizer_config.json": {
+        "bytes": 337
+      }
+    },
+    "rl_agent_config": {
+      "encoder": "answerdotai/ModernBERT-large",
+      "head_layers": 2,
+      "max_len": 512,
+      "head_max_len": 192,
+      "max_prefixes": 6,
+      "act_costs": {
+        "escalate": 0.5
+      },
+      "cost_wrong_act": 3.0,
+      "amp_dtype": "bf16",
+      "model_name": "rl-agent",
+      "temperature": [
+        1.6369030475616455,
+        1.2514300346374512,
+        1.983399510383606
+      ],
+      "temperature_by_options": {
+        "choice:3-5": 1.7601518630981445,
+        "choice:6-10": 1.0000158548355103,
+        "score:3-5": 1.2514300346374512,
+        "noul:2": 1.983399510383606,
+        "choice:11+": 0.10058280825614929,
+        "choice:2": 1.9063563346862793
+      },
+      "training": {
+        "updates": 7313,
+        "epochs_completed": 1,
+        "hours": 1.96,
+        "world_size": 1,
+        "fine_tuned_from_checkpoint": true
+      }
+    }
+  },
+  "measurement": {
+    "boundary": "prompt construction, tokenization, collation, H2D, model forward, synchronizing D2H, calibration, answer formatting; model load excluded",
+    "warmup_iterations": 20,
+    "timed_iterations": 50,
+    "rows": "one state and one question per row; question types cycle route/severity/needs_human",
+    "bucket_semantics": "state-only tokenizer lengths short 0..80 or long 400..472, not total input length",
+    "effective_tokens": "raw attention_mask sum, excludes padding; may include truncated state so per-request reconstruction still needs tokenization",
+    "quality_gate": "External argmax 63/63 with FP16 probability tolerance 0.02 is not DenseCore probability parity 1e-4 or task accuracy noninferiority."
+  },
+  "comparison_status": {
+    "laya_128": "unavailable: no matching fixed total-input 128-token four-option GPU workload",
+    "laya_256": "unavailable: no matching fixed total-input 256-token four-option GPU workload",
+    "external_workload": "performance reference only; CPU input/token/quality equivalence and full-instance price remain unverified",
+    "economic_target_tokens_per_second": null,
+    "pricing": "Published full-Pod CPU/RAM price candidates and explicit disk-cost scenarios captured in pricing-candidates-20261016.json; exact instance quote/host/region/storage/quality equivalence remain unverified; no economic qualification.",
+    "julia": "unavailable: published H200 BF16 accuracy is not a throughput baseline",
+    "provisional_pricing_manifest": "pricing-candidates-20261016.json"
+  },
+  "files": [
+    {
+      "path": "REPORT.md",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/REPORT.md",
+      "sha256": "8c4756579295ae7af076ca6dda47acd7fbca56b21a55a2d6818111f7d3b09047",
+      "bytes": 63249
+    },
+    {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358
+    },
+    {
+      "path": "manifest.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/manifest.json",
+      "sha256": "9dc70d8f91b0497923c0883b80d798e27eccb5cd535219cd94c7a951a6f74c3c",
+      "bytes": 5168
+    },
+    {
+      "path": "harness/workload.py",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/harness/workload.py",
+      "sha256": "e7288fbdef68551ef17adcda7ace6e8058460d5ee7fe609f7f5f4a8502e56958",
+      "bytes": 1668
+    },
+    {
+      "path": "harness/shootout.py",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/harness/shootout.py",
+      "sha256": "662f9956ab051e1fb4c8323d13937785f170971d9ce959c9c123c88634af7c5f",
+      "bytes": 6997
+    },
+    {
+      "path": "harness/sequences.py",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/harness/sequences.py",
+      "sha256": "930c9554eecb7d7b4e90c41bde1b1d19f92fdcc0a6b80e3a3b6e0d5d9706990e",
+      "bytes": 2510
+    },
+    {
+      "path": "harness/predict.py",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/harness/predict.py",
+      "sha256": "5a0395ba5c2f982a56549aeeb1be3d9787b586f2e71fff0aa367070a2efac2af",
+      "bytes": 2118
+    },
+    {
+      "path": "harness/parity.py",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/harness/parity.py",
+      "sha256": "794a5b1de73e7d19d59bf1d42a99dcfd479c20355647ac6d1687b168ead2c5d0",
+      "bytes": 8911
+    },
+    {
+      "path": "fixtures/workload/states.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/fixtures/workload/states.jsonl",
+      "sha256": "05c729a494b829264a00875c6238c9aeaa1ebe3685fc8ae0fce52604be43ef90",
+      "bytes": 1884865
+    },
+    {
+      "path": "fixtures/workload/questions.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/fixtures/workload/questions.json",
+      "sha256": "b17ad9cdb1b9e6d21cad7e99e4f0b46306313308aef563ecd8e75d46c611c08d",
+      "bytes": 737
+    },
+    {
+      "path": "fixtures/workload/source.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/fixtures/workload/source.json",
+      "sha256": "abe6e441cc0431a6d0a2376bd54b4aab88c6bccbd79ee1e9becee07a37ea711e",
+      "bytes": 286
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/compile-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/compile-fp16.r0.jsonl",
+      "sha256": "dba7f456f954494a57f39c031d4194f10e3fe8fb7637b45338593e9427d825d5",
+      "bytes": 165042
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/compile-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/compile-fp16.r1.jsonl",
+      "sha256": "c090777e3d99c901ed39b0f5bd0885645c3daec21ad1e27ec8cf72248a14aa18",
+      "bytes": 165952
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/compile-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/compile-fp16.r2.jsonl",
+      "sha256": "9a95c2fd144c07af8d76ddd218b59044d9cf16fcfb6eb7a5d180681ab9a5fd98",
+      "bytes": 165484
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp16.r0.jsonl",
+      "sha256": "c67d49211cfbf56f0dcca0c81cb9f316dbf8aaeb9ce905c59c904fe2af765cd0",
+      "bytes": 160257
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp16.r1.jsonl",
+      "sha256": "2810be07b9f9ad52e6b68497806c52e25f37d63c7ba08f348f3f25c9187b2de7",
+      "bytes": 158906
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp16.r2.jsonl",
+      "sha256": "15391f36cdb21ccd716d019c2bf9764499e9858afa98a4f7315f5ee80277ddcd",
+      "bytes": 160434
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp32.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp32.r0.jsonl",
+      "sha256": "96d8f41520adae30a4485be41ab3bcc6c0b0d704e7a74684c5b0bb59716c6c20",
+      "bytes": 160425
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp32.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp32.r1.jsonl",
+      "sha256": "8b5706f97b3801f405e44593b5c5696f3dd9a7cb0f0295a98fe5f29416102568",
+      "bytes": 160296
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/eager-fp32.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/eager-fp32.r2.jsonl",
+      "sha256": "9d9069ea5acada55808c43d6af8475e112765bf0717ec550366f6a90e446aab5",
+      "bytes": 160372
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "sha256": "90289c645cbc927d472b93bb0b7ba4282f0fc69938ce1175bbba6450191d139f",
+      "bytes": 158098
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "sha256": "adc1e0c16e63f46412604da97b94cdf44210bbf21cd9fe10cf31466c25488d73",
+      "bytes": 157465
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "sha256": "cffbe307ec50b33b6c51c9aee49a6b2bd65346d37d7a1573fb57da995622e047",
+      "bytes": 158368
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "sha256": "40d5e757e231866823c577d52893179a43c16f55bd8a48af85493778a56fa1d8",
+      "bytes": 159791
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "sha256": "4df4f2093fc144b10cea80bfe34eb73f220c90d7fdb72f8fa61d07738966c224",
+      "bytes": 160295
+    },
+    {
+      "path": "results/h100nvl/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "sha256": "7fce9c643d0d9585ee7e3ef92afdbd46db435f48e4c889c6f4c662346eb9ab1b",
+      "bytes": 160070
+    },
+    {
+      "path": "results/h100nvl/env.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/env.json",
+      "sha256": "d64c4c2612a0b053ce8bed33c0ebaa5b8dfc6f077ed265cf3b0136c6b330f30d",
+      "bytes": 1173
+    },
+    {
+      "path": "results/h100nvl/parity.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/h100nvl/parity.json",
+      "sha256": "19211c552a80b6a000c3c1a1cdb68185b10df60407d1f57e5f925684807551ff",
+      "bytes": 40655
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/compile-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/compile-fp16.r0.jsonl",
+      "sha256": "a516d506549d09d94e1135cf16618ada497f7577133fbd8b71b5255687f4aa92",
+      "bytes": 182209
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/compile-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/compile-fp16.r1.jsonl",
+      "sha256": "3943f0f2fb4174bd827cc0cc1efd2e2925989b666bc680ec799d354d19faa1c1",
+      "bytes": 182552
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/compile-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/compile-fp16.r2.jsonl",
+      "sha256": "f9139911201fb9a420e69668b327e29cdec11542292ccd6af598a4283d7f746e",
+      "bytes": 182336
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp16.r0.jsonl",
+      "sha256": "af1720e4e62a19280b671afb740247598f8ca826c424d20b203cc393b70b2544",
+      "bytes": 176258
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp16.r1.jsonl",
+      "sha256": "f8309b84e69c8273c9b47bdb78b687e9c05530db24a0c5aa48a88e98b3382e41",
+      "bytes": 177590
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp16.r2.jsonl",
+      "sha256": "54f75bfcd04f59f94c78eed38052ffb1cbfab82157207b17ac62337e70a94663",
+      "bytes": 177099
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp32.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp32.r0.jsonl",
+      "sha256": "6c6ad22680fa72e1c0e7defc358e00ffa782a90ea50eedaa80b454d5098e4b71",
+      "bytes": 177134
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp32.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp32.r1.jsonl",
+      "sha256": "e8b77f4fa545ca5f0d61f70c581f734c77e64a2880027b63d63b29fd3e4b352b",
+      "bytes": 177094
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/eager-fp32.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/eager-fp32.r2.jsonl",
+      "sha256": "4abac2f4f51172b49c9ff9194f4e4fe85fb2633698a7ff73906ab878ce7be9ec",
+      "bytes": 177214
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "sha256": "103ee4477292dd2b12da06ad285d46b5e0acfe1c6b89563fc5edbdbbd7578a01",
+      "bytes": 174529
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "sha256": "809e19cf08e557010ab39b910ca66b0d2ea96f7b0699a56a45005df63c82c91f",
+      "bytes": 174027
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "sha256": "ed3dde05b9eb35cc2ff0bdc044fcd90b167422f703867adfbbef860601227302",
+      "bytes": 174110
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "sha256": "11d8e439439fe37f1983975b0f8992185305f6c7ef1a05920696d4ca6a8582eb",
+      "bytes": 175516
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "sha256": "c3aece59b6202e8793aea7a62c9b869980ebe4b12a6b5dd879d18284c502366d",
+      "bytes": 176522
+    },
+    {
+      "path": "results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "sha256": "6afc5a23561d6419833e5d4ef58410c960ed592c6c0d63e990449d68222719d8",
+      "bytes": 175178
+    },
+    {
+      "path": "results/rtxpro6000-ws/env.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/env.json",
+      "sha256": "f8c9d110f0c7ad62e3e5a1fac2d214cb967161a8b2a566ba018f295547ea7ff8",
+      "bytes": 1190
+    },
+    {
+      "path": "results/rtxpro6000-ws/parity.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/rtxpro6000-ws/parity.json",
+      "sha256": "8b43a7bbfae10baed103074aeac2a01c1002015f69a1eadf49541ef8b26ad1a8",
+      "bytes": 93921
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/compile-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/compile-fp16.r0.jsonl",
+      "sha256": "13f6873b2b8dd39b920a7224c3baa77ccf1e058cfda931dda9a514aa5c904d23",
+      "bytes": 184888
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/compile-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/compile-fp16.r1.jsonl",
+      "sha256": "a581a926ec9d4088e1006eb1c9459f434eca0698fa9a291dbf0e0b05b005b10d",
+      "bytes": 182816
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/compile-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/compile-fp16.r2.jsonl",
+      "sha256": "d62b91bb048513ce9f98883f265d715d66cfec7515f1b85073e97ea1f2df4938",
+      "bytes": 184236
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp16.r0.jsonl",
+      "sha256": "0bd1595cad6a47d3a4d2affe6c3dba64c27754f394b98800f6b94654f8d254a0",
+      "bytes": 177963
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp16.r1.jsonl",
+      "sha256": "519c7adc7d74476244e802e174698cfd8db3e6fc639a7c2221c150266570d19e",
+      "bytes": 177985
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp16.r2.jsonl",
+      "sha256": "7d71b7718d1d0806b61666fa5bc15651dbac0c8ad27aa93f13a2e086a0d82e8f",
+      "bytes": 177548
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp32.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp32.r0.jsonl",
+      "sha256": "b98f6274565bae268f2123aecd4d53822daa4df30132f66f5bdd56f5a5dadd27",
+      "bytes": 179476
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp32.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp32.r1.jsonl",
+      "sha256": "9df5aa595b4c9cc3c068f4e913d0263e968fc1ec68f8946a1c9673ef5bea1532",
+      "bytes": 179059
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/eager-fp32.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/eager-fp32.r2.jsonl",
+      "sha256": "9bf643743b1f7e13c244db6c886b679d118955edf198b30df3c190f3f13d6906",
+      "bytes": 178434
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "sha256": "0baad975d72e3d7485392fd9caface31dd4467ad62cb09e452f20961775c0bfb",
+      "bytes": 175825
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r1.jsonl",
+      "sha256": "6a0f30f0220ddd868544646bcb1a90907c9f94d53a80c14f6a153562aa7d4766",
+      "bytes": 176364
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-cuda-fp16.r2.jsonl",
+      "sha256": "fa2bf39236e2cda467a7b409c402527e6bc70f302c907383055681093833daec",
+      "bytes": 175627
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "sha256": "9420e60a0552c6555d631d6ad4104cbb4d1f63d60f6b530bd3e3323c56f4c7af",
+      "bytes": 178434
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r1.jsonl",
+      "sha256": "8f36f57067835e789c025326c3d77b6c65c3dd017ca47b7a46748560d1ce5c53",
+      "bytes": 178006
+    },
+    {
+      "path": "results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/shootout/laya/ort-trt-fp16.r2.jsonl",
+      "sha256": "61b6f11f97c43d13e989e096408d356d2bdf7897de1e0722ee8495d869391687",
+      "bytes": 178624
+    },
+    {
+      "path": "results/zbook-rtxpro5000/env.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/env.json",
+      "sha256": "8ce0a9281df0be00772df7c26350ea192aae61e9819d08b2a25b03ffb86b990e",
+      "bytes": 1186
+    },
+    {
+      "path": "results/zbook-rtxpro5000/parity.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/zbook-rtxpro5000/parity.json",
+      "sha256": "d05bcaef710b39b0ce2c5c582ad8de8010d9f251a44aae8e597d86a056d0ee03",
+      "bytes": 85662
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/compile-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/compile-fp16.r0.jsonl",
+      "sha256": "8a7d87d12a2f9b6bebb27fb5278d39d84fae2e6b4e38d05a3df311c0a970b891",
+      "bytes": 136002
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/eager-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/eager-fp16.r0.jsonl",
+      "sha256": "8c3d0be50c188992592a42b44f88bb341b220ad5dce7b4db310cc435eb499eb4",
+      "bytes": 130538
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/eager-fp16.r1.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/eager-fp16.r1.jsonl",
+      "sha256": "c630b7c9dfdf5141bbcb689c0c9a7adf8b70b3d776d136d2783ac153b87a521c",
+      "bytes": 131068
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/eager-fp16.r2.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/eager-fp16.r2.jsonl",
+      "sha256": "40a8596826e37da7fb3e0cc053feeef3c18aba8566a4eb8511ac2953cdb31ba6",
+      "bytes": 131889
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/eager-fp32.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/eager-fp32.r0.jsonl",
+      "sha256": "5018132b72f0ae3c87c4f3a2a81e11d8e091698563bc5d32fd1b4a09d98fe382",
+      "bytes": 131701
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/ort-cuda-fp16.r0.jsonl",
+      "sha256": "819497802a6b8801d9b86390db199d39c23afea7cd3a91e1869c2383c802de9f",
+      "bytes": 107803
+    },
+    {
+      "path": "results/laptop-rtx2000ada/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/shootout/laya/ort-trt-fp16.r0.jsonl",
+      "sha256": "217f99573d65e7442cf30f438242a20c26828d2c472187a0bb3d20e1236100fd",
+      "bytes": 130197
+    },
+    {
+      "path": "results/laptop-rtx2000ada/env.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/env.json",
+      "sha256": "1dc1167726f6309ec38df3c0d5d7de0e3b6c62d1300200f774ed7b4e3e259474",
+      "bytes": 1280
+    },
+    {
+      "path": "results/laptop-rtx2000ada/parity.json",
+      "url": "https://raw.githubusercontent.com/bhushankinge/laya-cuda-bench/3520301f965434e1c4235941cd0121c0a3017bed/results/laptop-rtx2000ada/parity.json",
+      "sha256": "6dd4cc82eef033a0e56ba683f335617b0cb2370b076c46112bb9862d1c5d85c3",
+      "bytes": 77359
+    }
+  ],
+  "cells": [
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 9.07269399613142,
+      "decisions_per_second_derived": 110.220845145488,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 51693.576373233875,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 74.99123411253095,
+      "decisions_per_second_derived": 213.3582703278438,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 101438.52264899424,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 297.87848563864827,
+      "decisions_per_second_derived": 214.8527103687421,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 103005.08925381428,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1212.1325237676501,
+      "decisions_per_second_derived": 211.1980290771175,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 101661.32628549203,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5.506047513335943,
+      "decisions_per_second_derived": 181.61848359970492,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 17435.37442557167,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 19.427281338721514,
+      "decisions_per_second_derived": 823.5840991353524,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 84829.16221094129,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 69.90012107416987,
+      "decisions_per_second_derived": 915.5921193911903,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 96838.17275248386,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 278.4606977365911,
+      "decisions_per_second_derived": 919.3397922250496,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 96724.60142105268,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 7.441442459821701,
+      "decisions_per_second_derived": 134.3825481953616,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 63025.4151036246,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 47.658462543040514,
+      "decisions_per_second_derived": 335.72211830271164,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 159614.8846205455,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 185.25154469534755,
+      "decisions_per_second_derived": 345.4762015898446,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 165628.8483340813,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 750.8695172145963,
+      "decisions_per_second_derived": 340.93806464490683,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 164112.40192186693,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 3.808458801358938,
+      "decisions_per_second_derived": 262.5734062406502,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 25207.046999102415,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 16.02261606603861,
+      "decisions_per_second_derived": 998.5884910463188,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 102854.61457777084,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 57.93372355401516,
+      "decisions_per_second_derived": 1104.7106257606397,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 116840.40977771516,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 226.93347511813045,
+      "decisions_per_second_derived": 1128.0839015343106,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 118686.76485908251,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5.146680399775505,
+      "decisions_per_second_derived": 194.29999967427923,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 91126.69984723696,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 36.22861625626683,
+      "decisions_per_second_derived": 441.6398320825272,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 209972.13766573655,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 139.02462366968393,
+      "decisions_per_second_derived": 460.35010425247424,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 220701.91013716668,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 549.7619174420834,
+      "decisions_per_second_derived": 465.6561174537326,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 224146.1186932465,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 3.4036273136734962,
+      "decisions_per_second_derived": 293.8042000023532,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 28205.203200225907,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 12.377836275845766,
+      "decisions_per_second_derived": 1292.6330291847987,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 133141.20200603426,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 43.91235113143921,
+      "decisions_per_second_derived": 1457.4487211680853,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 154147.97489979328,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 171.8030092306435,
+      "decisions_per_second_derived": 1490.078672931293,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 156772.57412785722,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 11.476005427539349,
+      "decisions_per_second_derived": 87.13833452886551,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 40867.87889403792,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 57.293628342449665,
+      "decisions_per_second_derived": 279.2631652575121,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 132772.18113211842,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 219.83353327959776,
+      "decisions_per_second_derived": 291.12937887688355,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 139573.79268874088,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 872.095599770546,
+      "decisions_per_second_derived": 293.54579941391205,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 141299.8758764771,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 10.719719342887402,
+      "decisions_per_second_derived": 93.28602438304563,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 8955.45834077238,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 19.138742238283157,
+      "decisions_per_second_derived": 836.0006002899844,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 86108.0618298684,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 65.36892848089337,
+      "decisions_per_second_derived": 979.0584225150104,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 103550.72596881415,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 255.65266283228993,
+      "decisions_per_second_derived": 1001.358629180162,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 105353.8801497597,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 19.862522836774588,
+      "decisions_per_second_derived": 50.34607175622948,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 23612.30765367162,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 225.6826707161963,
+      "decisions_per_second_derived": 70.89600610106457,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 33706.61990067489,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 931.6369169391692,
+      "decisions_per_second_derived": 68.69629019239353,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 32934.50424958142,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 3731.172921601683,
+      "decisions_per_second_derived": 68.61113257921767,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 33026.34388413772,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 8.733568247407675,
+      "decisions_per_second_derived": 114.5007368891659,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 10992.070741359927,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 65.01465570181608,
+      "decisions_per_second_derived": 246.09835778232176,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 25348.130851579142,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 248.66806017234921,
+      "decisions_per_second_derived": 257.37121187032335,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 27221.027080472166,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "h100nvl",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 948.6780664883554,
+      "decisions_per_second_derived": 269.8491817646996,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 28391.08539707195,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 30.990216531790793,
+      "decisions_per_second_derived": 32.26824823809046,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 15133.808423664424,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 618.2874505175278,
+      "decisions_per_second_derived": 25.877931028047637,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 12303.338833147398,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 8.867359021678567,
+      "decisions_per_second_derived": 112.77314897877031,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 10826.22230196195,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 111.58207850530744,
+      "decisions_per_second_derived": 143.3922025322279,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 14769.396860819475,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 542.0170849538408,
+      "decisions_per_second_derived": 118.07745876765186,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 12488.53622497243,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 30.528849514666945,
+      "decisions_per_second_derived": 32.75590190582095,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 15362.517993830026,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 616.1009005154483,
+      "decisions_per_second_derived": 25.96977213734621,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 12347.00354054954,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2533.9152795495465,
+      "decisions_per_second_derived": 25.257355885780548,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 12108.928916303195,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 6.99188094586134,
+      "decisions_per_second_derived": 143.02303024652096,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 13730.210903666013,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 89.73886555759236,
+      "decisions_per_second_derived": 178.2950999055316,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 18364.395290269757,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "ort-trt-fp16-maxb32",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 540.1811879710294,
+      "decisions_per_second_derived": 118.47876494994193,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 12530.980624158703,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 29.07096449052915,
+      "decisions_per_second_derived": 34.39858351881596,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 16132.935670324685,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 362.8329130006023,
+      "decisions_per_second_derived": 44.097432803659245,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 20965.573208589743,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1283.5982995457016,
+      "decisions_per_second_derived": 49.85983545058547,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 23903.895798911155,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 13.630842033308,
+      "decisions_per_second_derived": 73.36303931601759,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 7042.85177433769,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 89.99634900828823,
+      "decisions_per_second_derived": 177.78498990582915,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 18311.853960300403,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 325.044498546049,
+      "decisions_per_second_derived": 196.89611818159455,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 20824.84099955021,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 36.88998747384176,
+      "decisions_per_second_derived": 27.107626444955773,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 12713.476802684258,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 506.42552599310875,
+      "decisions_per_second_derived": 31.59398406828672,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 15020.964800466067,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2161.1993045080453,
+      "decisions_per_second_derived": 29.613187393917077,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 14197.209825118089,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 17.658287019003183,
+      "decisions_per_second_derived": 56.63063460933882,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 5436.540922496526,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 116.39433749951422,
+      "decisions_per_second_derived": 137.4637318595226,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 14158.76438153083,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 545.797573053278,
+      "decisions_per_second_derived": 117.25959066100985,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 12402.03389350587,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 99.14214099990204,
+      "decisions_per_second_derived": 10.086528189874254,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 4730.581721051025,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1550.578526512254,
+      "decisions_per_second_derived": 10.318729252615865,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 4905.910839040555,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 6207.289761048742,
+      "decisions_per_second_derived": 10.310457939567332,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 4943.0590774960065,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 26.057454000692815,
+      "decisions_per_second_derived": 38.376734732925634,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 3684.166534360861,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 381.2968045240268,
+      "decisions_per_second_derived": 41.962061601782416,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 4322.092344983588,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "laptop-rtx2000ada",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 1,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1551.0232660453767,
+      "decisions_per_second_derived": 41.263081864129575,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 4364.215642785829,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 9.027972002513707,
+      "decisions_per_second_derived": 110.76684771746795,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 51949.65157949247,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 79.71458049723879,
+      "decisions_per_second_derived": 200.71610363118225,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 95427.96252015022,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 375.2792364975903,
+      "decisions_per_second_derived": 170.53967759394263,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 81760.45199398346,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1576.8468704991392,
+      "decisions_per_second_derived": 162.34930911139463,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 78147.72778855401,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 7.875085990235675,
+      "decisions_per_second_derived": 126.98274040942546,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 12190.343079304845,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 19.638794001366477,
+      "decisions_per_second_derived": 814.7139788159452,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 83915.53981804235,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 72.1657475005486,
+      "decisions_per_second_derived": 886.8473232334145,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 93797.9614213591,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 350.94723899965174,
+      "decisions_per_second_derived": 729.4543781843345,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 76746.57899225339,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 6.976297001529019,
+      "decisions_per_second_derived": 143.34252107971128,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 67227.64238638458,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 55.93897800281411,
+      "decisions_per_second_derived": 286.02596206164316,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 135987.46833768248,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 245.95754000620218,
+      "decisions_per_second_derived": 260.20751385944965,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 124749.17418358584,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1008.2008769968525,
+      "decisions_per_second_derived": 253.9176525639932,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 122224.65067384057,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 4.319338499044534,
+      "decisions_per_second_derived": 231.51693256298543,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 22225.6255260466,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 18.83465600258205,
+      "decisions_per_second_derived": 849.4978616974238,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 87498.27975483466,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 66.80253599915886,
+      "decisions_per_second_derived": 958.0474609647432,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 101328.48848859916,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 287.8814954965492,
+      "decisions_per_second_derived": 889.254794089635,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 93559.33056253995,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 6.758080497093033,
+      "decisions_per_second_derived": 147.9710104711163,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 69398.40391095354,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 53.62906499794917,
+      "decisions_per_second_derived": 298.3456825251728,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 141844.72543556185,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 210.26625899685314,
+      "decisions_per_second_derived": 304.3759864532418,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 145924.50613038777,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 850.4832510006963,
+      "decisions_per_second_derived": 301.0053398450646,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 144890.56645737414,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 4.013545498310123,
+      "decisions_per_second_derived": 249.15626356323693,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 23919.001302070745,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 18.00265599740669,
+      "decisions_per_second_derived": 888.7577478736928,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 91542.04803099037,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 61.3476080034161,
+      "decisions_per_second_derived": 1043.2354590978707,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 110338.45035364822,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 246.43291949905688,
+      "decisions_per_second_derived": 1038.8222503730055,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 109295.46285760365,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 24.48445499612717,
+      "decisions_per_second_derived": 40.84224052192197,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 19155.010804781406,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 63.40991499746451,
+      "decisions_per_second_derived": 252.3264697743211,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 119965.4659733288,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 296.27136349881766,
+      "decisions_per_second_derived": 216.01817753896896,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 103563.83970981538,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1201.649943999655,
+      "decisions_per_second_derived": 213.04041270780726,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 102548.16772166002,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 22.476646503491793,
+      "decisions_per_second_derived": 44.49062273790033,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 4271.0997828384325,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 31.49314750044141,
+      "decisions_per_second_derived": 508.0470283186443,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 52328.84391682037,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 72.91037299728487,
+      "decisions_per_second_derived": 877.7900505650042,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 92840.01331678928,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 340.01760050159646,
+      "decisions_per_second_derived": 752.9022015988199,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 79213.54647602585,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 20.131632496486418,
+      "decisions_per_second_derived": 49.67307048618786,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 23296.670058022108,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 153.0312645045342,
+      "decisions_per_second_derived": 104.55379854438786,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 49708.7965954474,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 624.2512279932271,
+      "decisions_per_second_derived": 102.52282595540906,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 49151.68544984088,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2654.866568504076,
+      "decisions_per_second_derived": 96.4266916601564,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 46415.51536408629,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 18.723417997534852,
+      "decisions_per_second_derived": 53.409051709023494,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 5127.268964066255,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 45.243173008202575,
+      "decisions_per_second_derived": 353.64451554048173,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 36425.38510066962,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 176.11758648854448,
+      "decisions_per_second_derived": 363.3935785519231,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 38434.54895653074,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "rtxpro6000-ws",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 696.079251501942,
+      "decisions_per_second_derived": 367.7742145705743,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 38693.86990329628,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 16.272330500214593,
+      "decisions_per_second_derived": 61.45401237928472,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 28821.931805884535,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 280.60295099930954,
+      "decisions_per_second_derived": 57.02007032719827,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 27109.479686187326,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1264.0495115010708,
+      "decisions_per_second_derived": 50.63092815407158,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 24273.57450861529,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5355.884457498178,
+      "decisions_per_second_derived": 47.79789445263385,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 23007.77788951059,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5.004267000913387,
+      "decisions_per_second_derived": 199.82946549763997,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 19183.62868777344,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 55.34905249987787,
+      "decisions_per_second_derived": 289.0745058379329,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 29774.67410130709,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 220.02239099856524,
+      "decisions_per_second_derived": 290.87948599021155,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 30765.050635433465,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-cuda-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 1034.2475479992572,
+      "decisions_per_second_derived": 247.52294602508823,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 26042.12120406143,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 14.152674499200657,
+      "decisions_per_second_derived": 70.65802298049601,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 33138.612777852635,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 149.84996149905783,
+      "decisions_per_second_derived": 106.7734675400674,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 50764.11047358079,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 663.3502495005814,
+      "decisions_per_second_derived": 96.47995165176147,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 46254.59932079683,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2664.363542000501,
+      "decisions_per_second_derived": 96.08298415905581,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 46250.069878781134,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5.9149885000806535,
+      "decisions_per_second_derived": 169.06203621298073,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 16229.95547644615,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 35.16143550041306,
+      "decisions_per_second_derived": 455.04399272356324,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 46869.53125052701,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 152.49063699957333,
+      "decisions_per_second_derived": 419.6978992236689,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 44389.61062257835,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "ort-trt-fp16-maxb256",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 680.8970389993192,
+      "decisions_per_second_derived": 375.97461192698177,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 39556.64139703643,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 11.418803502238006,
+      "decisions_per_second_derived": 87.57484965951178,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 41072.60449031102,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 142.86076149983273,
+      "decisions_per_second_derived": 111.99716305599235,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 53247.65121043336,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 619.5469809990755,
+      "decisions_per_second_derived": 103.30128620237035,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 49524.89632105202,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2463.6140005004563,
+      "decisions_per_second_derived": 103.91238235697492,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 50018.79351837089,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 5.820668000524165,
+      "decisions_per_second_derived": 171.80158701886924,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 16492.952353811448,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 34.415251000609715,
+      "decisions_per_second_derived": 464.910164383707,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 47885.746931521826,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 133.96587549868855,
+      "decisions_per_second_derived": 477.73360015570927,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 50527.79280396869,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-compile-max-autotune-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 599.3030239988002,
+      "decisions_per_second_derived": 427.1628704488441,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 44942.20606511393,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 13.93604949953442,
+      "decisions_per_second_derived": 71.75634673466166,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 33653.72661855632,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 200.70430600026157,
+      "decisions_per_second_derived": 79.71926621235096,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 37901.52862983461,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 892.9660459998559,
+      "decisions_per_second_derived": 71.67125814771498,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 34360.76896478654,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 3566.158669498691,
+      "decisions_per_second_derived": 71.78592534021682,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 34554.54774179257,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 8.426361499914492,
+      "decisions_per_second_derived": 118.67518382758058,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 11392.817647447737,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 46.85951149895118,
+      "decisions_per_second_derived": 341.446154434583,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 35168.95390676204,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 194.5058715000414,
+      "decisions_per_second_derived": 329.0389102726206,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 34801.00599430264,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp16",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 896.8458669996835,
+      "decisions_per_second_derived": 285.44481211294953,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 30031.916286914777,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 34.93978500046069,
+      "decisions_per_second_derived": 28.620668386677675,
+      "valid_input_tokens_per_iteration": [
+        469
+      ],
+      "valid_input_tokens_per_second_derived": 13423.09347335183,
+      "padded_sequence_lengths": [
+        469
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 543.8204524998582,
+      "decisions_per_second_derived": 29.421475280031274,
+      "valid_input_tokens_per_iteration": [
+        7607
+      ],
+      "valid_input_tokens_per_second_derived": 13988.072653449868,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2398.550454499855,
+      "decisions_per_second_derived": 26.68278246135342,
+      "valid_input_tokens_per_iteration": [
+        30683
+      ],
+      "valid_input_tokens_per_second_derived": 12792.309597839172,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "long",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 8878.221238499464,
+      "decisions_per_second_derived": 28.834604716751503,
+      "valid_input_tokens_per_iteration": [
+        123227
+      ],
+      "valid_input_tokens_per_second_derived": 13879.694669652881,
+      "padded_sequence_lengths": [
+        512
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 1,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 10.975766997944447,
+      "decisions_per_second_derived": 91.10980582835633,
+      "valid_input_tokens_per_iteration": [
+        96
+      ],
+      "valid_input_tokens_per_second_derived": 8746.541359522207,
+      "padded_sequence_lengths": [
+        96
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 16,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 146.82865449867677,
+      "decisions_per_second_derived": 108.97055520006957,
+      "valid_input_tokens_per_iteration": [
+        1648
+      ],
+      "valid_input_tokens_per_second_derived": 11223.967185607165,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 64,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 546.7132505000336,
+      "decisions_per_second_derived": 117.06319527003318,
+      "valid_input_tokens_per_iteration": [
+        6769
+      ],
+      "valid_input_tokens_per_second_derived": 12381.262012232102,
+      "padded_sequence_lengths": [
+        135
+      ]
+    },
+    {
+      "box": "zbook-rtxpro5000",
+      "backend": "torch-eager-fp32",
+      "state_bucket": "short",
+      "batch": 256,
+      "repeat_count": 3,
+      "timed_iterations_per_repeat": [
+        50
+      ],
+      "median_of_repeat_median_ms": 2231.765472000916,
+      "decisions_per_second_derived": 114.70739341194313,
+      "valid_input_tokens_per_iteration": [
+        26934
+      ],
+      "valid_input_tokens_per_second_derived": 12068.47239905186,
+      "padded_sequence_lengths": [
+        135
+      ]
+    }
+  ]
+}

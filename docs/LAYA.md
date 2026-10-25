@@ -9,8 +9,16 @@ Jev weights and the Jev hosted API are not supported by this implementation.
 The Go process handles tokenization and typed requests; C++/GGML executes
 ModernBERT and the decision heads. Python is only used for downloading and
 independent validation, never by the serving process.
-F16 model projections expand per layer for F32 arithmetic to preserve numerical
-compatibility. The runtime reuses its scratch workspace between layers and requests.
+F16 projections convert once at load for FP32 arithmetic; the embedding remains
+F16. A persistent GGML threadpool, compute workspace, and bounded graph templates
+are reused under the model handle lock. This trades additional resident memory
+for less repeated work: converted projections require about 1.5 GiB, graph
+templates are capped at 512 MiB, and each graph arena is capped at 2 GiB.
+Experimental `q8_0` quantizes encoder projections only; normalization and decision
+heads retain FP32 arithmetic. It requires separate task-quality qualification.
+Weights currently use raw CPU storage. Compiled ISA support does not establish
+AMX, VNNI or Arm packed-kernel execution; no such acceleration is claimed.
+Runtime metadata reports the selected precision, storage and workspace limit.
 
 ## Download and build
 
@@ -68,6 +76,18 @@ curl --fail http://127.0.0.1:8080/v1/systemone \
   }'
 ```
 
+For bounded request batching, use:
+
+```bash
+./bin/densecore-decision serve --model models/laya/laya-f16.gguf --threads 4 \
+  --precision fp32 --batch-size 8 --batch-wait 2ms --queue-capacity 32
+```
+
+Batching groups independent sequences by exact length without sharing attention
+or encoder states. The C ABI adds `DenseCoreDecisionPredictBatch`; the original
+single-request ABI remains available. `--precision q8_0` is an experimental
+candidate, with no task-accuracy or cost-efficiency qualification yet.
+
 For stdin/stdout use `densecore-decision predict --model PATH`; it accepts the
 same request JSON. `/v1/models` lists `laya`. Startup completes only after loading
 and validating the model and tokenizer.
@@ -97,16 +117,19 @@ answers retain the original labels.
 - Context is 512 tokens per question, with a 192-token question/option budget.
   State arrays retain their end when truncated; strings and objects retain their
   beginning. Usage reports dropped state tokens and options collapsed by truncation.
-- One request runs at a time, with at most 32 questions, 64 options per question,
-  and a 1 MiB body. Questions execute sequentially and repeat the encoder pass.
-  Concurrent requests return 429; invalid input returns 422 and oversized bodies
-  return 413. Shutdown rejects new work and drains native inference.
+- The default admits one request and returns 429 for excess work. Optional
+  batching admits up to `batch-size + queue-capacity` requests with a bounded
+  wait. Limits remain 32 questions, 64 options per question, and a 1 MiB body.
+  Each question still requires its own encoder pass; native batches keep those
+  passes independent. Invalid input returns 422 and oversized bodies return 413.
+  Canceled queued work is skipped; active native work completes before release.
+  Shutdown rejects new work and drains admitted inference.
 - The standalone server binds to loopback by default. It does not implement the
   main chat server's authentication, TLS, or metrics configuration. External
   exposure requires an authenticated proxy.
 - This is a source-build preview, not included in an already published Docker
   release. Numerical parity is distinct from task accuracy, calibration quality,
-  and speed relative to other engines. No comparative performance claim is made.
+  and speed relative to other engines. No GPU cost-efficiency claim is made.
 
 ## Independent validation
 
@@ -127,3 +150,8 @@ the test source for their environment variables.
 Architecture and preprocessing follow the Apache-2.0
 [upstream Laya implementation](https://github.com/NandhaKishorM/laya/tree/6d942c92081fbc139e736bbd9ac0023223c29b7f).
 Model ownership and licensing remain with the upstream publishers.
+
+Encoder workloads, raw measurement accounting, and qualification limits are in
+[the encoder economics guide](../benchmarks/economics/systemone-encoder.md).
+[Julia-1](JULIA.md) uses the same serving and batch interfaces with its own
+validated architecture, tokenizer, strict input limits and raw softmax policy.

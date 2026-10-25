@@ -1,0 +1,37 @@
+{
+  "schema": "densecore.encoder-tokenizer-identity.v1",
+  "captured_at_utc": "2026-10-16T14:49:16.224585+00:00",
+  "status": "verified_exact_bytes",
+  "external_checkpoint": {
+    "repository": "convaiinnovations/laya",
+    "revision": "c5d78730f3493e4fe16d61507ef4b78eef7318cf",
+    "tokenizer_path": "tokenizer/tokenizer.json",
+    "url": "https://huggingface.co/convaiinnovations/laya/resolve/c5d78730f3493e4fe16d61507ef4b78eef7318cf/tokenizer/tokenizer.json",
+    "bytes": 3583228,
+    "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+  },
+  "cpu_tokenizer": {
+    "bytes": 3583228,
+    "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
+    "comparison": "downloaded pinned tokenizer bytes equal local extracted CPU tokenizer bytes",
+    "local_path_at_verification": "/tmp/densecore-laya-tokenizer.json"
+  },
+  "frozen_external_manifest": {
+    "path": "benchmarks/economics/encoder_baselines/laya-cuda-bench.manifest.json",
+    "sha256": "2f545b65cad548fc40593a87081e1c1f063724919a0694101d2d7440ad26efb6",
+    "checkpoint_revision": "c5d78730f3493e4fe16d61507ef4b78eef7318cf",
+    "published_tokenizer_bytes": 3583228,
+    "origin_rewritten": false
+  },
+  "checks": {
+    "published_byte_length_matches": true,
+    "expected_cpu_sha256_matches": true,
+    "cpu_and_external_sha256_equal": true,
+    "cpu_and_external_bytes_equal": true
+  },
+  "limits": [
+    "Tokenizer file identity only; source prompt construction and token/marker receipts require separate verification.",
+    "No numerical quality, public workload length coverage, price qualification, or GPU efficiency claim follows from this receipt.",
+    "No external model code was executed."
+  ]
+}

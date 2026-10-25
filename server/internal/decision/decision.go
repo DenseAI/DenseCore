@@ -1,4 +1,4 @@
-// Package decision serves native, non-autoregressive Laya decisions.
+// Package decision serves native, non-autoregressive typed decisions.
 package decision
 
 import (
@@ -11,12 +11,23 @@ import (
 )
 
 type Config struct {
+	Model              string
+	StrictEncoding     bool
 	MaxLen, HeadMaxLen int
+	ModelMaxLen        int
 	CLS, SEP, Mask     int32
 	MaskText           string
 	Temperature        [3]float64
 	Buckets            map[string]float64
 }
+
+func (c Config) ModelID() string {
+	if c.Model == "" {
+		return "laya"
+	}
+	return c.Model
+}
+
 type Backend interface {
 	Tokenize(string) ([]int32, error)
 	Infer([]int32, []int32, int) ([]float32, []float32, error)
@@ -28,6 +39,7 @@ type Question struct {
 	Keys, Options, Legend  []string
 	Order                  []int
 	QType                  int
+	definition             object
 }
 type Request struct {
 	State     any
@@ -76,6 +88,7 @@ func parseQuestion(m member) (Question, error) {
 	if !ok || strings.TrimSpace(m.key) == "" {
 		return q, invalid("question must have a nonempty id and object definition")
 	}
+	q.definition = o
 	for _, f := range o {
 		switch f.key {
 		case "type", "instructions", "criteria", "labels", "option_order":
@@ -221,6 +234,68 @@ func parseQuestion(m member) (Question, error) {
 	return q, nil
 }
 
+// PrepareQuestion returns model-specific encoder descriptions without changing
+// parsed request labels, order or the caller's slices. It is safe to call again.
+func PrepareQuestion(c Config, q Question) (Question, error) {
+	if c.ModelID() != "julia-1" || q.definition == nil {
+		return q, nil
+	}
+	if _, ok := q.definition.get("instructions").(string); !ok {
+		return q, invalid("Julia instructions must be text")
+	}
+	labels := []string{}
+	add := func(value any) error {
+		label, ok := value.(string)
+		if !ok || label == "" {
+			return invalid("Julia option descriptions must be nonempty text")
+		}
+		labels = append(labels, label)
+		return nil
+	}
+	switch q.Type {
+	case "choice":
+		criteria, ok := q.definition.get("criteria").(object)
+		if !ok {
+			return q, invalid("Julia choice criteria must map IDs to descriptions")
+		}
+		for _, m := range criteria {
+			if m.key == "" {
+				return q, invalid("Julia choice IDs must be nonempty")
+			}
+			if err := add(m.value); err != nil {
+				return q, err
+			}
+		}
+	case "score":
+		criteria, ok := q.definition.get("criteria").([]any)
+		if !ok {
+			return q, invalid("Julia score criteria must be an ordered rubric")
+		}
+		for _, value := range criteria {
+			if err := add(value); err != nil {
+				return q, err
+			}
+		}
+	case "noul":
+		value := q.definition.get("criteria")
+		if value == nil {
+			labels = []string{"false", "true"}
+		} else {
+			criteria, ok := value.(object)
+			if !ok || len(criteria) != 2 {
+				return q, invalid("Julia noul criteria must map false and true to descriptions")
+			}
+			for _, key := range []string{"false", "true"} {
+				if err := add(criteria.get(key)); err != nil {
+					return q, err
+				}
+			}
+		}
+	}
+	q.Options = labels
+	return q, nil
+}
+
 type Sequence struct {
 	IDs, Markers                     []int32
 	StateTokens, StateUsed, Distinct int
@@ -228,19 +303,42 @@ type Sequence struct {
 
 func Build(b Backend, c Config, q Question, state []int32, left bool) (Sequence, error) {
 	s := Sequence{StateTokens: len(state)}
+	var err error
+	q, err = PrepareQuestion(c, q)
+	if err != nil {
+		return s, err
+	}
+	if c.StrictEncoding {
+		if len(q.Options) < 2 || len(q.Options) > 20 {
+			return s, invalid("Julia requires 2 to 20 options")
+		}
+		if strings.Contains(q.Instructions, c.MaskText) {
+			return s, invalid("reserved model marker in question")
+		}
+		for _, option := range q.Options {
+			if strings.Contains(option, c.MaskText) {
+				return s, invalid("reserved model marker in option")
+			}
+		}
+	}
 	clean := func(s string) string { return strings.ReplaceAll(s, c.MaskText, " ") }
 	head, e := b.Tokenize(q.Type + " question: " + clean(q.Instructions))
 	if e != nil {
 		return s, e
 	}
 	opts := [][]int32{}
+	optionLengths := []int{}
 	total := 0
 	for _, ix := range q.Order {
 		tok, e := b.Tokenize(" " + clean(q.Options[ix]))
 		if e != nil {
 			return s, e
 		}
+		if c.StrictEncoding && len(tok) > 48 {
+			return s, invalid("option exceeds 48-token model contract")
+		}
 		tok = tok[:min(48, len(tok))]
+		optionLengths = append(optionLengths, len(tok))
 		tok = append([]int32{c.Mask}, tok...)
 		opts = append(opts, tok)
 		total += len(tok)
@@ -255,6 +353,16 @@ func Build(b Backend, c Config, q Question, state []int32, left bool) (Sequence,
 		}
 		budget = c.HeadMaxLen - total
 	}
+	if c.StrictEncoding {
+		if len(head) > budget {
+			return s, invalid("question/options exceed lossless head budget")
+		}
+		for i, option := range opts {
+			if len(option) != optionLengths[i]+1 {
+				return s, invalid("question/options exceed lossless head budget")
+			}
+		}
+	}
 	head = head[:min(len(head), max(8, budget))]
 	s.IDs = append([]int32{c.CLS}, head...)
 	s.IDs = append(s.IDs, c.SEP)
@@ -267,6 +375,9 @@ func Build(b Backend, c Config, q Question, state []int32, left bool) (Sequence,
 	s.Distinct = len(distinct)
 	s.IDs = append(s.IDs, c.SEP)
 	room := max(0, c.MaxLen-len(s.IDs)-1)
+	if c.StrictEncoding && (room < 1 || len(state) > room) {
+		return s, invalid("state exceeds lossless context budget (effective limit %d tokens)", c.MaxLen)
+	}
 	s.StateUsed = min(room, len(state))
 	if left {
 		state = state[len(state)-s.StateUsed:]
@@ -319,6 +430,9 @@ func Decode(c Config, q Question, logits, act []float32) (map[string]any, error)
 	temp := c.Temperature[q.QType]
 	if v, ok := c.Buckets[q.Type+":"+bucket]; ok {
 		temp = v
+	}
+	if c.Model == "julia-1" {
+		temp = 1
 	}
 	if math.IsNaN(temp) || math.IsInf(temp, 0) {
 		temp = 1
@@ -374,42 +488,163 @@ func Decode(c Config, q Question, logits, act []float32) (map[string]any, error)
 	}
 	return a, nil
 }
-func Predict(ctx context.Context, b Backend, r Request) (map[string]any, error) {
+
+type preparedRequest struct {
+	request     Request
+	config      Config
+	stateTokens int
+	sequences   []Sequence
+}
+
+func prepare(ctx context.Context, b Backend, r Request) (preparedRequest, error) {
+	p := preparedRequest{request: r, config: b.Config()}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return p, err
 	}
-	c := b.Config()
-	st, e := b.Tokenize(strings.ReplaceAll(render(r.State), c.MaskText, " "))
-	if e != nil {
-		return nil, e
+	state := render(r.State)
+	if p.config.StrictEncoding && strings.Contains(state, p.config.MaskText) {
+		return p, invalid("reserved model marker in state")
 	}
+	st, err := b.Tokenize(strings.ReplaceAll(state, p.config.MaskText, " "))
+	if err != nil {
+		return p, err
+	}
+	p.stateTokens = len(st)
+	p.request.Questions = append([]Question(nil), r.Questions...)
 	_, left := r.State.([]any)
+	for i, q := range r.Questions {
+		var err error
+		q, err = PrepareQuestion(p.config, q)
+		if err != nil {
+			return p, err
+		}
+		p.request.Questions[i] = q
+		if err := ctx.Err(); err != nil {
+			return p, err
+		}
+		seq, err := Build(b, p.config, q, st, left)
+		if err != nil {
+			return p, err
+		}
+		p.sequences = append(p.sequences, seq)
+	}
+	return p, nil
+}
+func (p preparedRequest) finish(outputs []BatchOutput) (map[string]any, error) {
+	if len(outputs) != len(p.sequences) {
+		return nil, fmt.Errorf("batch output count mismatch")
+	}
 	answers := map[string]any{}
 	input, used, dropped := 0, 0, 0
 	collapsed := map[string]any{}
-	for _, q := range r.Questions {
-		if e := ctx.Err(); e != nil {
-			return nil, e
-		}
-		s, e := Build(b, c, q, st, left)
-		if e != nil {
-			return nil, e
-		}
-		logits, act, e := b.Infer(s.IDs, s.Markers, q.QType)
-		if e != nil {
-			return nil, e
-		}
-		a, e := Decode(c, q, logits, act)
-		if e != nil {
-			return nil, e
+	for i, q := range p.request.Questions {
+		seq := p.sequences[i]
+		a, err := Decode(p.config, q, outputs[i].Logits, outputs[i].Action)
+		if err != nil {
+			return nil, err
 		}
 		answers[q.ID] = a
-		input += len(s.IDs)
-		used += s.StateUsed
-		dropped += s.StateTokens - s.StateUsed
-		if s.Distinct < len(q.Options) {
-			collapsed[q.ID] = map[string]int{"total": len(q.Options), "distinct": s.Distinct}
+		input += len(seq.IDs)
+		used += seq.StateUsed
+		dropped += seq.StateTokens - seq.StateUsed
+		if seq.Distinct < len(q.Options) {
+			collapsed[q.ID] = map[string]int{"total": len(q.Options), "distinct": seq.Distinct}
 		}
 	}
-	return map[string]any{"model": "laya", "answers": answers, "usage": map[string]any{"input_tokens": input, "output_tokens": 0, "state_tokens": len(st) * len(r.Questions), "state_tokens_used": used, "state_tokens_dropped": dropped, "truncated": dropped > 0, "collapsed_options": collapsed}}, nil
+	return map[string]any{"model": p.config.ModelID(), "answers": answers, "usage": map[string]any{"input_tokens": input, "output_tokens": 0, "state_tokens": p.stateTokens * len(p.request.Questions), "state_tokens_used": used, "state_tokens_dropped": dropped, "truncated": dropped > 0, "collapsed_options": collapsed}}, nil
+}
+func Predict(ctx context.Context, b Backend, r Request) (map[string]any, error) {
+	p, err := prepare(ctx, b, r)
+	if err != nil {
+		return nil, err
+	}
+	outputs := make([]BatchOutput, len(p.sequences))
+	for i, seq := range p.sequences {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		outputs[i].Logits, outputs[i].Action, err = b.Infer(seq.IDs, seq.Markers, r.Questions[i].QType)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return p.finish(outputs)
+}
+func predictBatch(contexts []context.Context, b Backend, requests []Request) []decisionResult {
+	results := make([]decisionResult, len(requests))
+	prepared := make([]preparedRequest, len(requests))
+	starts := make([]int, len(requests))
+	inputs := []BatchInput{}
+	for i, r := range requests {
+		p, err := prepare(contexts[i], b, r)
+		prepared[i] = p
+		results[i].err = err
+		starts[i] = len(inputs)
+		if err != nil {
+			continue
+		}
+		for j, seq := range p.sequences {
+			inputs = append(inputs, BatchInput{seq.IDs, seq.Markers, r.Questions[j].QType})
+		}
+	}
+	if len(inputs) == 0 {
+		return results
+	}
+	outputs := make([]BatchOutput, 0, len(inputs))
+	var err error
+	for start := 0; start < len(inputs); start += 64 {
+		end := min(start+64, len(inputs))
+		var chunk []BatchOutput
+		chunk, err = b.(BatchBackend).InferBatch(inputs[start:end])
+		if err == nil && len(chunk) != end-start {
+			err = fmt.Errorf("batch output count mismatch")
+		}
+		if err != nil {
+			break
+		}
+		outputs = append(outputs, chunk...)
+	}
+	for i, p := range prepared {
+		if results[i].err != nil {
+			continue
+		}
+		if err != nil {
+			results[i].err = err
+			continue
+		}
+		if e := contexts[i].Err(); e != nil {
+			results[i].err = e
+			continue
+		}
+		results[i].out, results[i].err = p.finish(outputs[starts[i] : starts[i]+len(p.sequences)])
+	}
+	return results
+}
+
+// PredictBatch prepares independent requests, invokes native batches and decodes
+// each response. Failed input or inference returns an error for the whole call;
+// HTTP scheduling uses per-request results so one invalid request stays isolated.
+func PredictBatch(ctx context.Context, b Backend, requests []Request) ([]map[string]any, error) {
+	if len(requests) < 1 || len(requests) > 64 {
+		return nil, fmt.Errorf("request batch size must be 1..64")
+	}
+	if _, ok := b.(BatchBackend); !ok {
+		return nil, fmt.Errorf("backend does not support native batching")
+	}
+	contexts := make([]context.Context, len(requests))
+	for i := range contexts {
+		contexts[i] = ctx
+	}
+	results := predictBatch(contexts, b, requests)
+	out := make([]map[string]any, len(results))
+	for i, result := range results {
+		if result.err != nil {
+			return nil, fmt.Errorf("request %d: %w", i, result.err)
+		}
+		out[i] = result.out
+	}
+	return out, nil
 }

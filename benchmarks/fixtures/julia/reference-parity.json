@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repository": "SupersonicLabs/Julia-1",
+    "revision": "a85b127321d580d65176c89ced8273f305745d85",
+    "weights_sha256": "df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72",
+    "gguf_sha256": "6d5fc0afffff67d63115b2ab4c57fa41b5dffdd09e30faa3978b4aa1a91cff09",
+    "tokenizer_sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+    "stored_precision": "F32"
+  },
+  "independent_reference": {
+    "checker": "scripts/verify_julia_gguf.py",
+    "checker_sha256": "567bdfc080578713ed2837815170d057a8637d0bec00246e01d6e8628e5c8cb6",
+    "versions": {
+      "torch": "2.8.0+cpu",
+      "transformers": "5.0.0",
+      "numpy": "2.2.6"
+    },
+    "learned_tensors_exact": 169,
+    "generated_rope_buffers": [
+      "rope.freq_full",
+      "rope.freq_sliding"
+    ],
+    "generated_rope_buffer_sha256": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+    "execution": "CPU in disposable network-disabled read-only container",
+    "cases": [
+      {
+        "name": "choice",
+        "tokens": 33
+      },
+      {
+        "name": "score",
+        "tokens": 27
+      },
+      {
+        "name": "noul_unicode",
+        "tokens": 36
+      },
+      {
+        "name": "local_attention",
+        "tokens": 339
+      },
+      {
+        "name": "choice_reordered",
+        "tokens": 33
+      },
+      {
+        "name": "choice_after_long",
+        "tokens": 33
+      }
+    ],
+    "native_execution": "not executed in reference container; separate owned host replay below"
+  },
+  "native": {
+    "checker": "scripts/replay_encoder_fixtures.py",
+    "library_sha256": "757aa4d88ac6be8e73a14954510da8ef850085db976c3f01485395244055446b",
+    "fixture": "parity-inputs.json",
+    "fixtures_sha256": "99579f2b0911fcab9e83f43a95dfa521da39be793b122797278533125a9d3685",
+    "threads": 4,
+    "limits": {
+      "logit_atol": 0.001,
+      "probability_atol": 0.0001,
+      "action_atol": 0.001,
+      "action_rtol": 1e-06,
+      "action_probability_atol": 0.0001
+    },
+    "runs": 16,
+    "patterns": [
+      "single-choice",
+      "batch2-choice",
+      "single-score",
+      "batch2-score",
+      "single-noul_unicode",
+      "batch2-noul_unicode",
+      "single-local_attention",
+      "batch2-local_attention",
+      "single-choice_reordered",
+      "batch2-choice_reordered",
+      "single-choice_after_long",
+      "batch2-choice_after_long",
+      "mixed",
+      "mixed-reversed",
+      "long-before-short",
+      "short-after-long"
+    ],
+    "maximum_errors": {
+      "max_abs_logit": 2.288818359375e-05,
+      "max_abs_probability": 3.212624307580292e-06,
+      "max_abs_action_logit": 9.98377799987793e-07,
+      "max_abs_action_probability": 2.924962857475677e-07
+    },
+    "passed": true,
+    "checker_sha256": "e11ca8716680dff6e8a97f33af0819c30e7aa80d4bca48f1e98cd0c6a0565d6a",
+    "effective_context_limit": 4829,
+    "source_sha256": {
+      "core/src/decision/laya.cpp": "801bb36e349de62cd085c949786f95339fefe73b34ac8f8356f2fed12f525970",
+      "core/include/densecore/decision.h": "e9da8cfa10b7700b2f3de98d7f89ae5329699ca5429c0e9d9285238d8785d777",
+      "core/tests/decision/test_laya.cpp": "968ef62c8636ddd67ee94b13a4def5b3b9222b828dba29463452a7ce035a73c1"
+    },
+    "source_state": "Uncommitted workspace changes based on faa22b0e33791ef85e1c84056242591989094806; use exact source hashes, not HEAD alone.",
+    "runtime_dependencies_sha256": {
+      "libggml-base.so.0.9.8": "65a8e4602ef0a4929612f0cd340e96b37d4ff6d1c8a454b6f7b7cb03dfac2623",
+      "libggml-cpu.so.0.9.8": "76b07254f2b9cfbcd68562901e0b987c78c95390007fed86b6f8c9c13703bc52"
+    },
+    "runtime_dependencies_origin": "observed_process_maps",
+    "runtime_dependencies_stable": true
+  },
+  "qualification_limits": {
+    "upstream_quality_gate": false,
+    "task_accuracy": "unavailable",
+    "int8_quality": "unavailable",
+    "gpu_cost_comparison": "unavailable",
+    "context_coverage": "27..339 tokens; no long-context numerical or task-quality claim",
+    "scope": "FP32 compatibility on these six independent fixtures only"
+  }
+}

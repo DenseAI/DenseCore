@@ -1,0 +1,2027 @@
+{
+  "tokenizer_sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+  "revision": "a85b127321d580d65176c89ced8273f305745d85",
+  "reference": "Rust Hugging Face tokenizers; owned strict sequence helper checked against pinned upstream sequence; named rows captured from pinned pure typed.py function",
+  "typed_source_sha256": "ed89e66a70fcedac1339347bd8fcca69fd2cd1a31535ad0148dae42c610b544d",
+  "sequence_cases": [
+    {
+      "row": {
+        "state": "A customer asks for a refund.",
+        "question": "Where should the request go?",
+        "options": [
+          "Billing",
+          "Technical support",
+          "Sales",
+          "Other"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          7890,
+          1412,
+          573,
+          3853,
+          871,
+          235336,
+          1,
+          4,
+          97222,
+          4,
+          16818,
+          2676,
+          4,
+          16148,
+          4,
+          6464,
+          1,
+          586,
+          6650,
+          19619,
+          604,
+          476,
+          19745,
+          235265,
+          1
+        ],
+        "markers": [
+          11,
+          13,
+          16,
+          18
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "valid_input_tokens": 29
+      }
+    },
+    {
+      "row": {
+        "state": {
+          "日本語": "返品したい",
+          "n": 3
+        },
+        "question": "対応する部署は？",
+        "options": [
+          "請求",
+          "技術",
+          "営業",
+          "その他"
+        ],
+        "type": "choice"
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          79594,
+          3902,
+          99613,
+          235418,
+          235544,
+          1,
+          4,
+          235248,
+          133074,
+          4,
+          194617,
+          4,
+          206825,
+          4,
+          67008,
+          1,
+          19946,
+          62938,
+          1192,
+          664,
+          195890,
+          30503,
+          824,
+          664,
+          235254,
+          1192,
+          235248,
+          235304,
+          235270,
+          1
+        ],
+        "markers": [
+          10,
+          13,
+          15,
+          17
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          2,
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 34
+      }
+    },
+    {
+      "row": {
+        "state": [
+          "red",
+          "green"
+        ],
+        "question": "The light is green.",
+        "options": [
+          "False",
+          "True"
+        ],
+        "type": "noul"
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          552,
+          6311,
+          2872,
+          235292,
+          714,
+          2611,
+          603,
+          4433,
+          235265,
+          1,
+          4,
+          7662,
+          4,
+          5569,
+          1,
+          10890,
+          854,
+          824,
+          664,
+          9740,
+          4437,
+          1
+        ],
+        "markers": [
+          11,
+          13
+        ],
+        "qtype": 2,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 23
+      }
+    },
+    {
+      "row": {
+        "state": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "question": "Urgency?",
+        "options": [
+          "Low",
+          "Medium",
+          "High"
+        ],
+        "type": "score"
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          7716,
+          2872,
+          235292,
+          9155,
+          6266,
+          235336,
+          1,
+          4,
+          10559,
+          4,
+          23935,
+          4,
+          4211,
+          1,
+          476,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          29066,
+          35551,
+          1
+        ],
+        "markers": [
+          8,
+          10,
+          12
+        ],
+        "qtype": 1,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 43
+      }
+    },
+    {
+      "row": {
+        "state": "é é Ａ ① 👩‍💻",
+        "question": "Choose a script",
+        "options": [
+          "한국어",
+          "العربية",
+          "English"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          19262,
+          476,
+          12041,
+          1,
+          4,
+          114490,
+          236770,
+          4,
+          76857,
+          4,
+          4645,
+          1,
+          526,
+          236703,
+          1428,
+          235248,
+          238801,
+          90853,
+          235248,
+          241355,
+          235879,
+          242482,
+          1
+        ],
+        "markers": [
+          8,
+          11,
+          13
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          2,
+          1,
+          1
+        ],
+        "valid_input_tokens": 27
+      }
+    },
+    {
+      "row": {
+        "state": "\tfoo\r\nbar x​y",
+        "question": "Whitespace?",
+        "options": [
+          "Present",
+          "Absent"
+        ],
+        "type": "noul"
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          552,
+          6311,
+          2872,
+          235292,
+          8732,
+          86537,
+          235336,
+          1,
+          4,
+          25989,
+          4,
+          152058,
+          1,
+          235248,
+          226,
+          14214,
+          235316,
+          108,
+          2333,
+          236338,
+          235297,
+          235421,
+          235267,
+          1
+        ],
+        "markers": [
+          9,
+          11
+        ],
+        "qtype": 2,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 25
+      }
+    },
+    {
+      "row": {
+        "state": "reserved <mask>",
+        "question": "Marker?",
+        "options": [
+          "Yes",
+          "No"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "error": "reserved model marker in request"
+    },
+    {
+      "row": {
+        "state": "x",
+        "question": "Choose",
+        "options": [
+          "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+          "short"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "error": "option exceeds 48-token model contract"
+    },
+    {
+      "row": {
+        "state": "x",
+        "question": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+        "options": [
+          "one",
+          "two"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "error": "question/options exceed lossless head budget"
+    },
+    {
+      "row": {
+        "state": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+        "question": "Context?",
+        "options": [
+          "one",
+          "two"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "error": "state exceeds lossless context budget"
+    },
+    {
+      "row": {
+        "state": "<eos><bos><pad> ▁ literal",
+        "question": "Token?",
+        "options": [
+          "Reserved",
+          "Other"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          20107,
+          235336,
+          1,
+          4,
+          40015,
+          4,
+          6464,
+          1,
+          1,
+          2,
+          0,
+          235248,
+          235248,
+          36414,
+          1
+        ],
+        "markers": [
+          7,
+          9
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 19
+      }
+    },
+    {
+      "row": {
+        "state": "A customer asks for a refund.",
+        "question": "Where should the request go?",
+        "options": [
+          "Other",
+          "Sales",
+          "Technical support",
+          "Billing"
+        ]
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "policy": "checkpoint inference-policy.json",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          7890,
+          1412,
+          573,
+          3853,
+          871,
+          235336,
+          1,
+          4,
+          6464,
+          4,
+          16148,
+          4,
+          16818,
+          2676,
+          4,
+          97222,
+          1,
+          586,
+          6650,
+          19619,
+          604,
+          476,
+          19745,
+          235265,
+          1
+        ],
+        "markers": [
+          11,
+          13,
+          15,
+          18
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1,
+          2,
+          1
+        ],
+        "valid_input_tokens": 29
+      }
+    },
+    {
+      "row": {
+        "state": "A customer asks for a refund.",
+        "question": "Where should the request go?",
+        "options": [
+          "Billing",
+          "Technical support",
+          "Sales",
+          "Other"
+        ]
+      },
+      "max_length": 128,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          7890,
+          1412,
+          573,
+          3853,
+          871,
+          235336,
+          1,
+          4,
+          97222,
+          4,
+          16818,
+          2676,
+          4,
+          16148,
+          4,
+          6464,
+          1,
+          586,
+          6650,
+          19619,
+          604,
+          476,
+          19745,
+          235265,
+          1
+        ],
+        "markers": [
+          11,
+          13,
+          16,
+          18
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "valid_input_tokens": 29
+      }
+    },
+    {
+      "row": {
+        "state": "A customer asks for a refund.",
+        "question": "Where should the request go?",
+        "options": [
+          "Billing",
+          "Technical support",
+          "Sales",
+          "Other"
+        ]
+      },
+      "max_length": 256,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          7890,
+          1412,
+          573,
+          3853,
+          871,
+          235336,
+          1,
+          4,
+          97222,
+          4,
+          16818,
+          2676,
+          4,
+          16148,
+          4,
+          6464,
+          1,
+          586,
+          6650,
+          19619,
+          604,
+          476,
+          19745,
+          235265,
+          1
+        ],
+        "markers": [
+          11,
+          13,
+          16,
+          18
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "valid_input_tokens": 29
+      }
+    },
+    {
+      "row": {
+        "state": "A customer asks for a refund.",
+        "question": "Where should the request go?",
+        "options": [
+          "Billing",
+          "Technical support",
+          "Sales",
+          "Other"
+        ]
+      },
+      "max_length": 512,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          7890,
+          1412,
+          573,
+          3853,
+          871,
+          235336,
+          1,
+          4,
+          97222,
+          4,
+          16818,
+          2676,
+          4,
+          16148,
+          4,
+          6464,
+          1,
+          586,
+          6650,
+          19619,
+          604,
+          476,
+          19745,
+          235265,
+          1
+        ],
+        "markers": [
+          11,
+          13,
+          16,
+          18
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          2,
+          1,
+          1
+        ],
+        "valid_input_tokens": 29
+      }
+    },
+    {
+      "row": {
+        "state": {
+          "日本語": "返品したい",
+          "n": 3
+        },
+        "question": "対応する部署は？",
+        "options": [
+          "請求",
+          "技術",
+          "営業",
+          "その他"
+        ],
+        "type": "choice"
+      },
+      "max_length": 128,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          79594,
+          3902,
+          99613,
+          235418,
+          235544,
+          1,
+          4,
+          235248,
+          133074,
+          4,
+          194617,
+          4,
+          206825,
+          4,
+          67008,
+          1,
+          19946,
+          62938,
+          1192,
+          664,
+          195890,
+          30503,
+          824,
+          664,
+          235254,
+          1192,
+          235248,
+          235304,
+          235270,
+          1
+        ],
+        "markers": [
+          10,
+          13,
+          15,
+          17
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          2,
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 34
+      }
+    },
+    {
+      "row": {
+        "state": {
+          "日本語": "返品したい",
+          "n": 3
+        },
+        "question": "対応する部署は？",
+        "options": [
+          "請求",
+          "技術",
+          "営業",
+          "その他"
+        ],
+        "type": "choice"
+      },
+      "max_length": 256,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          79594,
+          3902,
+          99613,
+          235418,
+          235544,
+          1,
+          4,
+          235248,
+          133074,
+          4,
+          194617,
+          4,
+          206825,
+          4,
+          67008,
+          1,
+          19946,
+          62938,
+          1192,
+          664,
+          195890,
+          30503,
+          824,
+          664,
+          235254,
+          1192,
+          235248,
+          235304,
+          235270,
+          1
+        ],
+        "markers": [
+          10,
+          13,
+          15,
+          17
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          2,
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 34
+      }
+    },
+    {
+      "row": {
+        "state": {
+          "日本語": "返品したい",
+          "n": 3
+        },
+        "question": "対応する部署は？",
+        "options": [
+          "請求",
+          "技術",
+          "営業",
+          "その他"
+        ],
+        "type": "choice"
+      },
+      "max_length": 512,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          6241,
+          2872,
+          235292,
+          79594,
+          3902,
+          99613,
+          235418,
+          235544,
+          1,
+          4,
+          235248,
+          133074,
+          4,
+          194617,
+          4,
+          206825,
+          4,
+          67008,
+          1,
+          19946,
+          62938,
+          1192,
+          664,
+          195890,
+          30503,
+          824,
+          664,
+          235254,
+          1192,
+          235248,
+          235304,
+          235270,
+          1
+        ],
+        "markers": [
+          10,
+          13,
+          15,
+          17
+        ],
+        "qtype": 0,
+        "truncated": false,
+        "option_tokens": [
+          2,
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 34
+      }
+    },
+    {
+      "row": {
+        "state": [
+          "red",
+          "green"
+        ],
+        "question": "The light is green.",
+        "options": [
+          "False",
+          "True"
+        ],
+        "type": "noul"
+      },
+      "max_length": 128,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          552,
+          6311,
+          2872,
+          235292,
+          714,
+          2611,
+          603,
+          4433,
+          235265,
+          1,
+          4,
+          7662,
+          4,
+          5569,
+          1,
+          10890,
+          854,
+          824,
+          664,
+          9740,
+          4437,
+          1
+        ],
+        "markers": [
+          11,
+          13
+        ],
+        "qtype": 2,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 23
+      }
+    },
+    {
+      "row": {
+        "state": [
+          "red",
+          "green"
+        ],
+        "question": "The light is green.",
+        "options": [
+          "False",
+          "True"
+        ],
+        "type": "noul"
+      },
+      "max_length": 256,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          552,
+          6311,
+          2872,
+          235292,
+          714,
+          2611,
+          603,
+          4433,
+          235265,
+          1,
+          4,
+          7662,
+          4,
+          5569,
+          1,
+          10890,
+          854,
+          824,
+          664,
+          9740,
+          4437,
+          1
+        ],
+        "markers": [
+          11,
+          13
+        ],
+        "qtype": 2,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 23
+      }
+    },
+    {
+      "row": {
+        "state": [
+          "red",
+          "green"
+        ],
+        "question": "The light is green.",
+        "options": [
+          "False",
+          "True"
+        ],
+        "type": "noul"
+      },
+      "max_length": 512,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          552,
+          6311,
+          2872,
+          235292,
+          714,
+          2611,
+          603,
+          4433,
+          235265,
+          1,
+          4,
+          7662,
+          4,
+          5569,
+          1,
+          10890,
+          854,
+          824,
+          664,
+          9740,
+          4437,
+          1
+        ],
+        "markers": [
+          11,
+          13
+        ],
+        "qtype": 2,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1
+        ],
+        "valid_input_tokens": 23
+      }
+    },
+    {
+      "row": {
+        "state": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "question": "Urgency?",
+        "options": [
+          "Low",
+          "Medium",
+          "High"
+        ],
+        "type": "score"
+      },
+      "max_length": 128,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          7716,
+          2872,
+          235292,
+          9155,
+          6266,
+          235336,
+          1,
+          4,
+          10559,
+          4,
+          23935,
+          4,
+          4211,
+          1,
+          476,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          29066,
+          35551,
+          1
+        ],
+        "markers": [
+          8,
+          10,
+          12
+        ],
+        "qtype": 1,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 43
+      }
+    },
+    {
+      "row": {
+        "state": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "question": "Urgency?",
+        "options": [
+          "Low",
+          "Medium",
+          "High"
+        ],
+        "type": "score"
+      },
+      "max_length": 256,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          7716,
+          2872,
+          235292,
+          9155,
+          6266,
+          235336,
+          1,
+          4,
+          10559,
+          4,
+          23935,
+          4,
+          4211,
+          1,
+          476,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          29066,
+          35551,
+          1
+        ],
+        "markers": [
+          8,
+          10,
+          12
+        ],
+        "qtype": 1,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 43
+      }
+    },
+    {
+      "row": {
+        "state": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "question": "Urgency?",
+        "options": [
+          "Low",
+          "Medium",
+          "High"
+        ],
+        "type": "score"
+      },
+      "max_length": 512,
+      "head_length": 64,
+      "policy": "explicit supplementary short-context budget",
+      "expected": {
+        "ids": [
+          2,
+          7716,
+          2872,
+          235292,
+          9155,
+          6266,
+          235336,
+          1,
+          4,
+          10559,
+          4,
+          23935,
+          4,
+          4211,
+          1,
+          476,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          84377,
+          29066,
+          35551,
+          1
+        ],
+        "markers": [
+          8,
+          10,
+          12
+        ],
+        "qtype": 1,
+        "truncated": false,
+        "option_tokens": [
+          1,
+          1,
+          1
+        ],
+        "valid_input_tokens": 43
+      }
+    }
+  ],
+  "named_cases": [
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "choice",
+            "instructions": "Route?",
+            "criteria": {
+              "billing_id": "Billing",
+              "tech_id": "Technical support"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "hello",
+          "question": "Route?",
+          "type": "choice",
+          "options": [
+            "Billing",
+            "Technical support"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            6241,
+            2872,
+            235292,
+            20716,
+            235336,
+            1,
+            4,
+            97222,
+            4,
+            16818,
+            2676,
+            1,
+            25612,
+            1
+          ],
+          "markers": [
+            7,
+            9
+          ],
+          "qtype": 0,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            2
+          ],
+          "valid_input_tokens": 15
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "score",
+            "instructions": "Urgency?",
+            "criteria": [
+              "Low",
+              "Medium",
+              "High"
+            ]
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "hello",
+          "question": "Urgency?",
+          "type": "score",
+          "options": [
+            "Low",
+            "Medium",
+            "High"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            7716,
+            2872,
+            235292,
+            9155,
+            6266,
+            235336,
+            1,
+            4,
+            10559,
+            4,
+            23935,
+            4,
+            4211,
+            1,
+            25612,
+            1
+          ],
+          "markers": [
+            8,
+            10,
+            12
+          ],
+          "qtype": 1,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1,
+            1
+          ],
+          "valid_input_tokens": 17
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "noul",
+            "instructions": "Safe?"
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "hello",
+          "question": "Safe?",
+          "type": "noul",
+          "options": [
+            "false",
+            "true"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            552,
+            6311,
+            2872,
+            235292,
+            21095,
+            235336,
+            1,
+            4,
+            1566,
+            4,
+            1382,
+            1,
+            25612,
+            1
+          ],
+          "markers": [
+            8,
+            10
+          ],
+          "qtype": 2,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 15
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "noul",
+            "instructions": "Safe?",
+            "criteria": {
+              "false": "Unsafe",
+              "true": "Safe"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "hello",
+          "question": "Safe?",
+          "type": "noul",
+          "options": [
+            "Unsafe",
+            "Safe"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            552,
+            6311,
+            2872,
+            235292,
+            21095,
+            235336,
+            1,
+            4,
+            194500,
+            4,
+            21095,
+            1,
+            25612,
+            1
+          ],
+          "markers": [
+            8,
+            10
+          ],
+          "qtype": 2,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 15
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": {
+          "日本語": "返品したい",
+          "n": 3
+        },
+        "questions": {
+          "q": {
+            "type": "choice",
+            "instructions": "部署は？",
+            "criteria": {
+              "not_encoded_請求": "請求",
+              "not_encoded_技術": "技術"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": {
+            "日本語": "返品したい",
+            "n": 3
+          },
+          "question": "部署は？",
+          "type": "choice",
+          "options": [
+            "請求",
+            "技術"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            6241,
+            2872,
+            235292,
+            32494,
+            238523,
+            235418,
+            235544,
+            1,
+            4,
+            235248,
+            133074,
+            4,
+            194617,
+            1,
+            19946,
+            62938,
+            1192,
+            664,
+            195890,
+            30503,
+            824,
+            664,
+            235254,
+            1192,
+            235248,
+            235304,
+            235270,
+            1
+          ],
+          "markers": [
+            9,
+            12
+          ],
+          "qtype": 0,
+          "truncated": false,
+          "option_tokens": [
+            2,
+            1
+          ],
+          "valid_input_tokens": 29
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": [
+          "red",
+          "green"
+        ],
+        "questions": {
+          "q": {
+            "type": "score",
+            "instructions": "정도?",
+            "criteria": [
+              "낮음",
+              "높음"
+            ]
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": [
+            "red",
+            "green"
+          ],
+          "question": "정도?",
+          "type": "score",
+          "options": [
+            "낮음",
+            "높음"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            7716,
+            2872,
+            235292,
+            35467,
+            236840,
+            235336,
+            1,
+            4,
+            235248,
+            243937,
+            238036,
+            4,
+            187800,
+            238036,
+            1,
+            10890,
+            854,
+            824,
+            664,
+            9740,
+            4437,
+            1
+          ],
+          "markers": [
+            8,
+            12
+          ],
+          "qtype": 1,
+          "truncated": false,
+          "option_tokens": [
+            3,
+            2
+          ],
+          "valid_input_tokens": 23
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "noul",
+            "instructions": "Valid?",
+            "criteria": {
+              "true": "Valid",
+              "false": "Invalid"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "hello",
+          "question": "Valid?",
+          "type": "noul",
+          "options": [
+            "Invalid",
+            "Valid"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            552,
+            6311,
+            2872,
+            235292,
+            15777,
+            235336,
+            1,
+            4,
+            38333,
+            4,
+            15777,
+            1,
+            25612,
+            1
+          ],
+          "markers": [
+            8,
+            10
+          ],
+          "qtype": 2,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 15
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "shared state",
+        "questions": {
+          "choice": {
+            "type": "choice",
+            "instructions": "Route?",
+            "criteria": {
+              "id_a": "Billing",
+              "id_b": "Tech"
+            }
+          },
+          "score": {
+            "type": "score",
+            "instructions": "Urgency?",
+            "criteria": [
+              "Low",
+              "High"
+            ]
+          },
+          "noul": {
+            "type": "noul",
+            "instructions": "Safe?"
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "rows": [
+        {
+          "state": "shared state",
+          "question": "Route?",
+          "type": "choice",
+          "options": [
+            "Billing",
+            "Tech"
+          ]
+        },
+        {
+          "state": "shared state",
+          "question": "Urgency?",
+          "type": "score",
+          "options": [
+            "Low",
+            "High"
+          ]
+        },
+        {
+          "state": "shared state",
+          "question": "Safe?",
+          "type": "noul",
+          "options": [
+            "false",
+            "true"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "ids": [
+            2,
+            6241,
+            2872,
+            235292,
+            20716,
+            235336,
+            1,
+            4,
+            97222,
+            4,
+            4438,
+            1,
+            8934,
+            2329,
+            1
+          ],
+          "markers": [
+            7,
+            9
+          ],
+          "qtype": 0,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 15
+        },
+        {
+          "ids": [
+            2,
+            7716,
+            2872,
+            235292,
+            9155,
+            6266,
+            235336,
+            1,
+            4,
+            10559,
+            4,
+            4211,
+            1,
+            8934,
+            2329,
+            1
+          ],
+          "markers": [
+            8,
+            10
+          ],
+          "qtype": 1,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 16
+        },
+        {
+          "ids": [
+            2,
+            552,
+            6311,
+            2872,
+            235292,
+            21095,
+            235336,
+            1,
+            4,
+            1566,
+            4,
+            1382,
+            1,
+            8934,
+            2329,
+            1
+          ],
+          "markers": [
+            8,
+            10
+          ],
+          "qtype": 2,
+          "truncated": false,
+          "option_tokens": [
+            1,
+            1
+          ],
+          "valid_input_tokens": 16
+        }
+      ]
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "choice",
+            "instructions": "Route?",
+            "criteria": {
+              "id_a": "",
+              "id_b": "Tech"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "error": "JSONL line 1: options must contain 2–20 nonempty rendered descriptions"
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "score",
+            "instructions": "Urgency?",
+            "criteria": [
+              1,
+              2
+            ]
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "error": "JSONL line 1: options must contain 2–20 nonempty rendered descriptions"
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "noul",
+            "instructions": "Safe?",
+            "criteria": {
+              "false": "Unsafe"
+            }
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "error": "Noul criteria must map false and true to descriptions"
+    },
+    {
+      "request": {
+        "state": "hello",
+        "questions": {
+          "q": {
+            "type": "choice",
+            "instructions": "Route?",
+            "criteria": [
+              "Billing",
+              "Tech"
+            ]
+          }
+        }
+      },
+      "max_length": 8192,
+      "head_length": 512,
+      "error": "Choice criteria must map nonempty IDs to descriptions"
+    }
+  ]
+}

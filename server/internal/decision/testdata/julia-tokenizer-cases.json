@@ -1,0 +1,476 @@
+{
+  "tokenizer_sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+  "revision": "a85b127321d580d65176c89ced8273f305745d85",
+  "reference": "Rust Hugging Face tokenizers; owned strict sequence helper checked against pinned upstream sequence; named rows captured from pinned pure typed.py function",
+  "typed_source_sha256": "ed89e66a70fcedac1339347bd8fcca69fd2cd1a31535ad0148dae42c610b544d",
+  "cases": [
+    {
+      "text": "",
+      "ids": []
+    },
+    {
+      "text": "hello world",
+      "ids": [
+        25612,
+        2134
+      ]
+    },
+    {
+      "text": " hello  world ",
+      "ids": [
+        25612,
+        235248,
+        2134,
+        235248
+      ]
+    },
+    {
+      "text": "\tfoo\nbar\r\nbaz",
+      "ids": [
+        235248,
+        226,
+        14214,
+        108,
+        2333,
+        235316,
+        108,
+        31595
+      ]
+    },
+    {
+      "text": "<mask> hello  <mask>world",
+      "ids": [
+        4,
+        25612,
+        4,
+        2134
+      ]
+    },
+    {
+      "text": "a<eos>b<bos>c",
+      "ids": [
+        476,
+        1,
+        518,
+        2,
+        498
+      ]
+    },
+    {
+      "text": "한국어 질문과 선택지",
+      "ids": [
+        114490,
+        236770,
+        160587,
+        237465,
+        237233,
+        134472,
+        236183
+      ]
+    },
+    {
+      "text": "日本語の質問 選択肢",
+      "ids": [
+        26867,
+        236333,
+        235372,
+        55237,
+        153567,
+        239984
+      ]
+    },
+    {
+      "text": "é é Å Ａ ① ﬁ",
+      "ids": [
+        526,
+        236703,
+        1428,
+        235248,
+        248575,
+        235248,
+        238801,
+        90853,
+        59561
+      ]
+    },
+    {
+      "text": "🙂 👩‍💻 🏳️‍🌈",
+      "ids": [
+        33359,
+        235248,
+        241355,
+        235879,
+        242482,
+        235248,
+        243661,
+        235969,
+        235879,
+        240737
+      ]
+    },
+    {
+      "text": "▁hello▁▁world",
+      "ids": [
+        25612,
+        139,
+        2134
+      ]
+    },
+    {
+      "text": "\u0000\u0001    ",
+      "ids": [
+        235248,
+        217,
+        238213,
+        251878,
+        236338,
+        235929,
+        238441,
+        239495
+      ]
+    },
+    {
+      "text": "<pad><unused99><table>text</table>",
+      "ids": [
+        0,
+        255999,
+        169,
+        2793,
+        177
+      ]
+    },
+    {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ids": [
+        476,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        84377,
+        29066,
+        35551
+      ]
+    },
+    {
+      "text": "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t",
+      "ids": [
+        255992
+      ]
+    },
+    {
+      "text": "                              ",
+      "ids": [
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248,
+        235248
+      ]
+    },
+    {
+      "text": "𐀀𫠝🧪͸",
+      "ids": [
+        235248,
+        253761,
+        457,
+        388,
+        377,
+        374,
+        247075,
+        251643
+      ]
+    },
+    {
+      "text": "مرحبا بالعالم עברית",
+      "ids": [
+        89187,
+        19833,
+        192740,
+        12842,
+        7397,
+        188091
+      ]
+    },
+    {
+      "text": "नमस्ते दुनिया สวัสดีโลก",
+      "ids": [
+        7578,
+        235579,
+        45884,
+        235483,
+        211586,
+        12515,
+        151622,
+        28890,
+        145088
+      ]
+    },
+    {
+      "text": "x\ty",
+      "ids": [
+        1141,
+        226,
+        235267
+      ]
+    },
+    {
+      "text": "x\ny",
+      "ids": [
+        1141,
+        108,
+        597
+      ]
+    },
+    {
+      "text": "x\ry",
+      "ids": [
+        1141,
+        235316,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        597
+      ]
+    },
+    {
+      "text": "xy",
+      "ids": [
+        1141,
+        244423,
+        235267
+      ]
+    },
+    {
+      "text": "xy",
+      "ids": [
+        1141,
+        251878,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        236338,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        254701,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        244468,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        246183,
+        235267
+      ]
+    },
+    {
+      "text": "x​y",
+      "ids": [
+        1141,
+        235421,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        237046,
+        235267
+      ]
+    },
+    {
+      "text": "x y",
+      "ids": [
+        1141,
+        243385,
+        235267
+      ]
+    },
+    {
+      "text": "x　y",
+      "ids": [
+        1141,
+        235420,
+        235267
+      ]
+    },
+    {
+      "text": "x﻿y",
+      "ids": [
+        1141,
+        235705,
+        235267
+      ]
+    }
+  ]
+}
