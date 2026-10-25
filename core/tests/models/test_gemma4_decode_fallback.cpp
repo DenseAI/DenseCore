@@ -2204,3 +2204,86 @@ TEST(Gemma4DecodeGraphTest, PassivePleSnapshotRejectsUnflattenedLayerTokenLayout
     EXPECT_THROW(AttachPassiveHiddenSnapshot(ctx.get(),graph,input,0,"ple_selected_input"),densecore::InvalidArgumentException);
     EXPECT_TRUE(ggml_get_no_alloc(ctx.get()));
 }
+
+TEST(Gemma4DecodeGraphTest, CanonicalPleF32ProjectionMatchesOldSingleColumnPrimitive) {
+    constexpr int embedding = 1536, hidden = 256, max_columns = 8;
+    for (bool gate : {false, true}) for (bool weight_strided : {false, true}) {
+        SCOPED_TRACE(gate);
+        SCOPED_TRACE(weight_strided);
+        const int reduction = gate ? embedding : hidden;
+        const int outputs = gate ? hidden : embedding;
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(
+            ggml_init({16*1024*1024, nullptr, false}), ggml_free);
+        ASSERT_NE(weights, nullptr);
+        auto* backing = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32,
+                                          reduction*(weight_strided ? 2 : 1), outputs);
+        std::fill_n(static_cast<float*>(backing->data), ggml_nelements(backing), 1234.f);
+        auto* weight = weight_strided
+            ? ggml_view_2d(weights.get(), backing, reduction, outputs, backing->nb[1], 0) : backing;
+        ggml_set_name(weight, gate ? "blk.0.inp_gate.weight" : "blk.0.proj.weight");
+        for (int out=0; out<outputs; ++out) {
+            auto* row = reinterpret_cast<float*>(static_cast<char*>(weight->data)+out*weight->nb[1]);
+            for (int i=0; i<reduction; ++i)
+                row[i] = .13f*std::sin((i+3)*(out+7)*.0013f)+.03f*std::cos((i%19-out%23)*.17f);
+        }
+        std::vector<float> inputs(max_columns*reduction);
+        for (int c=0; c<max_columns; ++c) for (int i=0; i<reduction; ++i)
+            inputs[c*reduction+i] = .17f*std::sin((i+1)*.019f+c*.37f)+.031f*std::cos((i+9)*.041f-c*.11f);
+        auto model = MakeBaseGemma4GraphModel(1);
+        model->hparams.n_embd = embedding;
+        model->gemma4_hidden_size_per_layer_input = hidden;
+        model->layers[0].Set(gate ? model_keys::kGemma4PerLayerInputGate : model_keys::kGemma4PerLayerProjection, weight);
+        const auto run = [&](int columns, int first, int threads, bool strided) {
+            std::unique_ptr<InferenceWorkContext, decltype(&DestroyInferenceWorkContext)> work(
+                CreateInferenceWorkContext(), DestroyInferenceWorkContext);
+            struct Restore { InferenceWorkContext* previous; ~Restore(){SetCurrentWorkContext(previous);} } restore{GetCurrentWorkContext()};
+            SetCurrentWorkContext(work.get()); ResetInferenceWorkContext(work.get());
+            work->model_variant = ModelVariant::GEMMA4;
+            BatchSpec batch{}; batch.num_seqs=columns; batch.tokens.assign(columns, 0);
+            for (int c=0; c<columns; ++c) {
+                batch.seq_id.push_back(c); batch.pos.push_back(43+c); batch.n_past.push_back(43+c);
+            }
+            InferenceDependencies deps; batch.deps=&deps;
+            SetCurrentBatch(&batch); SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+                ggml_init({2*1024*1024, nullptr, false}), ggml_free);
+            auto* storage=ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, reduction+(strided ? 16 : 0), columns);
+            auto* input=strided ? ggml_view_2d(ctx.get(), storage, reduction, columns, storage->nb[1], 0) : storage;
+            for (int c=0; c<columns; ++c)
+                std::memcpy(static_cast<char*>(input->data)+c*input->nb[1], inputs.data()+(first+c)*reduction, reduction*sizeof(float));
+            auto* output=densecore::testing::SmartMulMatWithPhaseTest(ctx.get(), weight, input, model.get(),
+                static_cast<int>(InferenceExecutionPhase::Decode));
+            struct Params { ggml_custom_op_t fun; int n_tasks; void* userdata; } params{};
+            if (output->op!=GGML_OP_CUSTOM) throw std::runtime_error("PLE CPU fixture did not select a maintained custom callback");
+            std::memcpy(&params, output->op_params, sizeof(params));
+            if (columns==1) {
+                // Prove which old M1 arithmetic this oracle actually protects.
+                if (!weight_strided) EXPECT_EQ(params.fun, cb_gemv_custom);
+                else EXPECT_NE(params.fun, cb_gemv_custom); // existing Gemma4FloatProjection/DotF32.
+            }
+            params.n_tasks=threads; // actual thread5, including the 256-output gate.
+            std::memcpy(output->op_params, &params, sizeof(params));
+            auto* graph=ggml_new_graph_custom(ctx.get(), 128, false); ggml_build_forward_expand(graph, output);
+            EXPECT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, threads), GGML_STATUS_SUCCESS);
+            std::vector<float> result(outputs*columns);
+            for (int c=0; c<columns; ++c)
+                std::memcpy(result.data()+c*outputs, static_cast<char*>(output->data)+c*output->nb[1], outputs*sizeof(float));
+            return result;
+        };
+        std::vector<std::vector<float>> baseline;
+        for (int c=0; c<max_columns; ++c) baseline.push_back(run(1, c, 1, false));
+        for (int threads : {1,4,5,8}) for (bool strided : {false,true}) for (int columns : {1,2,3,4,8}) {
+            SCOPED_TRACE(threads);
+            SCOPED_TRACE(strided);
+            SCOPED_TRACE(columns);
+            const auto actual=run(columns, 0, threads, strided);
+            for (int c=0; c<columns; ++c) {
+                const auto& expected=baseline[c];
+                const auto first=std::mismatch(expected.begin(), expected.end(), actual.data()+c*outputs,
+                    [](float a,float b){return std::memcmp(&a,&b,sizeof(float))==0;});
+                EXPECT_TRUE(first.first==expected.end()) << "column=" << c
+                    << " first_unequal_output=" << std::distance(expected.begin(),first.first);
+            }
+        }
+    }
+}
