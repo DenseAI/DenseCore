@@ -74,11 +74,16 @@ skips and no failures. This count does not certify the follow-on source.
 
 - Gemma E2B short answers passed, but its long-answer cacheON run repeated
   Mercury. The same file passed with cacheOFF and in llama.cpp. The candidate
-  now rejects graph reuse across unkeyed fixed-history KV shapes; default-cache
-  real-model requalification is required.
+  now rejects graph reuse across unkeyed fixed-history KV shapes. Frozen
+  `82463c0` subsequently completed the ordered long answer with DONE and EOS
+  with default cache configured ON (unsafe graphs were skipped, with zero hits).
+  This is one HTTP final-answer check; native-ID parity and c=4 remain required.
 - Gemma E4B first failed at a published shared-KV consumer lacking private K/V.
-  Shared-source validation and native Q4_0 projection fixes have fixture coverage;
-  a complete real-model answer remains required.
+  Shared-source validation and native Q4_0 projection fixes subsequently produced
+  a correct Paris answer on `82463c0`, but the following long request failed.
+  Instrumented replay isolated a graph-ledger refusal: a new 512 MiB metadata
+  arena was requested with only 192 MiB free of its 1920 MiB capacity. Idle-arena
+  pressure recycling is under test; a complete long answer remains required.
 - The earlier portable candidate served within 4 GiB and explicitly rejected
   an undersized 1 GiB configuration. Its strict Count quality check failed, as
   did the same-file llama comparison; retain the failure. Active drain hit the
@@ -90,3 +95,11 @@ skips and no failures. This count does not certify the follow-on source.
 Raw local evidence is retained under `/home/jaewook/dc/logs/v02-*`, including
 `v02-mtp-dense-matrix-report.json`. Archive those raw files with exact source,
 model/library hashes and commands before publishing any result.
+
+AUTO pre-KV selection is now connected to stable loaded model bytes and the
+native CPU/build/runtime contract, including loaded GGML dependencies and the
+chosen prefill chunk. Candidate tests passed 62/62 before final integration;
+production still ships zero profiles. The initial collector qualifies only
+proven single-node, full-online-affinity Linux execution; partial cpusets,
+unknown conditions and unverified dependency/allocator overrides choose NONE.
+This restriction does not change ordinary resource-aware serving.
