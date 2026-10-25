@@ -610,6 +610,7 @@ set(SOURCES
     src/llm/graph/cache.cpp
     src/llm/models/common/family_internal.cpp
     src/llm/sampling/exec.cpp
+    src/llm/speculative/verification.cpp
     src/runtime/inference_context.cpp
     src/runtime/inference.cpp
     src/models/model_types.cpp
@@ -1394,6 +1395,7 @@ if(DENSECORE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_activation_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_image_ops.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_sampling_range.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/test_speculative_verification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_sampling_and_moe_trace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels/test_normalization.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/moe/test_moe_ops.cpp

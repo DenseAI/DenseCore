@@ -2557,29 +2557,48 @@ TransformerModel* LoadGGUFModel(const char* path) {
     get_u32("feed_forward_length", model->hparams.n_ff);
     get_u32("ffn_intermediate_size", model->hparams.n_ff);
 
-    if (model->variant == ModelVariant::QWEN38) {
-        uint32_t nextn_layers = 0;
+    uint32_t nextn_layers = 0;
+    if (model->arch == ModelArch::QWEN35) {
         get_u32("nextn_predict_layers", nextn_layers);
-        if (model->gguf_declared_layer_count != 65 || nextn_layers != 1) {
-            return fail_load("Qwen3.8 text support requires qwen35.block_count=65 with nextn_predict_layers=1");
+    }
+    if (model->variant == ModelVariant::QWEN38 &&
+        (model->gguf_declared_layer_count != 65 || nextn_layers != 1)) {
+        return fail_load("Qwen3.8 text support requires qwen35.block_count=65 with nextn_predict_layers=1");
+    }
+    if (nextn_layers > 0) {
+        if (nextn_layers >= model->gguf_declared_layer_count) {
+            return fail_load("NextN/MTP layer count must leave at least one executable trunk layer");
         }
         const uint32_t executable_layers = model->gguf_declared_layer_count - nextn_layers;
-        if (executable_layers != 64) {
-            return fail_load("Qwen3.8 text support requires exactly 64 executable trunk layers");
+        model->mtp_heads.reserve(nextn_layers);
+        for (uint32_t i = executable_layers; i < model->gguf_declared_layer_count; ++i) {
+            const std::string prefix = "blk." + std::to_string(i) + ".";
+            if (!has_tensor_with_prefix(prefix)) {
+                return fail_load("GGUF is missing trailing NextN/MTP tensors at " + prefix);
+            }
+            TransformerModel::NextNHead head;
+            head.gguf_layer_index = i;
+            model->ForEachWeightContext([&](ggml_context* weight_ctx) {
+                for (ggml_tensor* tensor = ggml_get_first_tensor(weight_ctx); tensor;
+                     tensor = ggml_get_next_tensor(weight_ctx, tensor)) {
+                    const std::string name = tensor->name;
+                    if (name.rfind(prefix, 0) == 0) {
+                        head.tensors.emplace(name.substr(prefix.size()), tensor);
+                    }
+                }
+            });
+            model->mtp_heads.push_back(std::move(head));
         }
-        const std::string mtp_prefix = "blk." + std::to_string(executable_layers) + ".";
-        const std::string after_mtp_prefix = "blk." + std::to_string(executable_layers + nextn_layers) + ".";
-        if (!has_tensor_with_prefix(mtp_prefix)) {
-            return fail_load("Qwen3.8 GGUF is missing the expected trailing blk.64 NextN/MTP tensors");
+        if (has_tensor_with_prefix("blk." + std::to_string(model->gguf_declared_layer_count) + ".")) {
+            return fail_load("GGUF has unexpected tensors after the declared NextN/MTP layers");
         }
-        if (has_tensor_with_prefix(after_mtp_prefix)) {
-            return fail_load("Qwen3.8 GGUF has unexpected tensors after the single trailing NextN/MTP layer");
-        }
+        // NextN is a separate prediction head, never another recurrent trunk layer.
+        // Keep GGUF provenance and head weights intact for explicit speculative execution.
         model->hparams.n_layer = executable_layers;
         model->skipped_mtp_layer_count = nextn_layers;
-        std::cout << "[DenseCore] Qwen3.8 text-only load: gguf_layers=" << model->gguf_declared_layer_count
+        std::cout << "[DenseCore] NextN text-only load: gguf_layers=" << model->gguf_declared_layer_count
                   << " executable_trunk_layers=" << model->hparams.n_layer
-                  << " skipped_mtp_layers=" << model->skipped_mtp_layer_count << std::endl;
+                  << " mtp_heads=" << model->mtp_heads.size() << std::endl;
     }
 
     model->gemma4_layer_n_head_kv.clear();

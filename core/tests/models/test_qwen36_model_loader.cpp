@@ -654,6 +654,46 @@ TEST(Qwen36ModelLoaderTest, PackedExpertViewsPreserveInt4BindingsForQwen36Moe) {
     EXPECT_NE(expert_last.down_binding.zeros->view_offs, expert0.down_binding.zeros->view_offs);
 }
 
+TEST(Qwen36ModelLoaderTest, SeparatesNextNHeadsFromExecutableHybridTrunk) {
+    for (const char* family : {"qwen35", "qwen35moe"}) {
+        SCOPED_TRACE(family);
+        TempPath tmp;
+        ASSERT_TRUE(WriteGguf(tmp.path(), [&](gguf_context* ctx) {
+            SetBaseQwen36AuxMetadata(ctx, family, true, 5);
+            gguf_set_val_u32(ctx, (std::string(family) + ".nextn_predict_layers").c_str(), 1);
+            AddMinimalHybridTensors(ctx, 4);
+            AddTensor2D(ctx, "blk.4.nextn.eh_proj.weight", 16, 8);
+            AddTensor1D(ctx, "blk.4.nextn.enorm.weight", 8);
+            AddTensor1D(ctx, "blk.4.nextn.hnorm.weight", 8);
+        }));
+        std::unique_ptr<TransformerModel> model(LoadGGUFModel(tmp.path().c_str()));
+        ASSERT_NE(model, nullptr);
+        EXPECT_EQ(model->gguf_declared_layer_count, 5u);
+        EXPECT_EQ(model->hparams.n_layer, 4u);
+        EXPECT_EQ(model->layers.size(), 4u);
+        EXPECT_EQ(model->ssm_layer_states.size(), 3u);
+        ASSERT_EQ(model->mtp_heads.size(), 1u);
+        EXPECT_EQ(model->mtp_heads[0].gguf_layer_index, 4u);
+        EXPECT_EQ(model->mtp_heads[0].Find("nextn.eh_proj.weight"),
+                  model->FindWeightTensor("blk.4.nextn.eh_proj.weight"));
+        EXPECT_NE(model->mtp_heads[0].Find("nextn.hnorm.weight"), nullptr);
+    }
+}
+
+TEST(Qwen36ModelLoaderTest, RejectsMissingOrImpossibleNextNBlocks) {
+    for (unsigned count : {1u, 5u, 6u}) {
+        SCOPED_TRACE(count);
+        TempPath tmp;
+        ASSERT_TRUE(WriteGguf(tmp.path(), [&](gguf_context* ctx) {
+            SetBaseQwen36AuxMetadata(ctx, "qwen35", true, 5);
+            gguf_set_val_u32(ctx, "qwen35.nextn_predict_layers", count);
+            AddMinimalHybridTensors(ctx, 4);
+        }));
+        std::unique_ptr<TransformerModel> model(LoadGGUFModel(tmp.path().c_str()));
+        EXPECT_EQ(model, nullptr);
+    }
+}
+
 TEST(Qwen38ModelLoaderTest, Text27bSkipsTrailingMtpBlock) {
     TempPath tmp;
     auto fill = [](gguf_context* ctx) {

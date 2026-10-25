@@ -568,6 +568,18 @@ struct TransformerModel {
     ModelArchFlags arch_flags;
     uint32_t gguf_declared_layer_count = 0;
     uint32_t skipped_mtp_layer_count = 0;
+    // Original trailing GGUF blocks, excluded from hparams.n_layer/layers and
+    // recurrent trunk state. Tensor lifetime is owned by this model's contexts.
+    struct NextNHead {
+        uint32_t gguf_layer_index = 0;
+        std::unordered_map<std::string, struct ggml_tensor*> tensors;
+        struct ggml_tensor* Find(const std::string& suffix) const {
+            const auto it = tensors.find(suffix);
+            return it == tensors.end() ? nullptr : it->second;
+        }
+    };
+    std::vector<NextNHead> mtp_heads;
+
 
     // SSM parameters (populated when arch_flags.is_hybrid_ssm = true)
     int ssm_conv_kernel = 4;
