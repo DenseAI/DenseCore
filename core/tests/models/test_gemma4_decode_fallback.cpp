@@ -16,6 +16,7 @@
 #include "ggml-cpu.h"
 #include "llm/graph/checked_ops.h"
 #include "llm/graph/gemma4_shared_kv.h"
+#include "llm/config/runtime_config.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_types.h"
@@ -1405,7 +1406,16 @@ TEST(Gemma4FallbackDecodeTest, E4BSharedLayersNeedOnlyQAndMatchLocalSourceLogits
                 } restore;
                 SetCurrentWorkContext(work.get());
                 ResetInferenceWorkContext(work.get());
-                const auto batch = MakeSingleTokenDecodeBatch(0, 3, 0);
+                // The default paged sliding path publishes current-token K/V
+                // (length1), which cannot exercise redundant history copies.
+                // Inject the maintained nonpaged policy for this allocation
+                // observation only; ordinary numerical/canary runs stay default.
+                densecore::llm::config::FastPathRuntimeConfig config;
+                config.decode_paged_attention.mode = densecore::llm::config::DecodePagedAttentionMode::Off;
+                InferenceDependencies deps;
+                deps.fast_path_config = &config;
+                auto batch = MakeSingleTokenDecodeBatch(0, 3, 0);
+                batch.deps = &deps;
                 SetCurrentBatch(&batch);
                 SetCurrentExecutionPhase(InferenceExecutionPhase::Decode);
                 ggml_init_params params{32ull * 1024 * 1024, nullptr, false};
