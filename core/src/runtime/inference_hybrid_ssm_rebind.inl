@@ -186,7 +186,6 @@ bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& 
                 ud->token_seq_ids = seq_ids;
                 ud->token_positions = positions;
                 ud->runtime_states = runtime_states;
-                ud->checkpoints = nullptr;
                 conv_rebinds++;
             }
         } else if (node->op == GGML_OP_CUSTOM) {
@@ -200,7 +199,6 @@ bool RebindLFM2DecodeGraphRuntimeState(GgmlGraphHandle* graph, const BatchSpec& 
                 ud->token_seq_ids = seq_ids;
                 ud->token_positions = positions;
                 ud->runtime_states = runtime_states;
-                ud->checkpoints = nullptr;
                 conv_rebinds++;
             }
         }

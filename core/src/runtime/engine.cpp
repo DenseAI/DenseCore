@@ -913,7 +913,7 @@ void InitializeRuntimeBackends(int threads) {
 
 std::unique_ptr<EngineState> InitializeEngineResources(const InitPaths& paths, int threads, int numa_node_id,
                                                        int pinning_policy, ggml_type requested_type,
-                                                       const char* api_name) {
+                                                       const char* api_name, int spec_type, int draft_n_max) {
     auto model_owner = std::unique_ptr<TransformerModel>(LoadModelWithNuma(paths.model_path.c_str(), numa_node_id));
     TransformerModel* model = model_owner.get();
     if (!model) {
@@ -1032,7 +1032,8 @@ DenseCoreHandle InitializeEngineCommon(const char* model_path, const char* reser
         if (!ResolveInitPaths(model_path, reserved, api_name, &paths)) return nullptr;
         threads = ResolveEngineThreadCount(threads);
         InitializeRuntimeBackends(threads);
-        auto state = InitializeEngineResources(paths, threads, numa_node_id, pinning_policy, requested_type, api_name);
+        auto state = InitializeEngineResources(paths, threads, numa_node_id, pinning_policy, requested_type, api_name,
+                                               spec_type, draft_n_max);
         if (!state) return nullptr;
         std::string speculation_error;
         if (!ConfigureSpeculation(state.get(), spec_type, draft_n_max, &speculation_error)) {
