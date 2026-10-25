@@ -4,8 +4,9 @@
 #include "densecore/exceptions.h"
 
 namespace densecore::llm::sampling {
-// A request's grammar/range/masks leave no admissible finite token. Callers
-// must terminate that request rather than bypass its constraints with fallback.
+// A request's active JSON grammar is incomplete, or its grammar/valid range/
+// masks leave no admissible finite token. Callers must terminate that request
+// rather than bypass its constraints. Invalid ranges retain full-vocab fallback.
 // This deliberately does not classify unrelated graph/internal errors.
 class SamplingConstraintError final : public densecore::InvalidArgumentException {
 public:

@@ -252,6 +252,10 @@ void ApplyGrammarMask(float* logits, int n_vocab, const GrammarConstraint* gramm
     if (!grammar || !grammar->enabled || !grammar->is_json_mode) {
         return;
     }
+    if (n_vocab > 0 && vocab.size() < static_cast<size_t>(n_vocab)) {
+        throw densecore::llm::sampling::SamplingConstraintError(
+            "grammar vocabulary does not cover the logits token IDs");
+    }
 
     const float NEG_INF = -INFINITY;
     std::vector<bool> allowed(n_vocab, false);
@@ -359,6 +363,10 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     float* logits_data = (float*)logits->data;
     int n_vocab = logits->ne[0];
     if (n_vocab <= 0) return 0;
+    const bool active_json_grammar = params.grammar && params.grammar->enabled && params.grammar->is_json_mode;
+    if (active_json_grammar && !params.vocab) {
+        throw densecore::llm::sampling::SamplingConstraintError("active JSON grammar requires a vocabulary");
+    }
 
     if (distribution) distribution->assign(static_cast<size_t>(n_vocab), 0.0);
     auto point_mass = [&](int token) {
@@ -377,6 +385,8 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     int range_start = 0;
     int range_end = n_vocab;
     if (params.action_token_count > 0) {
+        // Invalid ranges keep the documented full-vocabulary fallback, with
+        // or without grammar; only valid ranges restrict global token IDs.
         const int requested_start = std::max(0, params.action_token_start);
         if (requested_start < n_vocab) {
             const int64_t requested_end = static_cast<int64_t>(requested_start) + params.action_token_count;
@@ -967,7 +977,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
                 found = true;
             }
         }
-        if (!found && requires_working_logits) {
+        if (!found && active_json_grammar) {
             throw densecore::llm::sampling::SamplingConstraintError(
                 "no finite token satisfies grammar, vocabulary range and token masks");
         }
@@ -1056,7 +1066,7 @@ static int SampleTokenImpl(struct ggml_tensor* logits, int idx, const SamplingPa
     }
 
     if (!found_finite || !std::isfinite(max_logit)) {
-        if (requires_working_logits) {
+        if (active_json_grammar) {
             throw densecore::llm::sampling::SamplingConstraintError(
                 "no finite token satisfies grammar, vocabulary range and token masks");
         }

@@ -1945,3 +1945,130 @@ TEST(SamplingGrammarIntersection, EmptyFiniteSupportThrowsTypedErrorWithoutRngOr
         EXPECT_TRUE(grammar.accumulated.empty());
     }
 }
+
+
+TEST(SamplingGrammarIntersection, FiniteRawPenaltyOverflowThrowsBeforeAnyDraw) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {"};
+    auto grammar = OpeningObjectGrammar(vocab);
+    std::vector<int> allowed{2}, history{2};
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.repetition_penalty = 4; // Accepted positive finite penalty; -1e38*4 overflows F32.
+    params.token_history = &history;
+    params.allowed_token_ids = &allowed;
+    params.action_token_start = 2;
+    params.action_token_count = 1;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    for (float temperature : {0.f, 1.f}) {
+        params.temperature = temperature;
+        std::mt19937 rng(71);
+        const auto before = rng;
+        EXPECT_THROW(AnalyticSamplerDistribution({0,9,-1e38f}, params), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_THROW(AnalyticSamplerDraw({0,9,-1e38f}, params, rng), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_EQ(rng, before);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+        EXPECT_TRUE(grammar.accumulated.empty());
+    }
+}
+
+TEST(SamplingGrammarIntersection, ShortVocabularyFailsBeforeDirectMaskOrSamplerReads) {
+    const std::vector<std::string> vocab = {"invalid", "{"};
+    auto grammar = OpeningObjectGrammar(vocab);
+    float direct[] = {1,2,3};
+    EXPECT_THROW(ApplyGrammarMask(direct, 3, &grammar, vocab), densecore::llm::sampling::SamplingConstraintError);
+    EXPECT_EQ((std::vector<float>(direct, direct+3)), (std::vector<float>{1,2,3}));
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    for (float temperature : {0.f, 1.f}) {
+        params.temperature = temperature;
+        std::mt19937 rng(71);
+        const auto before = rng;
+        EXPECT_THROW(AnalyticSamplerDistribution({0,9,1}, params), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_THROW(AnalyticSamplerDraw({0,9,1}, params, rng), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_EQ(rng, before);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+    }
+}
+
+TEST(SamplingGrammarIntersection, LongerVocabularyUsesOnlyLogitsGlobalIds) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {", "{"};
+    auto grammar = OpeningObjectGrammar(vocab);
+    std::vector<int> allowed{1,3}; // GlobalID3 has vocabulary text but no logits column entry.
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.allowed_token_ids = &allowed;
+    params.grammar = &grammar;
+    params.vocab = &vocab;
+    for (float temperature : {0.f, 1.f}) {
+        params.temperature = temperature;
+        ExpectAnalyticDistribution(AnalyticSamplerDistribution({100,2,1}, params), {0,1,0});
+        std::mt19937 rng(71);
+        EXPECT_EQ(AnalyticSamplerDraw({100,2,1}, params, rng), 1);
+    }
+}
+
+TEST(SamplingGrammarIntersection, InvalidActionRangeRetainsDocumentedFullVocabularyFallback) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {"};
+    auto grammar = OpeningObjectGrammar(vocab);
+    std::vector<int> allowed{2};
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.action_token_start = 3; // Out-of-vocabulary start: invalid ranges are documented as ignored.
+    params.action_token_count = 1;
+    params.allowed_token_ids = &allowed;
+    params.vocab = &vocab;
+    for (bool with_grammar : {false,true}) for (float temperature : {0.f,1.f}) {
+        params.grammar = with_grammar ? &grammar : nullptr;
+        params.temperature = temperature;
+        ExpectAnalyticDistribution(AnalyticSamplerDistribution({0,9,1}, params), {0,0,1});
+    }
+}
+
+TEST(SamplingGrammarIntersection, MissingActiveJsonVocabularyFailsClosedBeforeDraw) {
+    const std::vector<std::string> vocab = {"invalid", "{", " {"};
+    auto grammar = OpeningObjectGrammar(vocab);
+    SamplingParams params;
+    params.top_k = 0;
+    params.top_p = 1;
+    params.grammar = &grammar;
+    params.vocab = nullptr;
+    for (float temperature : {0.f,1.f}) {
+        params.temperature = temperature;
+        std::mt19937 rng(71);
+        const auto before = rng;
+        EXPECT_THROW(AnalyticSamplerDistribution({9,2,1}, params), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_THROW(AnalyticSamplerDraw({9,2,1}, params, rng), densecore::llm::sampling::SamplingConstraintError);
+        EXPECT_EQ(rng, before);
+        EXPECT_EQ(grammar.state, JSONState::EXPECT_OBJECT_START);
+        EXPECT_TRUE(grammar.accumulated.empty());
+    }
+}
+
+TEST(SamplingGrammarIntersection, DisabledOrNonJsonAndNullGrammarKeepNoOpAndNonfiniteFallback) {
+    const std::vector<std::string> short_vocab;
+    for (int mode = 0; mode < 3; ++mode) {
+        GrammarConstraint grammar;
+        grammar.enabled = mode == 1;
+        grammar.is_json_mode = mode == 0;
+        auto* selected = mode == 2 ? nullptr : &grammar;
+        float direct[] = {1,2,3};
+        EXPECT_NO_THROW(ApplyGrammarMask(direct, 3, selected, short_vocab));
+        EXPECT_EQ((std::vector<float>(direct,direct+3)), (std::vector<float>{1,2,3}));
+        SamplingParams params;
+        params.temperature = 0;
+        params.top_k = 0;
+        params.top_p = 1;
+        params.grammar = selected;
+        for (bool with_vocab : {false,true}) {
+            params.vocab = with_vocab ? &short_vocab : nullptr;
+            ExpectAnalyticDistribution(AnalyticSamplerDistribution({NAN,NAN,NAN}, params), {1,0,0});
+        }
+    }
+}
