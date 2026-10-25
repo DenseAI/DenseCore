@@ -91,6 +91,8 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
 
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore::llm::attention::testing {
+ggml_tensor* AttachPagedInputSnapshotForTest(ggml_context* ctx, ggml_tensor* input, int layer,
+                                            int source_layer, int storage_dim, bool shared_reader);
 void ResetSharedPrefillFlashMaskBuildsForTest();
 uint64_t GetSharedPrefillFlashMaskBuildsForTest();
 void ExerciseSharedPrefillFlashMaskBuildForTest(bool native_flash_selected, int n_total_tokens, int n_tokens,

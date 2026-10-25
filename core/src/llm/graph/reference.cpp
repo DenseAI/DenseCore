@@ -340,6 +340,7 @@ HiddenSnapshotUserData* AllocateHiddenSnapshotUserData(struct ggml_context* ctx_
     std::memset(storage->data, 0, sizeof(HiddenSnapshotUserData));
     auto* result = reinterpret_cast<HiddenSnapshotUserData*>(storage->data);
     result->graph_no_alloc = restore.previous;
+    result->source_kv_layer = -1;
     return result;
 }
 
@@ -606,10 +607,12 @@ void cb_hidden_snapshot_probe(struct ggml_tensor* dst, const struct ggml_tensor*
                 }
                 if (std::fclose(file) != 0) ok = false;
                 std::fprintf(stderr,
-                    "[HIDDEN_CAPTURE%s] id=%llu batch=%d row=%d seq=%d scheduler_seq=%d pos=%d token=%d layer=%d stage=%s no_alloc=%d width=%d path=%s\n",
+                    "[HIDDEN_CAPTURE%s] id=%llu batch=%d row=%d seq=%d scheduler_seq=%d pos=%d token=%d layer=%d stage=%s no_alloc=%d width=%d source_layer=%d logical_dim=%d heads=%d storage_dim=%d shared_reader=%d path=%s\n",
                     ok ? "" : "_ERROR", static_cast<unsigned long long>(id), batch->num_seqs, row, seq,
                     scheduler_seq, batch->pos[row], batch->tokens[row], ud->layer_idx,
-                    ud->stage ? ud->stage : "unknown", static_cast<int>(ud->graph_no_alloc), width, path.c_str());
+                    ud->stage ? ud->stage : "unknown", static_cast<int>(ud->graph_no_alloc), width,
+                    ud->source_kv_layer, ud->logical_head_dim, ud->logical_head_count,
+                    ud->storage_head_dim, static_cast<int>(ud->shared_kv_reader), path.c_str());
             }
         }
     } catch (...) {

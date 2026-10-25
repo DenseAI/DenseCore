@@ -1,6 +1,7 @@
 #include "llm/attention/exec.h"
 #include <stdexcept>
 #include "llm/attention/graph_ops.h"
+#include "llm/graph/construction_ops.h"
 
 #include "ggml.h"
 #include "llm/attention/internal.h"
@@ -165,6 +166,31 @@ BuildOrReuseSharedPrefillFlashMask(struct ggml_context* ctx_c, int n_total_token
     return mask;
 }
 
+ggml_tensor* AttachPagedInputSnapshot(ggml_context* ctx, ggml_tensor* input, int layer,
+                                      int source_layer, int storage_dim, bool shared_reader,
+                                      const char* stage) {
+    if (!ctx || !input || input->type != GGML_TYPE_F32 || !ggml_is_contiguous(input) ||
+        input->ne[0] <= 0 || input->ne[1] <= 0 || input->ne[2] <= 0 || input->ne[3] != 1 ||
+        input->ne[0] > std::numeric_limits<int>::max() || input->ne[1] > std::numeric_limits<int>::max() ||
+        storage_dim < input->ne[0] || source_layer < 0) {
+        throw std::invalid_argument("paged input snapshot requires validated contiguous F32 head/token layout");
+    }
+    const auto dim = input->ne[0], heads = input->ne[1], tokens = input->ne[2];
+    auto* flat = ggml_reshape_2d(ctx, input, dim * heads, tokens);
+    auto* ud = AllocateHiddenSnapshotUserData(ctx);
+    ud->layer_idx = layer;
+    ud->token_idx = -1;
+    ud->stage = stage;
+    ud->var_name = stage;
+    ud->source_kv_layer = source_layer;
+    ud->logical_head_dim = static_cast<int>(dim);
+    ud->logical_head_count = static_cast<int>(heads);
+    ud->storage_head_dim = storage_dim;
+    ud->shared_kv_reader = shared_reader;
+    auto* captured = ggml_map_custom1(ctx, flat, cb_hidden_snapshot_probe, 1, ud);
+    return ggml_reshape_3d(ctx, captured, dim, heads, tokens);
+}
+
 }  // namespace
 
 struct ggml_tensor* ExecutePagedDecodeAttentionPath(
@@ -219,6 +245,17 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     struct ggml_tensor* Q_decode = ggml_is_contiguous(Qcur) ? Qcur : ggml_cont(ctx_c, Qcur);
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
+    if (model && model->arch_flags.is_gemma4) {
+        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_query"))
+            Q_decode = AttachPagedInputSnapshot(ctx_c, Q_decode, il, kv_cache_layer, cache->head_dim,
+                                                gemma4_shared_kv_layer, "attn_query");
+        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_key"))
+            K_decode = AttachPagedInputSnapshot(ctx_c, K_decode, il, kv_cache_layer, cache->head_dim,
+                                                gemma4_shared_kv_layer, "attn_key");
+        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_value"))
+            V_decode = AttachPagedInputSnapshot(ctx_c, V_decode, il, kv_cache_layer, cache->v_head_dim,
+                                                gemma4_shared_kv_layer, "attn_value");
+    }
     const float paged_attn_scale = ResolveAttentionScaleForRuntime(head_dim_q, use_explicit_attention_scale);
 
     PagedAttentionUserData* ud = GetPagedAttentionUserData();
@@ -417,6 +454,11 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
 
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore::llm::attention::testing {
+
+ggml_tensor* AttachPagedInputSnapshotForTest(ggml_context* ctx, ggml_tensor* input, int layer,
+                                            int source_layer, int storage_dim, bool shared_reader) {
+    return AttachPagedInputSnapshot(ctx, input, layer, source_layer, storage_dim, shared_reader, "attn_query");
+}
 
 void ResetSharedPrefillFlashMaskBuildsForTest() {
     g_shared_prefill_flash_mask_builds.store(0, std::memory_order_relaxed);

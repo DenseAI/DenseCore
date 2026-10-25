@@ -59,6 +59,11 @@ struct HiddenSnapshotUserData {
     const char* stage = nullptr;
     const char* var_name = nullptr;
     bool graph_no_alloc = false;
+    int source_kv_layer = -1;
+    int logical_head_dim = 0;
+    int logical_head_count = 0;
+    int storage_head_dim = 0;
+    bool shared_kv_reader = false;
 };
 
 struct Gemma4KVSummaryUserData {

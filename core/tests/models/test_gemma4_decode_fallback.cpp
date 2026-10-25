@@ -15,6 +15,7 @@
 #include "llm/runtime/work_context_internal.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-alloc.h"
 #include "llm/graph/checked_ops.h"
 #include "llm/attention/exec.h"
 #include "llm/graph/construction_ops.h"
@@ -1869,4 +1870,68 @@ TEST(Gemma4DecodeGraphTest, IntendedBatchedDiagnosticAbortPropagatesThroughRepla
     catch (...) { unavailable=std::current_exception(); }
     EXPECT_NO_THROW(PropagateBatchedDecodeDiagnosticAbort(unavailable));
     EXPECT_NO_THROW(PropagateBatchedDecodeDiagnosticAbort(nullptr));
+}
+
+
+TEST(Gemma4DecodeGraphTest, PagedInputSnapshotPreservesHeadsTokensAndDeferredStorage) {
+    for (bool deferred : {false, true}) for (int dim : {256, 512})
+        for (int heads : {1, 8}) for (int tokens : {1, 3}) {
+            SCOPED_TRACE(deferred);
+            SCOPED_TRACE(dim);
+            SCOPED_TRACE(heads);
+            SCOPED_TRACE(tokens);
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+                ggml_init({2*1024*1024, nullptr, deferred}), ggml_free);
+            ASSERT_NE(ctx, nullptr);
+            auto* input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, heads, tokens);
+            auto* output = densecore::llm::attention::testing::AttachPagedInputSnapshotForTest(
+                ctx.get(), input, 9, 7, 512, true);
+            ASSERT_TRUE(ggml_are_same_shape(input, output));
+            ASSERT_TRUE(ggml_is_contiguous(output));
+            EXPECT_EQ(ggml_get_no_alloc(ctx.get()), deferred);
+            auto* graph = ggml_new_graph_custom(ctx.get(), 128, false);
+            ggml_build_forward_expand(graph, output);
+            HiddenSnapshotUserData* retained = nullptr;
+            for (int i=0; i<ggml_graph_n_nodes(graph); ++i) {
+                auto* node = ggml_graph_node(graph, i);
+                if (node->op != GGML_OP_MAP_CUSTOM1) continue;
+                struct Params { ggml_custom1_op_t fn; int tasks; void* userdata; } params{};
+                std::memcpy(&params, node->op_params, sizeof(params));
+                if (params.fn == cb_hidden_snapshot_probe) retained = static_cast<HiddenSnapshotUserData*>(params.userdata);
+            }
+            ASSERT_NE(retained, nullptr);
+            std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);
+            ASSERT_NE(backend, nullptr);
+            std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> allocator(
+                ggml_gallocr_new(ggml_backend_cpu_buffer_type()), ggml_gallocr_free);
+            ASSERT_NE(allocator, nullptr);
+            if (deferred) {
+                ASSERT_TRUE(ggml_gallocr_reserve(allocator.get(), graph));
+                ASSERT_TRUE(ggml_gallocr_alloc_graph(allocator.get(), graph));
+            }
+            ASSERT_NE(input->data, nullptr);
+            for (int64_t i=0; i<ggml_nelements(input); ++i)
+                static_cast<float*>(input->data)[i] = ((i*13)%127-63)/32.f;
+            EXPECT_EQ(retained->layer_idx, 9);
+            EXPECT_EQ(retained->source_kv_layer, 7);
+            EXPECT_EQ(retained->logical_head_dim, dim);
+            EXPECT_EQ(retained->logical_head_count, heads);
+            EXPECT_EQ(retained->storage_head_dim, 512);
+            EXPECT_TRUE(retained->shared_kv_reader);
+            EXPECT_EQ(retained->graph_no_alloc, deferred);
+            ASSERT_EQ(ggml_backend_graph_compute(backend.get(), graph), GGML_STATUS_SUCCESS);
+            ASSERT_NE(output->data, nullptr);
+            EXPECT_EQ(std::memcmp(input->data, output->data, ggml_nelements(input)*sizeof(float)), 0);
+            EXPECT_EQ(retained->layer_idx, 9); // Metadata remains owned through allocation and compute.
+        }
+}
+
+TEST(Gemma4DecodeGraphTest, PagedInputSnapshotRejectsStridedHeadsBeforeReshape) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({1024*1024,nullptr,false}), ggml_free);
+    ASSERT_NE(ctx, nullptr);
+    auto* backing = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 257, 2, 3);
+    auto* strided = ggml_view_3d(ctx.get(), backing, 256, 2, 3, backing->nb[1], backing->nb[2], 0);
+    ASSERT_FALSE(ggml_is_contiguous(strided));
+    EXPECT_THROW(densecore::llm::attention::testing::AttachPagedInputSnapshotForTest(
+        ctx.get(), strided, 0, 0, 512, false), std::invalid_argument);
 }
