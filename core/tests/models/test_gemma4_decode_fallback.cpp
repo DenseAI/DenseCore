@@ -1935,3 +1935,45 @@ TEST(Gemma4DecodeGraphTest, PagedInputSnapshotRejectsStridedHeadsBeforeReshape) 
     EXPECT_THROW(densecore::llm::attention::testing::AttachPagedInputSnapshotForTest(
         ctx.get(), strided, 0, 0, 512, false), std::invalid_argument);
 }
+
+
+TEST(Gemma4DecodeGraphTest, ProjectedSnapshotMaterializesFusedStridedHeadsWithoutPermutation) {
+    for (bool deferred : {false, true}) {
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+            ggml_init({2*1024*1024,nullptr,deferred}), ggml_free);
+        ASSERT_NE(ctx, nullptr);
+        constexpr int dim=256, heads=8, tokens=3;
+        auto* backing = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim+16, heads, tokens);
+        auto* input = ggml_view_3d(ctx.get(), backing, dim, heads, tokens, backing->nb[1], backing->nb[2], 0);
+        ASSERT_FALSE(ggml_is_contiguous(input));
+        auto* output = densecore::llm::attention::testing::AttachPagedInputSnapshotForTest(
+            ctx.get(), input, 0, 0, 512, false, true);
+        ASSERT_TRUE(ggml_are_same_shape(input, output));
+        ASSERT_TRUE(ggml_is_contiguous(output));
+        auto* graph = ggml_new_graph_custom(ctx.get(), 128, false);
+        ggml_build_forward_expand(graph, output);
+        std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);
+        std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> allocator(
+            ggml_gallocr_new(ggml_backend_cpu_buffer_type()), ggml_gallocr_free);
+        ASSERT_NE(backend,nullptr);ASSERT_NE(allocator,nullptr);
+        if (deferred) {
+            ASSERT_TRUE(ggml_gallocr_reserve(allocator.get(),graph));
+            ASSERT_TRUE(ggml_gallocr_alloc_graph(allocator.get(),graph));
+        }
+        for (int64_t i=0; i<ggml_nelements(backing); ++i)
+            static_cast<float*>(backing->data)[i] = ((i*17)%251-125)/64.f;
+        // The allocator may reuse the consumed backing/view after CONT.
+        // Keep the oracle independent of that temporary tensor's lifetime.
+        std::vector<float> expected(dim*heads*tokens);
+        for (int t=0; t<tokens; ++t) for (int h=0; h<heads; ++h) for (int d=0; d<dim; ++d) {
+            const int64_t source_index = (t*heads+h)*(dim+16)+d;
+            expected[(t*heads+h)*dim+d] = ((source_index*17)%251-125)/64.f;
+        }
+        ASSERT_EQ(ggml_backend_graph_compute(backend.get(),graph),GGML_STATUS_SUCCESS);
+        SCOPED_TRACE(deferred);
+        ASSERT_NE(output->data,nullptr);
+        for (size_t i=0; i<expected.size(); ++i)
+            EXPECT_FLOAT_EQ(static_cast<float*>(output->data)[i],expected[i]) << "index=" << i;
+        EXPECT_EQ(ggml_get_no_alloc(ctx.get()),deferred);
+    }
+}

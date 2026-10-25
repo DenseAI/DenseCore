@@ -463,6 +463,19 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             throw densecore::InvalidArgumentException("Missing attention_norm weight in TransformerLayer");
         }
         cur = apply_weighted_rms_norm(cur, attn_norm, "attn_norm", il);
+        if (model->arch_flags.is_gemma4 && ShouldRunHiddenSnapshotProbe(il, "attn_projection_input")) {
+            if (!gf) throw std::runtime_error("projection input snapshot requires owned graph");
+            auto* ud = AllocateHiddenSnapshotUserData(ctx_c);
+            ud->layer_idx = il;
+            ud->token_idx = -1;
+            ud->stage = "attn_projection_input";
+            ud->var_name = "attn_norm";
+            auto* tap = ggml_map_custom1(ctx_c, cur, cb_hidden_snapshot_probe, 1, ud);
+            // Keep the actual matmul input/op unchanged; register a passive
+            // diagnostic branch instead of inserting it into the projection.
+            ggml_set_output(tap);
+            ggml_build_forward_expand(gf, tap);
+        }
 
         // Short-conv / SSM / Attention layer dispatch
         const bool is_conv_layer = model->IsLFM2ConvLayer(il);
@@ -1282,6 +1295,17 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                 Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_v, n_head_kv, N);
             }
 
+            if (model->arch_flags.is_gemma4) {
+                const int source = layer_spec ? layer_spec->attention.kv_source_layer
+                    : densecore::models::Gemma4KVSourceLayer(model, il);
+                const int storage = cache ? cache->head_dim : std::max(head_dim_q, head_dim_kv);
+                Qcur = MaybeAttachGemmaHeadSnapshot(ctx_c, model, Qcur, il, source, storage,
+                                                    gemma4_shared_kv_layer, "attn_query_projected");
+                if (!gemma4_shared_kv_layer)
+                    Kcur = MaybeAttachGemmaHeadSnapshot(ctx_c, model, Kcur, il, source, storage,
+                                                        false, "attn_key_projected");
+            }
+
             // =========================================================================
             // Per-Head QK-Norm (Architecture-flag based for Qwen3/Qwen2.5)
             // =========================================================================
@@ -1390,6 +1414,17 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                         logged_k_mismatch = true;
                     }
                 }
+            }
+
+            if (model->arch_flags.is_gemma4) {
+                const int source = layer_spec ? layer_spec->attention.kv_source_layer
+                    : densecore::models::Gemma4KVSourceLayer(model, il);
+                const int storage = cache ? cache->head_dim : std::max(head_dim_q, head_dim_kv);
+                Qcur = MaybeAttachGemmaHeadSnapshot(ctx_c, model, Qcur, il, source, storage,
+                                                    gemma4_shared_kv_layer, "attn_query_normalized");
+                if (!gemma4_shared_kv_layer)
+                    Kcur = MaybeAttachGemmaHeadSnapshot(ctx_c, model, Kcur, il, source, storage,
+                                                        false, "attn_key_normalized");
             }
 
             if (densecore::models::ShouldApplyVNorm(model, Vcur, gemma4_shared_kv_layer)) {

@@ -60,6 +60,9 @@ constexpr uint32_t kFastAttentionSemanticLogitSoftcap = 1u << 0;
 
 PagedAttentionUserData* GetPagedAttentionUserData();
 
+ggml_tensor* MaybeAttachGemmaHeadSnapshot(ggml_context* ctx, TransformerModel* model, ggml_tensor* input,
+                                         int layer, int source_layer, int storage_dim, bool shared_reader,
+                                         const char* stage);
 struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     struct ggml_context* ctx_c, TransformerModel* model, PagedKVCache* cache, struct ggml_tensor* Qcur,
     struct ggml_tensor* Kcur, struct ggml_tensor* Vcur, int il, int kv_cache_layer, bool gemma4_shared_kv_layer,
@@ -92,7 +95,7 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
 #ifdef DENSECORE_TEST_BUILD
 namespace densecore::llm::attention::testing {
 ggml_tensor* AttachPagedInputSnapshotForTest(ggml_context* ctx, ggml_tensor* input, int layer,
-                                            int source_layer, int storage_dim, bool shared_reader);
+                                            int source_layer, int storage_dim, bool shared_reader, bool materialize = false);
 void ResetSharedPrefillFlashMaskBuildsForTest();
 uint64_t GetSharedPrefillFlashMaskBuildsForTest();
 void ExerciseSharedPrefillFlashMaskBuildForTest(bool native_flash_selected, int n_total_tokens, int n_tokens,

@@ -191,7 +191,24 @@ ggml_tensor* AttachPagedInputSnapshot(ggml_context* ctx, ggml_tensor* input, int
     return ggml_reshape_3d(ctx, captured, dim, heads, tokens);
 }
 
+ggml_tensor* AttachMaterializedPagedInputSnapshot(ggml_context* ctx, ggml_tensor* input, int layer,
+                                                  int source_layer, int storage_dim, bool shared_reader,
+                                                  const char* stage) {
+    if (!input || input->type != GGML_TYPE_F32)
+        throw std::invalid_argument("head snapshot requires F32 input");
+    auto* contiguous = ggml_is_contiguous(input) ? input : ggml_cont(ctx, input);
+    return AttachPagedInputSnapshot(ctx, contiguous, layer, source_layer, storage_dim, shared_reader, stage);
+}
+
 }  // namespace
+
+ggml_tensor* MaybeAttachGemmaHeadSnapshot(ggml_context* ctx, TransformerModel* model, ggml_tensor* input,
+                                         int layer, int source_layer, int storage_dim, bool shared_reader,
+                                         const char* stage) {
+    if (!model || !model->arch_flags.is_gemma4 ||
+        !densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(layer, stage)) return input;
+    return AttachMaterializedPagedInputSnapshot(ctx, input, layer, source_layer, storage_dim, shared_reader, stage);
+}
 
 struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     struct ggml_context* ctx_c, TransformerModel* model, PagedKVCache* cache, struct ggml_tensor* Qcur,
@@ -246,15 +263,12 @@ struct ggml_tensor* ExecutePagedDecodeAttentionPath(
     struct ggml_tensor* K_decode = ggml_is_contiguous(Kcur) ? Kcur : ggml_cont(ctx_c, Kcur);
     struct ggml_tensor* V_decode = ggml_is_contiguous(Vcur) ? Vcur : ggml_cont(ctx_c, Vcur);
     if (model && model->arch_flags.is_gemma4) {
-        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_query"))
-            Q_decode = AttachPagedInputSnapshot(ctx_c, Q_decode, il, kv_cache_layer, cache->head_dim,
-                                                gemma4_shared_kv_layer, "attn_query");
-        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_key"))
-            K_decode = AttachPagedInputSnapshot(ctx_c, K_decode, il, kv_cache_layer, cache->head_dim,
-                                                gemma4_shared_kv_layer, "attn_key");
-        if (densecore::llm::graph::detail::ShouldRunHiddenSnapshotProbe(il, "attn_value"))
-            V_decode = AttachPagedInputSnapshot(ctx_c, V_decode, il, kv_cache_layer, cache->v_head_dim,
-                                                gemma4_shared_kv_layer, "attn_value");
+        Q_decode = MaybeAttachGemmaHeadSnapshot(ctx_c, model, Q_decode, il, kv_cache_layer,
+                                                cache->head_dim, gemma4_shared_kv_layer, "attn_query");
+        K_decode = MaybeAttachGemmaHeadSnapshot(ctx_c, model, K_decode, il, kv_cache_layer,
+                                                cache->head_dim, gemma4_shared_kv_layer, "attn_key");
+        V_decode = MaybeAttachGemmaHeadSnapshot(ctx_c, model, V_decode, il, kv_cache_layer,
+                                                cache->v_head_dim, gemma4_shared_kv_layer, "attn_value");
     }
     const float paged_attn_scale = ResolveAttentionScaleForRuntime(head_dim_q, use_explicit_attention_scale);
 
@@ -456,8 +470,10 @@ struct ggml_tensor* ExecuteStandardAttentionPath(struct ggml_context* ctx_c, Tra
 namespace densecore::llm::attention::testing {
 
 ggml_tensor* AttachPagedInputSnapshotForTest(ggml_context* ctx, ggml_tensor* input, int layer,
-                                            int source_layer, int storage_dim, bool shared_reader) {
-    return AttachPagedInputSnapshot(ctx, input, layer, source_layer, storage_dim, shared_reader, "attn_query");
+                                            int source_layer, int storage_dim, bool shared_reader, bool materialize) {
+    return materialize
+        ? AttachMaterializedPagedInputSnapshot(ctx, input, layer, source_layer, storage_dim, shared_reader, "attn_query")
+        : AttachPagedInputSnapshot(ctx, input, layer, source_layer, storage_dim, shared_reader, "attn_query");
 }
 
 void ResetSharedPrefillFlashMaskBuildsForTest() {
