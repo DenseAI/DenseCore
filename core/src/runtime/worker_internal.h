@@ -161,6 +161,11 @@ void FinalizeDecodeSilentFinishReason(Request* req);
 void LogRequestDecodeSummary(const Request* req, const TransformerModel* model,
                              const densecore::TransformerGraphExecutionPlan* graph_plan = nullptr);
 bool HasDecodeVisibleProgressStalled(const Request* req, std::chrono::steady_clock::time_point now);
+// A cache/embedding capability is explicit: unknown callers retain the generic estimate.
+EngineState::GraphContextEstimate EstimateRuntimeGraphRequirement(
+    const TransformerModel* model, size_t context, size_t sequences, size_t query_per_sequence,
+    size_t total_queries, bool cached_generation,
+    const densecore::llm::config::FastPathRuntimeConfig* fast_path = nullptr);
 size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, size_t sequences,
                                  size_t query_per_sequence, size_t total_queries, size_t available_bytes);
 int ResolveQwen36PrefillChunkTokens(const TransformerModel* model, const Request* req);

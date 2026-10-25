@@ -939,3 +939,51 @@ TEST(MtpHeadMemory, ExpertMetadataScalesPerSessionButGraphAndBankRemainShared) {
     model.hparams.n_experts_used=257;
     EXPECT_THROW(CalculateHeadGraphMemory(model,16,2049),std::invalid_argument);
 }
+
+namespace {
+TransformerModel MakeE4BGraphBudgetShape() {
+    auto model = MakeModel(512, 2, 42, 512);
+    model.arch = ModelArch::GEMMA;
+    model.variant = ModelVariant::GEMMA4;
+    model.arch_flags.is_gemma4 = true;
+    model.hparams.n_embd = 2560;
+    model.hparams.n_head = 8;
+    model.hparams.n_vocab = 262144;
+    model.hparams.n_ctx = 131072;
+    model.hparams.n_ff = 10240;
+    model.gemma4_hidden_size_per_layer_input = 256;
+    model.gemma4_key_length_full = model.gemma4_value_length_full = 512;
+    model.gemma4_key_length_swa = model.gemma4_value_length_swa = 256;
+    return model;
+}
+}
+
+TEST(EngineKVCacheConfig, GemmaPagedGraphRequirementDoesNotGrowWithHostCapacity) {
+    auto model = MakeE4BGraphBudgetShape();
+    ScopedEnvVar min("DENSECORE_GRAPH_CTX_MIN_MB", nullptr);
+    ScopedEnvVar max("DENSECORE_GRAPH_CTX_MAX_MB", nullptr);
+    ScopedEnvVar extra("DENSECORE_GRAPH_CTX_EXTRA_MB", nullptr);
+    size_t low = 0;
+    {
+        ScopedEnvVar available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "3269");
+        low = EstimateRuntimeGraphRequirement(&model, 2048, 4, 1, 4, true).total_bytes;
+    }
+    ScopedEnvVar available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "4464");
+    EXPECT_EQ(EstimateRuntimeGraphRequirement(&model, 2048, 4, 1, 4, true).total_bytes, low)
+        << "A required paged graph geometry must not consume newly available RAM as nonexistent history tensors";
+}
+
+TEST(EngineKVCacheConfig, GemmaPagedDecodePlanFitsSnapshotResidualWithoutCuttingReserves) {
+    auto model = MakeE4BGraphBudgetShape();
+    ScopedEnvVar available("DENSECORE_GRAPH_CTX_AVAILABLE_MB_HINT", "4464");
+    constexpr size_t available_bytes = 4681576448ULL;
+    constexpr size_t kv = 748683264ULL;
+    constexpr size_t repack = available_bytes / 8;
+    constexpr size_t allocator = available_bytes / 16;
+    const size_t cache = DecodeGraphCacheCtxBytes();
+    const size_t pool_capacity = available_bytes - kv - repack - allocator - cache;
+    const auto pool = PlanRuntimeGraphPoolBytes(&model, 2048, 4, 1, 4, pool_capacity);
+    EXPECT_LE(pool, pool_capacity);
+    EXPECT_GE(pool, 1536ULL * 1024 * 1024);
+    EXPECT_LE(kv + repack + allocator + cache + pool, available_bytes);
+}

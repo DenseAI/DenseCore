@@ -2407,3 +2407,94 @@ TEST(Gemma4DecodeGraphTest, F32BatchedOuterStridesIgnorePoisonAndPreserveOutputG
         }
     }
 }
+
+#include "runtime/worker_internal.h"
+#include "llm/attention/callback_ops.h"
+void cb_kv_update_and_gather_custom(ggml_tensor*, int, int, void*);
+
+namespace {
+std::unique_ptr<TransformerModel> MakeE4BMetadataOnlyBudgetModel() {
+    auto m = std::make_unique<TransformerModel>();
+    m->arch=ModelArch::GEMMA; m->variant=ModelVariant::GEMMA4; m->arch_flags.is_gemma4=true;
+    auto& hp=m->hparams;hp.n_vocab=262144;hp.n_ctx=131072;hp.n_embd=2560;hp.n_layer=42;
+    hp.n_head=8;hp.n_head_kv=2;hp.n_embd_head_k=hp.n_embd_head_v=512;hp.n_rot=512;hp.n_ff=10240;
+    hp.f_norm_rms_eps=1e-6f;hp.rope_freq_base=1000000.f;hp.rope_freq_scale=1.f;
+    m->gemma4_sliding_window=512;m->gemma4_key_length_full=m->gemma4_value_length_full=512;
+    m->gemma4_key_length_swa=m->gemma4_value_length_swa=256;
+    m->gemma4_rope_dim_full=512;m->gemma4_rope_dim_swa=256;
+    m->gemma4_rope_freq_base_full=1000000.f;m->gemma4_rope_freq_base_swa=10000.f;
+    m->gemma4_hidden_size_per_layer_input=256;
+    ggml_init_params params{2*1024*1024,nullptr,true};m->ctx_w=ggml_init(params);
+    if(!m->ctx_w)throw std::runtime_error("weight descriptor context");
+    const auto norm=[&](int n){return ggml_new_tensor_1d(m->ctx_w,GGML_TYPE_F32,n);};
+    const auto weight=[&](int in,int out){return ggml_new_tensor_2d(m->ctx_w,GGML_TYPE_Q4_0,in,out);};
+    m->tok_embeddings=weight(2560,262144);m->output=m->tok_embeddings;m->output_norm=norm(2560);
+    m->gemma4_per_layer_token_embeddings=weight(256*42,262144);
+    m->gemma4_per_layer_model_projection=ggml_new_tensor_2d(m->ctx_w,GGML_TYPE_BF16,2560,256*42);
+    m->gemma4_per_layer_projection_norm=norm(256);
+    m->layers.resize(42);m->gemma4_layer_n_head_kv.assign(42,2);
+    for(int i=0;i<42;++i){
+        const bool sliding=i%6!=5;const int dim=sliding?256:512;
+        m->gemma4_layer_is_sliding.push_back(sliding);
+        m->gemma4_layer_kv_source.push_back(i<24?i:(sliding?22:23));
+        auto& l=m->layers[i];
+        l.Set(model_keys::kAttnNorm,norm(2560));l.Set(model_keys::kFfnNorm,norm(2560));
+        l.Set(model_keys::kAttnQWeight,weight(2560,8*dim));
+        if(i<24){l.Set(model_keys::kAttnKWeight,weight(2560,2*dim));l.Set(model_keys::kAttnVWeight,weight(2560,2*dim));}
+        l.Set(model_keys::kAttnOWeight,weight(8*dim,2560));
+        l.Set(model_keys::kFfnGate,weight(2560,10240));l.Set(model_keys::kFfnUp,weight(2560,10240));
+        l.Set(model_keys::kFfnDown,weight(10240,2560));
+        l.Set("attn_q_norm.weight",norm(dim));l.Set("attn_k_norm.weight",norm(dim));
+        l.Set("attn_post_norm.weight",norm(2560));l.Set("ffn_post_norm.weight",norm(2560));
+    }
+    return m;
+}
+}
+
+TEST(Gemma4GraphBudget, MetadataOnlyE4BGraphMeasuresPagedWidthsMixedAndPrefillWithoutHistoryTensors) {
+    // No model file, compute, weight payload, or KV arena is allocated. All
+    // descriptors have actual E4B geometry; no_alloc construction must not read weights.
+    auto model=MakeE4BMetadataOnlyBudgetModel();
+    for(const auto shape:std::vector<std::pair<int,int>>{{1,1},{2,1},{4,1},{8,1},{1,32},{4,32},{8,32},{1,256}}){
+        const auto [width,chunk]=shape;SCOPED_TRACE("width="+std::to_string(width)+" chunk="+std::to_string(chunk));
+        PagedKVCache cache{};cache.head_dim=cache.v_head_dim=512;cache.n_head_kv=2;cache.n_layer=42;
+        cache.max_blocks=128*width;cache.cache_type=GGML_TYPE_Q8_0;cache.layer_n_head_kv.assign(42,2);
+        for(int layer=0;layer<42;++layer){const int dim=layer%6==5?512:256;cache.layer_head_dims.push_back(dim);cache.layer_v_head_dims.push_back(dim);}
+        BatchSpec batch{};batch.num_seqs=width;batch.n_past.assign(width,2048-chunk);batch.block_tables.resize(width);
+        for(int seq=0;seq<width;++seq){
+            for(int block=0;block<128;++block)batch.block_tables[seq].push_back(seq*128+block);
+            const int queries=seq==0?chunk:1;
+            for(int q=0;q<queries;++q){batch.tokens.push_back(1);batch.seq_id.push_back(seq);batch.pos.push_back(batch.n_past[seq]+q);}
+        }
+        std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+        ASSERT_NE(work,nullptr);
+        struct Restore {InferenceWorkContext* old=GetCurrentWorkContext();~Restore(){SetCurrentWorkContext(old);}} restore;
+        SetCurrentWorkContext(work.get());ResetInferenceWorkContext(work.get());SetCurrentBatch(&batch);
+        SetCurrentExecutionPhase(chunk>1?InferenceExecutionPhase::Prefill:InferenceExecutionPhase::Decode);
+        work->graph_build_no_alloc=true;
+        ggml_init_params params{32*1024*1024,nullptr,true};
+        std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init(params),ggml_free);ASSERT_NE(ctx,nullptr);
+        auto* graph=ggml_new_graph_custom(ctx.get(),32768,false);
+        auto* output=BuildTransformerGraph(model.get(),&cache,ctx.get(),batch,false,graph);ASSERT_NE(output,nullptr);
+        int paged=0,gathers=0;
+        for(auto* t=ggml_get_first_tensor(ctx.get());t;t=ggml_get_next_tensor(ctx.get(),t)){
+            if(t->op!=GGML_OP_CUSTOM)continue;
+            ggml_custom_op_t fn=nullptr;std::memcpy(&fn,t->op_params,sizeof(fn));
+            paged+=fn==cb_paged_attention_decode;gathers+=fn==cb_kv_update_and_gather_custom;
+        }
+        EXPECT_EQ(paged,42);EXPECT_EQ(gathers,0);
+        // Mark external no-alloc weight descriptors AFTER graph construction.
+        // The sizing-only allocator sees external weights but never reads them.
+        alignas(64) static unsigned char external_weight_marker[64]{};
+        for(auto* t=ggml_get_first_tensor(model->ctx_w);t;t=ggml_get_next_tensor(model->ctx_w,t))t->data=external_weight_marker;
+        auto* allocator=ggml_gallocr_new(ggml_backend_cpu_buffer_type());ASSERT_NE(allocator,nullptr);
+        size_t backend=0;ggml_gallocr_reserve_n_size(allocator,graph,nullptr,nullptr,&backend);ggml_gallocr_free(allocator);
+        const auto estimate=EstimateRuntimeGraphRequirement(model.get(),2048,width,chunk,batch.tokens.size(),true);
+        std::cout<<"[E4BGraphBudget] width="<<width<<" chunk="<<chunk<<" queries="<<batch.tokens.size()
+                 <<" metadata="<<ggml_used_mem(ctx.get())<<" backend="<<backend<<" estimated="<<estimate.total_bytes<<std::endl;
+        EXPECT_GE(estimate.total_bytes,ggml_used_mem(ctx.get())+backend);
+        // Restore the sentinel before another graph is constructed: no native
+        // repack/fingerprint or data-dependent operation may see fake bytes.
+        for(auto* t=ggml_get_first_tensor(model->ctx_w);t;t=ggml_get_next_tensor(model->ctx_w,t))t->data=nullptr;
+    }
+}

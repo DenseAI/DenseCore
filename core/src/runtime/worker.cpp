@@ -595,6 +595,15 @@ int GetDebugFirstTokenSamplingLogitsOffset() {
     return value;
 }
 
+EngineState::GraphContextEstimate EstimateRuntimeGraphRequirement(
+    const TransformerModel* model, size_t context, size_t sequences, size_t query_per_sequence,
+    size_t total_queries, bool cached_generation,
+    const densecore::llm::config::FastPathRuntimeConfig* fast_path) {
+    (void)cached_generation;
+    (void)fast_path;
+    return EngineState::EstimateGraphContextSize(model,context,sequences,query_per_sequence,total_queries);
+}
+
 size_t PlanRuntimeGraphPoolBytes(const TransformerModel* model, size_t context, size_t sequences,
                                  size_t query_per_sequence, size_t total_queries, size_t available_bytes) {
     const auto estimate = EngineState::EstimateGraphContextSize(model,context,sequences,query_per_sequence,total_queries);
