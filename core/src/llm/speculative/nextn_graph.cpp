@@ -46,6 +46,34 @@ NextNGraph::NextNGraph(TransformerModel& source) : source_(source) {
         {model_keys::kFfnDown, "ffn_down.weight"},
     };
     for (const auto& binding : bindings) layer.Set(binding.canonical, required(binding.gguf));
+    const auto matrix = [&](const char* key, int64_t input, int64_t output) {
+        const auto* tensor = layer.Get(key);
+        if (!tensor || tensor->ne[0] != input || tensor->ne[1] != output || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            throw std::invalid_argument(std::string("MTP projection shape mismatch: ") + key);
+        }
+    };
+    const int64_t head_dim = source.hparams.n_embd_head_k;
+    const int64_t value_dim = source.hparams.n_embd_head_v;
+    if (head_dim < 1 || value_dim != head_dim || source.hparams.n_head_kv < 1 ||
+        source.hparams.n_head % source.hparams.n_head_kv != 0) {
+        throw std::invalid_argument("MTP requires equal K/V head dimensions and integral GQA");
+    }
+    matrix(model_keys::kAttnQWeight, embd, 2 * head_dim * source.hparams.n_head);
+    matrix(model_keys::kAttnKWeight, embd, head_dim * source.hparams.n_head_kv);
+    matrix(model_keys::kAttnVWeight, embd, value_dim * source.hparams.n_head_kv);
+    matrix(model_keys::kAttnOWeight, value_dim * source.hparams.n_head, embd);
+    const int64_t ffn = layer.Get(model_keys::kFfnGate)->ne[1];
+    matrix(model_keys::kFfnGate, embd, ffn);
+    matrix(model_keys::kFfnUp, embd, ffn);
+    matrix(model_keys::kFfnDown, ffn, embd);
+    for (const auto& norm : {std::pair<const char*, int64_t>{model_keys::kAttnNorm, embd},
+                             {model_keys::kFfnNorm, embd}, {model_keys::kAttnQNorm, head_dim},
+                             {model_keys::kAttnKNorm, head_dim}}) {
+        const auto* tensor = layer.Get(norm.first);
+        if (tensor->type != GGML_TYPE_F32 || ggml_nelements(tensor) != norm.second) {
+            throw std::invalid_argument(std::string("MTP norm shape/dtype mismatch: ") + norm.first);
+        }
+    }
     model_.tok_embeddings = head.Find("nextn.embed_tokens.weight");
     if (!model_.tok_embeddings) model_.tok_embeddings = source.tok_embeddings;
     model_.output_norm = head.Find("nextn.shared_head_norm.weight");

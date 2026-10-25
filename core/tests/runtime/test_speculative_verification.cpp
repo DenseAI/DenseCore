@@ -130,6 +130,16 @@ TEST(MtpConfiguration, KeepsAutomaticModeOffAndRejectsUnsupportedOrUnbudgetedExp
     EXPECT_FALSE(ConfigureSpeculation(&state, 1, 2, &error));
 }
 
+TEST(NextNGraph, RejectsMalformedHeadBeforeWorkerExecution) {
+    auto source = MakeTinyNextNSource();
+    auto* original = source->mtp_heads[0].tensors["attn_q.weight"];
+    source->mtp_heads[0].tensors["attn_q.weight"] = source->mtp_heads[0].tensors["ffn_up.weight"];
+    EXPECT_THROW(NextNGraph(*source), std::invalid_argument);
+    source->mtp_heads[0].tensors["attn_q.weight"] = original;
+    source->mtp_heads[0].tensors["attn_k_norm.weight"] = ggml_new_tensor_1d(source->ctx_w, GGML_TYPE_F16, 2);
+    EXPECT_THROW(NextNGraph(*source), std::invalid_argument);
+}
+
 TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
     auto owner = MakeTinyNextNSource();
     auto& source = *owner;
