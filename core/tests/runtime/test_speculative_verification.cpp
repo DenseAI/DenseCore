@@ -7,6 +7,9 @@
 #include "llm/sampling/sampling_rng.h"
 #include "densecore/runtime/scheduler.h"
 #include "llm/speculative/nextn_graph.h"
+#include "llm/speculative/reference_session.h"
+#include "runtime/speculation_config.h"
+#include "runtime/engine_internal.h"
 #include "ggml-cpu.h"
 #include <random>
 #include <stdexcept>
@@ -16,8 +19,9 @@
 namespace {
 using namespace densecore::llm::speculative;
 
-TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
-    TransformerModel source{};
+std::unique_ptr<TransformerModel> MakeTinyNextNSource() {
+    auto owner = std::make_unique<TransformerModel>();
+    auto& source = *owner;
     source.arch = ModelArch::QWEN35;
     source.variant = ModelVariant::QWEN35;
     source.arch_flags.is_hybrid_ssm = true;
@@ -34,7 +38,7 @@ TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
     source.hparams.n_layer = 4;
     source.hparams.n_ff = 2;
     source.ctx_w = ggml_init({1024 * 1024, nullptr, false});
-    ASSERT_NE(source.ctx_w, nullptr);
+    if (!source.ctx_w) throw std::bad_alloc();
     const auto weight = [&](int columns, int rows, float value) {
         auto* t = ggml_new_tensor_2d(source.ctx_w, GGML_TYPE_F32, columns, rows);
         std::fill_n(static_cast<float*>(t->data), columns * rows, value);
@@ -61,6 +65,74 @@ TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
         head.tensors[name] = weight(2, 2, 0);
     }
     head.tensors["attn_q.weight"] = weight(2, 4, 0); // [q | gate] per head
+    return owner;
+}
+
+TEST(MtpReferenceSession, VerifiesGreedyProposalsAndRecoversFromRejection) {
+    auto source = MakeTinyNextNSource();
+    auto* ctx = ggml_init({1024 * 1024, nullptr, false});
+    ASSERT_NE(ctx, nullptr);
+    auto* logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 1);
+    ReferenceSession session(*source, 16, 2, 1234, 1);
+    SamplingParams params;
+    params.temperature = 0;
+    std::vector<int> history;
+    params.token_history = &history;
+    std::atomic<bool> cancelled{false};
+    std::mt19937 rng(7);
+    const int prompt = 1;
+    const float first_hidden[] = {3, 4};
+    const float second_hidden[] = {4, 3};
+    const float first_logits[] = {1, 3};
+    const float second_logits[] = {3, 1};
+    session.ObserveTarget(&prompt, first_hidden, 2, 1, true);
+    std::memcpy(logits->data, first_logits, sizeof(first_logits));
+    EXPECT_EQ(session.Sample(logits, 0, params, rng, nullptr, cancelled), 1);
+    EXPECT_GT(session.Proposed(), 0u);
+    history.push_back(1);
+    session.ObserveTarget(&prompt, second_hidden, 2, 1, false);
+    std::memcpy(logits->data, second_logits, sizeof(second_logits));
+    EXPECT_EQ(session.Sample(logits, 0, params, rng, nullptr, cancelled), 0);
+    EXPECT_EQ(session.Accepted(), 0u);
+    history.push_back(0);
+    const int zero = 0;
+    session.ObserveTarget(&zero, second_hidden, 2, 1, false);
+    EXPECT_EQ(session.Sample(logits, 0, params, rng, nullptr, cancelled), 0);
+    EXPECT_EQ(session.Accepted(), 1u);
+    cancelled.store(true);
+    EXPECT_THROW(session.Sample(logits, 0, params, rng, nullptr, cancelled), std::runtime_error);
+    ggml_free(ctx);
+}
+
+TEST(MtpConfiguration, KeepsAutomaticModeOffAndRejectsUnsupportedOrUnbudgetedExplicitMode) {
+    EngineState state;
+    std::string error;
+    ASSERT_TRUE(ConfigureSpeculation(&state, 0, 2, &error));
+    EXPECT_EQ(state.speculation_selected.load(), 1);
+    EXPECT_FALSE(ConfigureSpeculation(&state, 2, 2, &error));
+    EXPECT_FALSE(ConfigureSpeculation(&state, 0, 4, &error));
+    auto entry = std::make_unique<ModelEntry>();
+    entry->model = MakeTinyNextNSource();
+    entry->kv_cache = std::make_unique<PagedKVCache>();
+    entry->kv_config.max_seq_len = 16;
+    entry->kv_config.max_num_seqs = 1;
+    entry->kv_config.memory_plan.available_bytes = 1;
+    state.default_model_id = "default";
+    state.models.emplace("default", std::move(entry));
+    EXPECT_FALSE(ConfigureSpeculation(&state, 2, 2, &error));
+    EXPECT_NE(error.find("required_bytes="), std::string::npos);
+    EXPECT_EQ(state.speculation_selected.load(), 1);
+    state.models["default"]->kv_config.memory_plan.available_bytes = 1024ULL * 1024 * 1024;
+    ASSERT_TRUE(ConfigureSpeculation(&state, 2, 2, &error)) << error;
+    EXPECT_EQ(state.speculation_selected.load(), 2);
+    EXPECT_EQ(state.speculation_max_context, 16);
+    EXPECT_GT(state.speculation_reserved_bytes, 64ULL * 1024 * 1024);
+    EXPECT_FALSE(ConfigureSpeculation(&state, 1, 2, &error));
+}
+
+TEST(NextNGraph, ExecutesHiddenTokenFusionAndSharedOutputHead) {
+    auto owner = MakeTinyNextNSource();
+    auto& source = *owner;
     NextNGraph nextn(source);
     std::unique_ptr<PagedKVCache> cache(InitPagedKVCache(&nextn.Model(), 1, 16, GGML_TYPE_F32, -1));
     ASSERT_NE(cache, nullptr);

@@ -566,6 +566,7 @@ endif()
 # Source files (DenseCore specific only)
 set(SOURCES
     src/runtime/engine.cpp
+    src/runtime/speculation_config.cpp
     src/runtime/request_builder.cpp
     src/runtime/worker.cpp
     src/runtime/worker_helpers.cpp
