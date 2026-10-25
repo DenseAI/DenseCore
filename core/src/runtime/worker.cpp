@@ -46,6 +46,7 @@
 #include "llm/attention/exec.h"
 #include "llm/config/runtime_config.h"
 #include "llm/graph/cache.h"
+#include "llm/sampling/sampling_errors.h"
 #include "llm/sampling/sampling_rng.h"
 #include "llm/speculative/reference_session.h"
 #include "llm/speculative/fair_schedule.h"
@@ -6266,7 +6267,21 @@ void EngineLoop(EngineState* state) {
                                 continue;
                             }
                         } else {
-                            best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params, req->SamplingRng());
+                            try {
+                                best_token = SampleTokenWithRng(output, sampling_logits_idx, sampling_params,
+                                                                req->SamplingRng());
+                            } catch (const densecore::llm::sampling::SamplingConstraintError& e) {
+                                const bool canceled = req->cancelled.load(std::memory_order_acquire);
+                                finalize_generation_error(
+                                    req, canceled ? DecodeFinishCause::RequestCanceled : DecodeFinishCause::GraphBuildFailed,
+                                    canceled ? "Error: request canceled"
+                                             : std::string("Error: Sampling constraints: ") + e.what(),
+                                    global_direct_callback);
+                                free_request_blocks(req);
+                                remove_request_from_scheduler(req, false);
+                                token_offset += processed_count;
+                                continue;
+                            }
                         }
                     }
                     if (state->speculation_selected.load(std::memory_order_acquire) == 2) {
