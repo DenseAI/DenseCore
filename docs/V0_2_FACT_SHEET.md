@@ -50,8 +50,12 @@ and [model catalog](MODEL_CATALOG.md).
 - Private Gemma `d4088c7` cache-ON c4 failed: rank-0 requests 1/5 produced 135 IDs
   against c1's 127, first difference index 52. Same-source cache-OFF, mixed and
   E4B matrices were not run. DEBUG `658e626` narrowed a surviving PLE delta;
-  Q4/F32 fixes and capture fixtures are now in `4ad6a35` native/ASAN. Historical
-  model failures remain recorded; current-source model requalification is separate.
+  Private `a9efe78` subsequently passes 20 E2B cache-ON/OFF c1/c4 raw-ID checks
+  and four staggered requests, each matching its own c1 complete answer/EOS.
+  E4B context2048/cap4 fails capacity before generation; a separately requested
+  cap1 profile passes one native long case, without a cap4 retry or silent reduction.
+  Q4/F32 fixes/fixtures are in `4ad6a35` native/ASAN. Private model outcomes do not
+  transfer automatically to root4ad6, broad support, HTTP or performance/default gates.
 - Separate Go-only `386b800` portable amd64 image passed actual container and
   kind strict drain: same-round readiness 503/new-admission 503/native active=1,
   accepted stream finish/DONE once, 7.596/7.903 seconds after signal commands

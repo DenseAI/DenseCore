@@ -39,8 +39,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   candidates. Private `d4088c7` E2B c4 parity still fails (rank-0 requests 1/5:
   135 versus 127 IDs, first difference 52). Same-source cache-OFF/mixed/E4B were
   not run. Private `658e626` DEBUG narrowed a surviving delta to F32 PLE projection
-  from identical input. Q4/F32 fixes and capture fixtures are now in `4ad6a35`
-  native/ASAN; source-matched model requalification remains separate.
+  from identical input. Private `a9efe78` then passes 20 E2B cache-ON/OFF
+  c1/c4 checks and four staggered requests against their own c1 IDs/final answers.
+  E4B context2048/cap4 fails capacity before generation; a separately requested
+  cap1 profile passes one native long case. Q4/F32 fixes and capture fixtures are
+  now in `4ad6a35` native/ASAN; private model results do not transfer automatically
+  to that root, broad Gemma support or performance/default qualification.
 - Correct shared-sampler top-k=0, conditional nucleus probabilities and grammar
   intersections with whitelist/range constraints. Mock-native full-worker
   NONE request error/peer/recovery checks pass. Common NONE/MTP JSON completion

@@ -47,9 +47,9 @@ Python tokenizer is available), not native prompt accounting.
 
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `4ad6a35` full native and 693-pass/9-skip critical ASAN; prior `143a2ad` Go/Python lifecycle | Prior actual c=8/Gemma parity failures remain unresolved; future functional fixes require new sanitizer/model qualification |
+| A | Integrated `4ad6a35` full native and 693-pass/9-skip critical ASAN; prior `143a2ad` Go/Python lifecycle | H c=8 parity failure remains unresolved. Private a9 Gemma passes retain their source boundary; future functional fixes require source-matched sanitizer/model qualification |
 | B/H | Resource/planner fixtures; earlier 4 GiB serving and explicit 1 GiB rejection without OOM kill; historical `7ecaf86` embedding AUTO/LAST 12 bitwise C/Python/HTTP comparisons | Actual `143a2ad` c=8 resource/cleanup evidence passes, but request isolation does not; final image/platform checks remain |
-| B Gemma | Historical E2B c1 and private `ad1aa84` checks retained; private `d4088c7` cache-ON c1 repeats pass but c4 parity is 6/8 | Rank-0 requests differ from c1. Cache-OFF/mixed/E4B were not run on d408. Q4/F32 fixes are in `4ad6a35` native/ASAN; model requalification remains separate |
+| B Gemma | Private `a9efe78` E2B cache-ON/OFF c1/c4 20 same-case checks and four staggered requests pass; historical ad1/d408 failures retained | a9 E4B cap4 capacity FAIL; separate cap1 one-case PASS. No broad Gemma/HTTP/default/performance qualification or automatic transfer to `4ad6a35` model proof |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
 | D | Historical `7ecaf86` greedy parity retained; integrated `4ad6a35` 0.8B/2B JSON NONE/MTP c1/c4 native+HTTP pass and actual probabilistic rejection/rollback/stop suppression | Current probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. Population distribution, speed, 35B MoE and auto qualification absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
@@ -83,6 +83,23 @@ outputs (about `4.77e-7` / `2.38e-7`). The later Q4/F32 fixes and capture fixtur
 are included in `4ad6a35` native/ASAN; source-matched model requalification remains
 separate. Diagnostic reproduction does not establish
 full-model isolation, absence of every observer effect, or model support.
+
+Private `a9efe78fec43c25f29510098a17f61cbe8dd9f55` subsequently passes the
+E2B formal cache-ON/OFF c1/c4 grid: 20 complete native requests all match the
+original 127-ID c1 baseline and EOS. With context2048, capacity4, Q8 KV, NONE,
+prefix OFF and requested threads8, a separate four-request staggered test also
+matches each case's own c1 raw IDs, complete answer and EOS. Submission timing
+proves overlapping request lifetimes, not a mixed physical graph. These actual
+private-source passes coexist with the earlier ad1/d408 failures; neither is
+silently substituted for the other or inherited by root `4ad6a35`.
+
+On the same private a9 source, E4B context2048/cap4 initialization fails explicitly
+before generation: required plan4,532,711,424 bytes versus available3,428,679,680.
+No request or c4 wave ran, and that profile was not reduced or retried. A separately
+requested PC context2048/cap1 profile passes one native long-answer case with
+59 sampled tokens and one STOP/terminal/completion. It is not a cap4, repeat,
+cache-OFF, HTTP, supported-RAM-range, broad-model or performance qualification.
+The capacity failure remains preserved; successful cap1 is a distinct profile.
 
 Private stop candidate `5ad54a5` completed 72 native requests, eight native
 cancel/recovery cases and eight HTTP disconnect/recovery cases. Its 32 configured
@@ -223,6 +240,10 @@ identities before publishing any claim; use the relative reproduction links abov
   `v02-h-integrated143-c8-ctx512-cache0-fixed8-control` native ledgers.
 - `v02-mtp-sampling-stop5ad-matrix-report.json`,
   `v02-stop5ad-native-stop-correlation.json`.
+- `v02-gemma-a9-native-isolation-summary.json`,
+  `v02-gemma-a9-staggered-isolation-summary.json`,
+  `v02-gemma-a9-e4b-capacity-result.json`, `v02-gemma-a9-e4b-pc-cap1-result.json`
+  bind the private `a9efe78` actual cases, capacity failure and separate cap1 pass.
 - `v02-gemma-e2b-ad1-native-comparison.json`,
   `v02-gemma-e2b-e966-projection-inputs-comparison.json`,
   `v02-gemma-d408-native-isolation-summary.json`,
