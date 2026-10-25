@@ -20,3 +20,28 @@ This tool is a request recorder and answer gate; it does not automatically infer
 a speedup. Public performance claims require matched five-block ABBA samples,
 A/A noise, same-engine token parity for state changes, and every required
 platform/concurrency cell passing independently.
+
+`check_prefix_parity.py` runs fresh native prefix-off/on processes against the
+same model/library bytes and records exact sampled token IDs, including stop
+tokens, together with authoritative generated counts. It checks fresh request
+#1/#4, submitted concurrency 1/2/4, fixed five-turn histories, cancellation and
+recovery, and a cache-pressure sequence. It requires actual hit, skipped-prefill,
+and hybrid snapshot restoration counters. Submitted concurrency may serialize
+on models whose runtime requires exclusive execution.
+
+```bash
+python3 benchmarks/personal/check_prefix_parity.py \
+  --library build/libdensecore.so --model /path/to/model.gguf \
+  --server bin/densecore-server --build-lock /path/to/shared-build.lock \
+  --context 2048 --concurrency 1 2 4 --churn 128 --require-eviction \
+  --out /tmp/prefix-parity
+```
+
+The optional server probe validates complete final chat answers with
+`cache_prompt=true`; text found only in reasoning and truncated answers fail.
+Without `--server`, the report explicitly leaves HTTP final answers unverified.
+`--require-eviction` requires an identical probe that previously hit the cache to
+become a miss after pressure; retaining all probes is an unverified eviction
+gate, even if token parity passes. Increase `--churn` as needed for the configured
+KV capacity. Every request, raw native log and HTTP response is preserved in the
+output directory. This tool does not enable model defaults or establish speed.
