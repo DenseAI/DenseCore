@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 #include "densecore/backend/flash_attention.h"
@@ -2339,4 +2340,70 @@ TEST(Gemma4DecodeGraphTest, CanonicalPleF32AdmissionRequiresActualRoleShapeAndFa
     auto* global_bf16=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_BF16,1536,8960);
     model->layers[0].Set(model_keys::kGemma4PerLayerInputGate,global_bf16);
     EXPECT_FALSE(densecore::testing::IsGemma4PleF32ProjectionForTest(model.get(),global_bf16));
+}
+
+TEST(Gemma4DecodeGraphTest, F32BatchedOuterStridesIgnorePoisonAndPreserveOutputGuards) {
+    constexpr int reduction=32,outputs=16,columns=4,tail=16;
+    constexpr float output_poison=-7777.f;
+    for(int threads:{1,4,5,8}) for(bool input_padded:{false,true}) for(bool output_padded:{false,true}) {
+        SCOPED_TRACE(threads);
+        SCOPED_TRACE(input_padded);
+        SCOPED_TRACE(output_padded);
+        std::vector<float> previous;
+        for(float input_poison:{12345.f,-23456.f}) {
+            SCOPED_TRACE(input_poison);
+            const int input_stride=reduction+(input_padded?16:0);
+            const int output_stride=outputs+(output_padded?8:0);
+            std::vector<float> input(input_stride*columns+tail,input_poison);
+            std::vector<float> output(output_stride*columns+tail,output_poison);
+            std::vector<float> weight(reduction*outputs,0.f),expected(columns*outputs);
+            for(int col=0;col<columns;++col)for(int i=0;i<reduction;++i)
+                input[col*input_stride+i]=float(1+i+col*37);
+            for(int row=0;row<outputs;++row)weight[row*reduction+(row*3+1)%reduction]=1.f;
+            // Independent dense logical reference: exact small integer products
+            // isolate addressing from SIMD reduction/rounding differences.
+            for(int col=0;col<columns;++col)for(int row=0;row<outputs;++row) {
+                double sum=0;
+                for(int i=0;i<reduction;++i)sum+=double(input[col*input_stride+i])*weight[row*reduction+i];
+                expected[col*outputs+row]=static_cast<float>(sum);
+            }
+            const auto input_before=input,weight_before=weight;
+            ggml_tensor src{},weights{},dst{};
+            const auto set=[](ggml_tensor& tensor,int width,int rows,int stride,void* data) {
+                tensor.type=GGML_TYPE_F32;tensor.data=data;
+                tensor.ne[0]=width;tensor.ne[1]=rows;tensor.ne[2]=tensor.ne[3]=1;
+                tensor.nb[0]=sizeof(float);tensor.nb[1]=stride*sizeof(float);
+                tensor.nb[2]=rows*tensor.nb[1];tensor.nb[3]=tensor.nb[2];
+            };
+            set(src,reduction,columns,input_stride,input.data());
+            set(weights,reduction,outputs,reduction,weight.data());
+            set(dst,outputs,columns,output_stride,output.data());
+            dst.src[0]=&src;dst.src[1]=&weights;
+            std::unique_ptr<InferenceWorkContext,decltype(&DestroyInferenceWorkContext)> work(CreateInferenceWorkContext(),DestroyInferenceWorkContext);
+            ResetInferenceWorkContext(work.get());
+            BatchSpec batch{};batch.num_seqs=columns;batch.tokens.assign(columns,0);
+            for(int col=0;col<columns;++col){batch.seq_id.push_back(col);batch.pos.push_back(41+col);batch.n_past.push_back(41+col);}
+            BindInferenceWorkContextBatch(work.get(),&batch);
+            SetInferenceWorkContextPhase(work.get(),InferenceExecutionPhase::Prefill);
+            GemvBatchedUserData userdata{};
+            userdata.weight_tensor=&weights;userdata.N=reduction;userdata.K=outputs;userdata.M=columns;
+            userdata.weight_type=GGML_TYPE_F32;userdata.input_quant_type=GGML_TYPE_F32;userdata.work_ctx=work.get();
+            std::vector<std::thread> workers;
+            for(int ith=0;ith<threads;++ith)workers.emplace_back([&,ith]{cb_gemv_batched_custom(&dst,ith,threads,&userdata);});
+            for(auto& worker:workers)worker.join();
+            std::vector<float> actual;
+            bool guards_intact=true;
+            for(int col=0;col<columns;++col) {
+                actual.insert(actual.end(),output.begin()+col*output_stride,output.begin()+col*output_stride+outputs);
+                for(int i=outputs;i<output_stride;++i)guards_intact &= output[col*output_stride+i]==output_poison;
+            }
+            for(size_t i=output_stride*columns;i<output.size();++i)guards_intact &= output[i]==output_poison;
+            EXPECT_EQ(actual,expected);
+            EXPECT_TRUE(guards_intact) << "dense output indexing overwrote padded guard rows";
+            EXPECT_EQ(input,input_before);
+            EXPECT_EQ(weight,weight_before);
+            if(!previous.empty())EXPECT_EQ(actual,previous) << "logical result depends on input padding poison";
+            previous=std::move(actual);
+        }
+    }
 }
