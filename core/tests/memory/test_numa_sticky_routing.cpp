@@ -1900,19 +1900,11 @@ TEST(NumaStickyRouting, RepackedDenseGemmMatchesVecDotForKQuants) {
     }
 }
 
-// DISABLED: this test is a working reproducer for a PRE-EXISTING heap
-// corruption in ForwardMoE at batch_size > 1 -- running it makes the next
-// MoE test segfault inside getenv() because environ has been clobbered.
-// Verified pre-existing: the crash reproduces with the per-token quantized
-// activation cache in cpu_backend_moe_ops.cpp reverted to its previous
-// batch_size == 1 form. Re-enable once that corruption is fixed; until then
-// it stays here as the reproducer rather than being deleted.
-// Repro: ./densecore_tests --gtest_filter='NumaStickyRouting.DISABLED_ForwardMoESmallDecodeBatchMatchesPerTokenDecode:NumaStickyRouting.ForwardMoEGgmlQuantizedGeneralPathFallsBackToDenseDequantForWideExpertBatches' --gtest_also_run_disabled_tests
-TEST(NumaStickyRouting, DISABLED_ForwardMoESmallDecodeBatchMatchesPerTokenDecode) {
-    // A concurrent decode batch must produce exactly what each token would have
-    // produced on its own. This covers the per-token shared quantized-activation
-    // cache on the small-decode MoE lane: with one cache per token, picking the
-    // wrong row would silently feed token A's hidden state to token B's expert.
+// Regression for cross-token state isolation in batch>1 MoE. The previously
+// reported heap corruption did not reproduce in the current ext4 Release run
+// or 20 repeated ASAN runs; keep this case active rather than hiding it.
+TEST(NumaStickyRouting, ForwardMoESmallDecodeBatchMatchesPerTokenDecode) {
+    // Distinct tokens and expert pairs expose accidentally shared activation rows.
     CpuBackend& backend = GetCpuBackend();
     constexpr int batch = 4;
     constexpr int top_k = 2;
