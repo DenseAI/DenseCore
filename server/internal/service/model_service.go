@@ -204,6 +204,11 @@ func (s *ModelService) loadModelBlueGreen(mainModelPath, draftModelPath string, 
 	// Step 1: Initialize new engine (old engine still serves requests)
 	newEngine, err := engine.NewDenseEngine(mainModelPath, draftModelPath, threads)
 	if err != nil {
+		// A cold start has no old engine to release. Retrying the same model
+		// immediately repeats an expensive deterministic initialization failure.
+		if !s.hasCurrentEngine() {
+			return err
+		}
 		log.Printf("[ModelService] Failed to load new engine, falling back to force mode: %v", err)
 		// If Blue/Green fails (e.g., OOM), fall back to force mode
 		return s.loadModelForce(mainModelPath, draftModelPath, threads)
