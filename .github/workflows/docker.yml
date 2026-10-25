@@ -96,6 +96,7 @@ jobs:
           bash scripts/check_version_consistency.sh "${{ inputs.version }}"
           bash scripts/resolve_release_cpu_target.sh "${{ matrix.target }}"
       - name: Build native image
+        id: native_image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -126,8 +127,15 @@ jobs:
           echo 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec  /tmp/Qwen3.5-0.8B-Q4_K_M.gguf' | sha256sum --check --strict
       - name: Real-model serving, limits and active drain
         run: bash scripts/container_model_smoke.sh densecore:scan /tmp/Qwen3.5-0.8B-Q4_K_M.gguf 18080
+      - name: Preserve real-model container phase evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-smoke-${{ matrix.profile }}
+          path: /tmp/densecore-container-smoke.*
+          if-no-files-found: warn
       - name: Build downloader and test installed chart on kind
-        if: matrix.profile == 'portable-amd64'
+        if: always() && matrix.profile == 'portable-amd64' && steps.native_image.outcome == 'success'
         run: |
           set -euo pipefail
           docker tag densecore:scan densecore:local
