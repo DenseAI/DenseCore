@@ -55,6 +55,11 @@ def compare(groups, require_eviction=False):
                 failures.append(f"{mode}/{row['label']}: same prompt differs across scheduling/concurrency")
         if not group.get('cancellation', {}).get('passed'):
             failures.append(f'{mode}: cancellation/recovery evidence missing')
+        for row in group.get('churn_requests', []):
+            try:
+                validate_native(row)
+            except ValueError as error:
+                failures.append(f"{mode}/{row['label']}: cache pressure request failed: {error}")
         repeat = [row for row in group['requests'] if row['label'] in ('repeat1', 'repeat4')]
         if len(repeat) != 2 or repeat[0]['token_ids'] != repeat[1]['token_ids']:
             failures.append(f'{mode}: fresh process #1/#4 exact IDs differ')
@@ -124,7 +129,9 @@ def child(args):
             lib.CancelRequest(handle, request)
             raise TimeoutError(f'{label} failed to terminate')
         row['wall_seconds'] = time.monotonic() - started
-        return {k: v for k, v in row.items() if k not in ('done', 'first_token')}
+        exported = {k: v for k, v in row.items() if k not in ('done', 'first_token')}
+        if not cancel: validate_native(exported)
+        return exported
 
     # Fixed history avoids mode-specific answers changing later prompt bytes.
     system = 'You are a concise geography assistant. Give only the requested city name. ' * 8
@@ -163,11 +170,15 @@ def child(args):
         for i in range(args.churn):
             result['churn_requests'].append(submit(f'churn{i}', f'Cache pressure document {i}. ' * 24 + question('France')))
         result['requests'].append(submit('after-churn', probe))
-    except Exception as error:
+    except BaseException as error:
         result['error'] = str(error)
         raise
     finally:
         lib.FreeEngine(handle)
+        # Preserve the failing/in-flight row too, even when validation stops a
+        # pressure wave or an operator interrupts a repeated scheduling stall.
+        result['all_requests'] = [{k: v for k, v in row.items() if k not in ('done', 'first_token')}
+                                  for row in records.values()]
         write(args.out, result)
 
 

@@ -44,6 +44,12 @@ class PrefixEvidenceTest(unittest.TestCase):
         self.assertTrue(any('c4 request matrix incomplete' in x for x in failures))
         self.assertTrue(any('cancellation/recovery' in x for x in failures))
 
+    def test_cache_pressure_errors_cannot_pass_on_early_parity(self):
+        groups = valid_groups()
+        groups['on']['churn_requests'] = [{'label': 'churn42', 'terminal_events': 1,
+            'token_ids': [], 'generated_tokens': 0, 'finish_reason': 3}]
+        self.assertTrue(any('cache pressure request failed' in x for x in compare(groups)))
+
     def test_restore_hit_and_skipped_tokens_are_each_required(self):
         for field in ('hits', 'restores', 'skipped_tokens'):
             groups = valid_groups()
