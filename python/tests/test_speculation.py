@@ -75,3 +75,12 @@ def test_runtime_plan_preserves_native_selection_reason_and_reservations():
     assert result["effective_concurrency"] == 2
     assert result["mtp_bytes"] == 1024
     assert result["spec_reason"] == "explicit reference"
+
+
+def test_versioned_initialization_preserves_legacy_default_kv_policy():
+    class Library:
+        def InitEngineWithOptions(self, path, reserved, threads, numa, pinning, kv_type, options):
+            assert kv_type == -1
+            return 42
+
+    assert initialize_native(Library(), b"model.gguf", 2, 0, init_options()) == 42

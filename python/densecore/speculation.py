@@ -25,7 +25,10 @@ def init_options(spec_type: str = "auto", spec_draft_n_max: int = 2) -> NativeIn
 def initialize_native(lib, model_path: bytes, threads: int, kv_type: int, options: NativeInitOptions):
     """Use the additive API, while keeping ordinary decode on older libraries."""
     if hasattr(lib, "InitEngineWithOptions"):
-        return lib.InitEngineWithOptions(model_path, None, threads, -1, 0, kv_type, ctypes.byref(options))
+        # The original Python fp16 default called InitEngine, which retains
+        # model-specific native KV defaults (for example Gemma's Q8 policy).
+        native_kv_type = -1 if kv_type == 0 else kv_type
+        return lib.InitEngineWithOptions(model_path, None, threads, -1, 0, native_kv_type, ctypes.byref(options))
     if options.spec_type == 2:
         raise RuntimeError("explicit mtp requires a native library with InitEngineWithOptions")
     if kv_type != 0:
