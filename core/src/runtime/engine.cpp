@@ -436,8 +436,9 @@ KVCacheConfig ComputeSafeKVCacheConfig(const TransformerModel* model, ggml_type 
     auto resources = densecore::runtime::DetectResourceBudget();
     const char* hint = std::getenv("DENSECORE_KV_AVAILABLE_MB_HINT");
     uint64_t hint_mb = 0;
-    if (hint && densecore::runtime::ResourceUnsigned(hint,hint_mb) && hint_mb <= SIZE_MAX/(1024*1024))
-        resources.memory = {densecore::runtime::ResourceState::Finite, hint_mb*(1024*1024)};
+    if (hint && densecore::runtime::ResourceUnsigned(hint,hint_mb) && hint_mb <= SIZE_MAX/(1024*1024) &&
+        resources.memory.state == densecore::runtime::ResourceState::Finite)
+        resources.memory.bytes = std::min<uint64_t>(resources.memory.bytes,hint_mb*(1024*1024));
     if (resources.memory.state != densecore::runtime::ResourceState::Finite) {
 #if defined(__linux__)
         throw densecore::OutOfMemoryException("resource memory availability unknown; cannot safely initialize");
