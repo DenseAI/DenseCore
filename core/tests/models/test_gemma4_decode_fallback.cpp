@@ -11,6 +11,7 @@
 
 #include "densecore/backend/flash_attention.h"
 #include "runtime/inference_types_internal.h"
+#include "llm/runtime/work_context_internal.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "llm/graph/checked_ops.h"
