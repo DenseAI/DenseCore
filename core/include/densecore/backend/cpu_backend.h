@@ -608,6 +608,9 @@ public:
      */
     void RegisterMoEExperts(const std::vector<ExpertWeights>& experts);
     void RegisterMoEExperts(const TransformerLayer* layer_key, const std::vector<ExpertWeights>& experts);
+    // Retire before releasing a model's immutable weights. Stops background
+    // rebalancing so no copied registry reference can outlive the weights.
+    void UnregisterMoEExperts(const TransformerLayer* layer_key);
 
     /**
      * @brief Get registered expert weights (thread-safe)
@@ -725,6 +728,9 @@ private:
     struct MoELayerRegistry {
         struct DequantizedExpertCacheEntry {
             int expert_id = -1;
+            ExpertWeights source{};
+            bool source_safe_reference = false;
+            bool source_materialized_f32 = false;
             size_t bytes = 0;
             uint64_t last_used = 0;
             simd::AlignedVector<float> w1;

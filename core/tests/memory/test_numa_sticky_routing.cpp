@@ -4056,3 +4056,69 @@ TEST(NumaStickyRouting, ThreadPoolPropagatesCallbackExceptionsAndRemainsReusable
         EXPECT_EQ(visits.load(), 64);
     }
 }
+
+TEST(NumaStickyRouting, DequantCacheRejectsExpertReplacementAndRetiresRegistrationLifetime) {
+    CpuBackend& backend = GetCpuBackend();
+    TransformerLayer layer;
+    struct Retire {
+        CpuBackend& backend;
+        TransformerLayer& layer;
+        ~Retire() { backend.UnregisterMoEExperts(&layer); }
+    } retire{backend, layer};
+    constexpr int batch = 8;
+    auto first = BuildQuantizedExpertFixture(batch, 64, 128, GGML_TYPE_Q4_0, 3211);
+    auto smaller = BuildQuantizedExpertFixture(batch, 32, 64, GGML_TYPE_Q4_0, 3212);
+    auto replacement = BuildQuantizedExpertFixture(batch, 32, 64, GGML_TYPE_Q4_0, 3213);
+    auto run = [&](QuantizedExpertFixture& fixture) {
+        const int hidden = fixture.expert.hidden_dim, intermediate = fixture.expert.intermediate_dim;
+        moe::MoERouteResult routing;
+        routing.batch_size = batch;
+        routing.top_k = 1;
+        for (int token = 0; token < batch; ++token) {
+            routing.expert_ids.push_back(0);
+            routing.weights.push_back(1.0f);
+            routing.token_indices.push_back(token);
+        }
+        std::vector<float> actual(batch * hidden), expected(batch * hidden);
+        Tensor input = Tensor::Make2D(fixture.input.data(), batch, hidden);
+        Tensor output = Tensor::Make2D(actual.data(), batch, hidden);
+        backend.ForwardMoE(&layer, input, routing, std::vector<CpuBackend::ExpertWeights>{fixture.expert}, &output);
+        DenseExpertReference(fixture.input.data(), fixture.w1_ref.data(), fixture.w2_ref.data(), fixture.w3_ref.data(),
+                             expected.data(), batch, hidden, intermediate);
+        for (size_t i = 0; i < actual.size(); ++i) EXPECT_NEAR(actual[i], expected[i], 2e-3f) << "index=" << i;
+    };
+    backend.InitMoEProfiler(&layer, 1);
+    backend.RegisterMoEExperts(&layer, {first.expert});
+    backend.GetMoEProfiler(&layer)->SetExpertNumaNode(0, 0);
+    const auto before = backend.GetMoERuntimeStatsSnapshot().total_cached_experts;
+    run(first);
+    run(first);
+    EXPECT_GT(backend.GetMoERuntimeStatsSnapshot().total_cached_experts, before);
+    // Same registry/expert ID with a new shape must never return old tensors.
+    run(smaller);
+    // The same shape with different weight bytes/source pointers must also miss.
+    run(replacement);
+    // Explicit lifetime retirement permits allocator address reuse. Keep all
+    // buffer addresses stable while replacing their contents for a new model.
+    backend.UnregisterMoEExperts(&layer);
+    std::copy(replacement.w1_quant.begin(), replacement.w1_quant.end(), smaller.w1_quant.begin());
+    std::copy(replacement.w2_quant.begin(), replacement.w2_quant.end(), smaller.w2_quant.begin());
+    std::copy(replacement.w3_quant.begin(), replacement.w3_quant.end(), smaller.w3_quant.begin());
+    smaller.w1_ref = replacement.w1_ref;
+    smaller.w2_ref = replacement.w2_ref;
+    smaller.w3_ref = replacement.w3_ref;
+    backend.InitMoEProfiler(&layer, 1);
+    backend.RegisterMoEExperts(&layer, {smaller.expert});
+    backend.GetMoEProfiler(&layer)->SetExpertNumaNode(0, 0);
+    run(smaller);
+}
+
+TEST(NumaStickyRouting, MatMulTransBRejectsOutputShapeMismatchBeforeWriting) {
+    CpuBackend& backend = GetCpuBackend();
+    std::vector<float> a(4, 1.0f), b(12, 1.0f), output(4, 99.0f);
+    Tensor A = Tensor::Make2D(a.data(), 1, 4);
+    Tensor B = Tensor::Make2D(b.data(), 3, 4);
+    Tensor C = Tensor::Make2D(output.data(), 1, 2);
+    EXPECT_ANY_THROW(backend.MatMulTransB(A, B, &C, 0));
+    EXPECT_EQ(output, std::vector<float>(4, 99.0f));
+}

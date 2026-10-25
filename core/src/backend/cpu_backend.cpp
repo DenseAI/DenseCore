@@ -1213,6 +1213,10 @@ void CpuBackend::MatMulTransB(const Tensor& A, const Tensor& B, Tensor* C, int n
         if (M <= 0 || K <= 0 || N <= 0) {
             return;
         }
+        if (A.ndim != 2 || B.ndim != 2 || C->ndim != 2 || B.shape[1] != K ||
+            C->shape[0] != M || C->shape[1] != N) {
+            throw BackendException("MatMulTransB: incompatible input/weight/output shapes");
+        }
 
         const float* a_data = A.DataAs<float>();
         const float* b_data = B.DataAs<float>();

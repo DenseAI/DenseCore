@@ -1584,6 +1584,13 @@ struct EngineState {
         cpu->SetOpRegistry(op_registry.get());
     }
 
+    void RetireModelMoERegistries(const TransformerModel* model) {
+        if (!model || !backend_registry) return;
+        auto* cpu = dynamic_cast<densecore::CpuBackend*>(backend_registry->Get(densecore::DeviceType::CPU));
+        if (!cpu) return;
+        for (const auto& layer : model->layers) cpu->UnregisterMoEExperts(&layer);
+    }
+
     // Multi-model pool
     std::map<std::string, std::unique_ptr<ModelEntry>> models;  // Smart pointer ownership
     std::string default_model_id;
@@ -2456,6 +2463,7 @@ struct EngineState {
         // Cleanup all models - smart pointers handle automatic cleanup
         {
             std::lock_guard<std::mutex> lock(models_mu);
+            for (const auto& item : models) RetireModelMoERegistries(item.second->model.get());
             models.clear();
         }
 

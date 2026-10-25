@@ -1616,6 +1616,7 @@ int UnloadModel(DenseCoreHandle handle, const char* model_id) {
         return DENSECORE_STATUS_INVALID_ARGUMENT;  // Cannot unload last model
     }
 
+    state->RetireModelMoERegistries(it->second->model.get());
     state->models.erase(it);
 
     // Update default if needed

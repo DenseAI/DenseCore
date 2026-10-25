@@ -1,6 +1,7 @@
 #include "densecore/runtime/resource_ledger.h"
 #include "densecore/runtime/resource_budget.h"
 #include "backend/cpu_backend_internal.h"
+#include "backend/moe_weight_identity.h"
 #include "backend/cpu_moe_execution.h"
 #include "backend/cpu_backend_moe_forward_plan.h"
 #include "backend/cpu_backend_moe_projection.h"
@@ -1257,8 +1258,11 @@ void CpuBackend::ForwardMoE(const CpuExecutionOptions& options, const Transforme
         return;
     }
 
+    // A null layer key has no immutable model-registration lifetime. Direct
+    // callers may replace or reuse their buffers between invocations.
     const bool dequant_cache_enabled =
-        internal::IsMoEDequantCacheEnabled() && registry != nullptr && !arm_disable_registry_dequant_cache;
+        internal::IsMoEDequantCacheEnabled() && registry != nullptr && layer_key != nullptr &&
+        !arm_disable_registry_dequant_cache;
     const bool cache_all_active_experts = internal::ShouldCacheAllActiveExperts();
     const size_t dequant_cache_budget = internal::GetMoEDequantCacheBytes();
     const auto get_or_create_dequant_cache_entry = [&](int expert_id, const ExpertWeights& exp, size_t cacheable_bytes,
@@ -1274,8 +1278,15 @@ void CpuBackend::ForwardMoE(const CpuExecutionOptions& options, const Transforme
             auto it = registry->dequant_cache.find(expert_id);
             if (it != registry->dequant_cache.end()) {
                 existing_entry = it->second;
-                if (existing_entry) {
+                if (existing_entry && internal::SameExpertSource(existing_entry->source, exp) &&
+                    existing_entry->source_safe_reference == safe_reference_mode &&
+                    existing_entry->source_materialized_f32 == materialize_f32) {
                     existing_entry->last_used = ++registry->dequant_cache_use_counter;
+                } else {
+                    if (existing_entry)
+                        registry->dequant_cache_bytes -= std::min(registry->dequant_cache_bytes, existing_entry->bytes);
+                    registry->dequant_cache.erase(it);
+                    existing_entry.reset();
                 }
             }
         }
@@ -1285,6 +1296,9 @@ void CpuBackend::ForwardMoE(const CpuExecutionOptions& options, const Transforme
 
         auto candidate = std::make_shared<MoELayerRegistry::DequantizedExpertCacheEntry>();
         candidate->expert_id = expert_id;
+        candidate->source = exp;
+        candidate->source_safe_reference = safe_reference_mode;
+        candidate->source_materialized_f32 = materialize_f32;
         candidate->bytes = cacheable_bytes;
         PopulateMoEDequantCacheEntry(candidate.get(), exp, safe_reference_mode, materialize_f32);
 
@@ -1292,10 +1306,18 @@ void CpuBackend::ForwardMoE(const CpuExecutionOptions& options, const Transforme
         auto it = registry->dequant_cache.find(expert_id);
         if (it != registry->dequant_cache.end()) {
             cached_entry = it->second;
-            if (cached_entry) {
+            if (cached_entry && internal::SameExpertSource(cached_entry->source, exp) &&
+                cached_entry->source_safe_reference == safe_reference_mode &&
+                cached_entry->source_materialized_f32 == materialize_f32) {
                 cached_entry->last_used = ++registry->dequant_cache_use_counter;
+                return cached_entry;
             }
-        } else if (candidate->bytes <= dequant_cache_budget) {
+            if (cached_entry)
+                registry->dequant_cache_bytes -= std::min(registry->dequant_cache_bytes, cached_entry->bytes);
+            registry->dequant_cache.erase(it);
+            cached_entry.reset();
+        }
+        if (candidate->bytes <= dequant_cache_budget) {
             while (registry->dequant_cache_bytes + candidate->bytes > dequant_cache_budget &&
                    !registry->dequant_cache.empty()) {
                 auto evict_it = registry->dequant_cache.end();

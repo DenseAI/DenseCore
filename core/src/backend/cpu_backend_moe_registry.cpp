@@ -1,3 +1,4 @@
+#include "backend/moe_weight_identity.h"
 #include "backend/cpu_backend_internal.h"
 
 namespace densecore {
@@ -798,10 +799,7 @@ void CpuBackend::RegisterMoEExperts(const TransformerLayer* layer_key, const std
         for (size_t i = 0; i < a.size(); ++i) {
             const ExpertWeights& lhs = a[i];
             const ExpertWeights& rhs = b[i];
-            if (lhs.w1.ptr != rhs.w1.ptr || lhs.w2.ptr != rhs.w2.ptr || lhs.w3.ptr != rhs.w3.ptr ||
-                lhs.w1.size != rhs.w1.size || lhs.w2.size != rhs.w2.size || lhs.w3.size != rhs.w3.size ||
-                lhs.hidden_dim != rhs.hidden_dim || lhs.intermediate_dim != rhs.intermediate_dim ||
-                lhs.numa_node_hint != rhs.numa_node_hint) {
+            if (!internal::SameExpertSource(lhs, rhs) || lhs.numa_node_hint != rhs.numa_node_hint) {
                 return false;
             }
         }
@@ -873,6 +871,13 @@ void CpuBackend::RegisterMoEExperts(const TransformerLayer* layer_key, const std
 
     std::cerr << "[CpuBackend] Registered " << experts.size() << " MoE experts for layer " << layer_key
               << " NUMA rebalancing" << std::endl;
+}
+
+void CpuBackend::UnregisterMoEExperts(const TransformerLayer* layer_key) {
+    StopRebalanceThread();
+    std::lock_guard<std::mutex> rebalance_lock(rebalance_mutex_);
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    moe_registries_.erase(layer_key);
 }
 
 std::vector<CpuBackend::ExpertWeights> CpuBackend::GetRegisteredExperts() const {
