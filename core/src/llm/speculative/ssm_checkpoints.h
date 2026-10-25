@@ -94,6 +94,7 @@ public:
     // recorder while its graph is executing is forbidden.
     void Prepare(size_t positions, size_t channels, size_t kernel, size_t heads, size_t head_k, size_t head_v,
                   int sequence_id = 0) {
+        if (sequence_id < 0) throw std::invalid_argument("SSM checkpoint sequence must be nonnegative");
         const size_t bytes = RequiredBytes(positions, channels, kernel, heads, head_k, head_v);
         const size_t conv_elements = Multiply(channels, kernel - 1);
         const size_t head_elements = Multiply(head_k, head_v);
@@ -148,12 +149,15 @@ public:
                std::all_of(state_begin, state_begin + view_.heads, [](uint8_t value) { return value != 0; });
     }
 
+    bool CanRestore(size_t slot, const ssm::SSMSequenceRuntimeState& state) const {
+        return Complete(slot) && state.conv_state.size() == view_.channels * view_.history &&
+               state.ssm_state.size() == view_.heads * view_.head_elements;
+    }
+
     bool Restore(size_t slot, ssm::SSMSequenceRuntimeState* state) const {
+        if (!state || !CanRestore(slot, *state)) return false;
         const size_t conv_count = view_.channels * view_.history;
         const size_t state_count = view_.heads * view_.head_elements;
-        if (!state || !Complete(slot) || state->conv_state.size() != conv_count || state->ssm_state.size() != state_count) {
-            return false;
-        }
         if (conv_count) std::copy_n(conv_.data() + slot * conv_count, conv_count, state->conv_state.data());
         std::copy_n(recurrent_.data() + slot * state_count, state_count, state->ssm_state.data());
         return true;

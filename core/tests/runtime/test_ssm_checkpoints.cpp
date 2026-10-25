@@ -112,6 +112,7 @@ TEST(SSMCheckpointTest, BatchedPositionsMatchSequentialStateAndEveryRejectionBou
             SCOPED_TRACE(accepted);
             EXPECT_TRUE(recorder.Complete(accepted));
             auto restored = fixture.Initial();
+            ASSERT_TRUE(recorder.CanRestore(accepted, restored));
             ASSERT_TRUE(recorder.Restore(accepted, &restored));
             EXPECT_EQ(restored.conv_state, expected_states[accepted].conv_state);
             EXPECT_EQ(restored.ssm_state, expected_states[accepted].ssm_state);
@@ -159,6 +160,7 @@ TEST(SSMCheckpointTest, PartialWritesCannotBeRestoredAndRecordingReusesAllocated
     float* const state_storage = recorder.View()->recurrent;
     const size_t bytes = recorder.Bytes();
     auto state = fixture.Initial();
+    EXPECT_FALSE(recorder.CanRestore(0, state));
     EXPECT_FALSE(recorder.Complete(0));
     EXPECT_TRUE(recorder.View()->RecordConv(0, 3, 0, 0, kChannels / 2, state.conv_state.data()));
     EXPECT_TRUE(recorder.View()->RecordHead(0, 3, 0, 0, state.ssm_state.data()));
