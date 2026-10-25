@@ -1,5 +1,6 @@
 #include "densecore/runtime/inference.h"
 #include "llm/graph/checked_ops.h"
+#include "llm/graph/gemma4_shared_kv.h"
 
 #include "densecore/backend/flash_attention.h"
 #include "densecore/backend/hardware_topology.h"  // For compute thread affinity
@@ -930,15 +931,18 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             // Q/K/V Projections (using smart dispatcher for Parallel GEMV)
             const bool use_glm_dsa_mla =
                 model->arch_flags.is_glm_dsa && q_a && q_a_norm && q_b && kv_a && kv_a_norm && kv_b;
+            const bool gemma4_shared_kv_layer = model->arch_flags.is_gemma4 &&
+                (layer_spec ? layer_spec->attention.reads_shared_kv
+                            : densecore::models::Gemma4KVSourceLayer(model, il) != il);
             const bool gemma4_value_from_key = !use_glm_dsa_mla && !wv && wk && model->arch_flags.is_gemma4;
-            if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
+            if (!use_glm_dsa_mla && (!wq || (!gemma4_shared_kv_layer && (!wk || !wv)))) {
                 if (gemma4_value_from_key) {
                     // Gemma4 alternative attention omits V projection on some layers.
                     // Those blocks use the raw K projection as the input to v_norm.
                     wv = wk;
                 }
             }
-            if (!use_glm_dsa_mla && (!wq || !wk || !wv)) {
+            if (!use_glm_dsa_mla && (!wq || (!gemma4_shared_kv_layer && (!wk || !wv)))) {
                 const std::string hint =
                     model->arch_flags.is_hybrid_ssm
                         ? " (hybrid SSM model: layer may be misclassified — check layer_types in GGUF)"
@@ -962,20 +966,39 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             // Optional fused QKV projection (single pass over input per token).
             // Falls back to per-projection matmul for non-F32/quantized weights.
             struct ggml_tensor* gemma4_fused_qkv_repack = nullptr;
-            if (model->arch_flags.is_gemma4 && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32) {
+            if (model->arch_flags.is_gemma4 && !gemma4_shared_kv_layer && IsFusedQKVEnabled() &&
+                cur->type == GGML_TYPE_F32) {
                 gemma4_fused_qkv_repack = layer.Get("attn_qkv.cpu_repack_fused");
                 if (gemma4_fused_qkv_repack && (gemma4_fused_qkv_repack->ne[0] != cur->ne[0] ||
                                                 gemma4_fused_qkv_repack->ne[1] != wq->ne[1] + wk->ne[1] + wv->ne[1])) {
                     gemma4_fused_qkv_repack = nullptr;
                 }
             }
-            const bool fused_qkv_supported = !use_glm_dsa_mla && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
+            const bool fused_qkv_supported = !use_glm_dsa_mla && !gemma4_shared_kv_layer && IsFusedQKVEnabled() && cur->type == GGML_TYPE_F32 &&
                                              wq->type == GGML_TYPE_F32 && wk->type == GGML_TYPE_F32 &&
                                              wv->type == GGML_TYPE_F32 && wq->data && wk->data && wv->data &&
                                              wq->ne[0] == cur->ne[0] && wk->ne[0] == cur->ne[0] &&
                                              wv->ne[0] == cur->ne[0] && wq->ne[1] > 0 && wk->ne[1] > 0 && wv->ne[1] > 0;
 
-            if (use_glm_dsa_mla) {
+            if (gemma4_shared_kv_layer) {
+                const int source_layer = layer_spec ? layer_spec->attention.kv_source_layer
+                                                   : densecore::models::Gemma4KVSourceLayer(model, il);
+                const auto& source = RequireGemma4SharedKVSource(
+                    model, il, source_layer, GetGemma4SharedKVState(source_layer), N);
+                Qcur = smart_mul_mat(ctx_c, wq, cur, model);
+                if (ShouldRunAttentionProjectionReferenceProbe(il)) {
+                    auto* q_ref_ud = GetProjectionReferenceUserData();
+                    q_ref_ud->weight_tensor = wq;
+                    q_ref_ud->input_tensor = cur;
+                    q_ref_ud->layer_idx = il;
+                    q_ref_ud->token_seq_ids = batch.seq_id.data();
+                    q_ref_ud->stage = "attn_q_proj";
+                    q_ref_ud->var_name = "Qcur";
+                    Qcur = ggml_map_custom1(ctx_c, Qcur, cb_projection_reference_probe, 1, q_ref_ud);
+                }
+                Kcur = source.k;
+                Vcur = source.v;
+            } else if (use_glm_dsa_mla) {
                 static bool logged_glm_dsa_path = false;
                 if (!logged_glm_dsa_path) {
                     std::cerr << "[DenseCore] GLM-5 DSA path enabled"
@@ -1158,8 +1181,10 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             };
 
             Qcur = apply_lora(Qcur, cur, "attn_q");
-            Kcur = apply_lora(Kcur, cur, "attn_k");
-            Vcur = apply_lora(Vcur, cur, "attn_v");
+            if (!gemma4_shared_kv_layer) {
+                Kcur = apply_lora(Kcur, cur, "attn_k");
+                Vcur = apply_lora(Vcur, cur, "attn_v");
+            }
 
             // Add Bias if present (for Qwen2 and some other models)
             if (bq) {
@@ -1170,7 +1195,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     // std::cerr << "Skipping BQ mismatch L" << il << std::endl;
                 }
             }
-            if (bk) {
+            if (bk && !gemma4_shared_kv_layer) {
                 if (Kcur->ne[0] == bk->ne[0]) {
                     Kcur = ggml_add(ctx_c, Kcur, bk);
                 } else {
@@ -1178,7 +1203,7 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
                     // std::cerr << "Skipping BK mismatch" << std::endl;
                 }
             }
-            if (bv) {
+            if (bv && !gemma4_shared_kv_layer) {
                 if (Vcur->ne[0] == bv->ne[0]) {
                     Vcur = ggml_add(ctx_c, Vcur, bv);
                 } else {
@@ -1191,17 +1216,17 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             if (!ggml_is_contiguous(Qcur)) {
                 Qcur = ggml_cont(ctx_c, Qcur);
             }
-            if (!ggml_is_contiguous(Kcur)) {
+            if (!gemma4_shared_kv_layer && !ggml_is_contiguous(Kcur)) {
                 Kcur = ggml_cont(ctx_c, Kcur);
             }
-            if (!ggml_is_contiguous(Vcur)) {
+            if (!gemma4_shared_kv_layer && !ggml_is_contiguous(Vcur)) {
                 Vcur = ggml_cont(ctx_c, Vcur);
             }
 
             // Dynamically infer head dimensions from the actual projected tensors
             int dim_q = Qcur->ne[0];
-            int dim_k = Kcur->ne[0];
-            int dim_v = Vcur->ne[0];
+            int dim_k = Kcur->ne[0] * (gemma4_shared_kv_layer ? Kcur->ne[1] : 1);
+            int dim_v = Vcur->ne[0] * (gemma4_shared_kv_layer ? Vcur->ne[1] : 1);
 
             int n_head_kv = layer_spec ? layer_spec->attention.kv_head_count
                                        : densecore::models::ResolveLayerKVHeadCount(model, il);
@@ -1240,11 +1265,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
 
             int head_dim_q = dim_q / n_head;
 
-            const bool gemma4_shared_kv_layer =
-                layer_spec ? layer_spec->attention.reads_shared_kv
-                           : (model->arch_flags.is_gemma4 && densecore::models::Gemma4KVSourceLayer(model, il) != il);
-            bool k_done = false;
-            bool v_done = false;
+            const bool k_done = gemma4_shared_kv_layer;
+            const bool v_done = gemma4_shared_kv_layer;
 
             // Reshape Q (Standard)
             ValidateAttentionProjectionShape3D(Qcur, "Qcur", il, head_dim_q, n_head, N, dim_q, n_head);
@@ -1427,7 +1449,8 @@ struct ggml_tensor* BuildTransformerGraphInlineImpl(TransformerModel* model, Pag
             // SKIP RoPE if we detected anomaly and sliced (k_done)
             // Layer 0 anomaly (80 dim) is unsafe for 128-dim RoPE/Kernel which expects
             // 128
-            bool skip_rope = k_done;
+            // Reused source K/V are already rotated, but this layer's Q is not.
+            bool skip_rope = k_done && !gemma4_shared_kv_layer;
             if (skip_rope) {
                 // std::cerr << "[DenseCore] Skipping RoPE for anomalous Layer " << il <<
                 // std::endl;

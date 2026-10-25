@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "llm/graph/checked_ops.h"
+#include "llm/graph/gemma4_shared_kv.h"
 #include "densecore/runtime/inference.h"
 #include "densecore/memory/kv_cache.h"
 #include "densecore/models/model_types.h"
@@ -220,7 +221,9 @@ std::unique_ptr<TransformerModel> MakeSlidingDecodeGraphModel(bool sliding_enabl
 
 std::unique_ptr<TransformerModel> MakeSharedKvGraphModel(bool shared_layer_1, bool sliding_enabled) {
     auto model = MakeBaseGemma4GraphModel(/*n_layer=*/2);
-    model->gemma4_layer_is_sliding = {0u, 1u};
+    // Match real GGUF mappings: a shared sliding layer reads a sliding
+    // producer. Source publication still retains full history for its reader.
+    model->gemma4_layer_is_sliding = {1u, 1u};
     model->gemma4_layer_kv_source = {0, shared_layer_1 ? 0 : 1};
     model->gemma4_sliding_window = sliding_enabled ? 1 : -1;
 
@@ -1323,4 +1326,116 @@ TEST(Gemma4FallbackDecodeTest, PerLayerPrefillCompactionMatchesFinalTokenDecodeA
     for (size_t i = 0; i < prefill_logits.size(); ++i) EXPECT_NEAR(prefill_logits[i], decode_logits[i], 1e-5);
     auto embeddings = densecore::testing::ExecuteTransformerGraphEmbeddingsForTest(model.get(), prefill_cache.get(), prefill, 4);
     EXPECT_EQ(embeddings.size(), 3u * kTinyGraphDim);
+}
+
+TEST(Gemma4FallbackDecodeTest, E4BSharedLayersNeedOnlyQAndMatchLocalSourceLogits) {
+    ScopedFlashAttentionDisableForTest flash_guard;
+    const auto make_model = [](bool shared, bool omit_kv) {
+        auto model = MakeBaseGemma4GraphModel(42);
+        model->gemma4_n_shared_kv_layers = shared ? 18 : 0;
+        model->gemma4_sliding_window = 512;
+        SetTensorData(model->tok_embeddings, {0.0f, 1.0f, 1.0f, 0.0f});
+        for (int layer = 0; layer < 42; ++layer) {
+            // Public E4B: full layers 5,11,17,23,29,35,41;
+            // shared layers24..41 read the last local sliding/full pair22/23.
+            const bool sliding = layer % 6 != 5;
+            model->gemma4_layer_is_sliding[layer] = sliding ? 1u : 0u;
+            model->gemma4_layer_kv_source[layer] = shared && layer >= 24 ? (sliding ? 22 : 23) : layer;
+            auto& weights = model->layers[layer];
+            const std::vector<float> identity = {1.0f, 0.0f, 0.0f, 1.0f};
+            ConfigureLayerQkv(weights.Get(model_keys::kAttnQWeight), weights.Get(model_keys::kAttnKWeight),
+                              weights.Get(model_keys::kAttnVWeight), weights.Get(model_keys::kAttnOWeight),
+                              identity, identity, identity,
+                              layer == 41 ? identity : std::vector<float>(4, 0.0f));
+            if (shared && layer >= 24) {
+                // These redundant consumer projections must never contribute.
+                SetTensorData(weights.Get(model_keys::kAttnKWeight), {-100.0f, 9.0f, 13.0f, -50.0f});
+                SetTensorData(weights.Get(model_keys::kAttnVWeight), {0.0f, 100.0f, -100.0f, 0.0f});
+                if (omit_kv) {
+                    weights.Set(model_keys::kAttnKWeight, nullptr);
+                    weights.Set(model_keys::kAttnVWeight, nullptr);
+                }
+            }
+        }
+        return model;
+    };
+    for (bool use_cache : {false, true}) {
+        auto reference = make_model(false, false);
+        auto redundant = make_model(true, false);
+        auto missing = make_model(true, true);
+        auto ref_cache = use_cache ? MakeTinyGraphCache(reference.get()) : nullptr;
+        auto redundant_cache = use_cache ? MakeTinyGraphCache(redundant.get()) : nullptr;
+        auto missing_cache = use_cache ? MakeTinyGraphCache(missing.get()) : nullptr;
+        if (use_cache) {
+            ASSERT_GE(ref_cache->block_manager->AllocateSingle(), 0);
+            ASSERT_GE(redundant_cache->block_manager->AllocateSingle(), 0);
+            ASSERT_GE(missing_cache->block_manager->AllocateSingle(), 0);
+            for (int layer = 24; layer < 42; ++layer) {
+                for (int slot = 0; slot < 5; ++slot) {
+                    const SlotVec key = {77.0f + layer, 88.0f};
+                    const SlotVec value = {55.0f, 66.0f + layer};
+                    missing_cache->WriteKSlot(0, layer, slot, key.data());
+                    missing_cache->WriteVSlot(0, layer, slot, value.data());
+                }
+            }
+        }
+        const auto check = [&](const BatchSpec& batch) {
+            const auto expected = densecore::testing::ExecuteTransformerGraphForTest(reference.get(), ref_cache.get(), batch, 1);
+            const auto with_unused_weights = densecore::testing::ExecuteTransformerGraphForTest(redundant.get(), redundant_cache.get(), batch, 1);
+            const auto without_weights = densecore::testing::ExecuteTransformerGraphForTest(missing.get(), missing_cache.get(), batch, 1);
+            ASSERT_EQ(expected.size(), 2u);
+            ASSERT_EQ(with_unused_weights.size(), expected.size());
+            ASSERT_EQ(without_weights.size(), expected.size());
+            EXPECT_LT(L1Diff(expected, with_unused_weights), 1e-5f);
+            EXPECT_LT(L1Diff(expected, without_weights), 1e-5f);
+        };
+        check(MakeSingleSequencePrefillBatch({1, 0, 1}));
+        if (use_cache) {
+            check(MakeSingleTokenDecodeBatch(0, 3, 0));
+            check(MakeSingleTokenDecodeBatch(1, 4, 0));
+            for (int layer = 24; layer < 42; ++layer) {
+                for (int slot = 0; slot < 5; ++slot) {
+                    EXPECT_EQ(ReadKSlotVec(missing_cache.get(), layer, 0, slot), SlotVec({77.0f + layer, 88.0f}));
+                    EXPECT_EQ(ReadVSlotVec(missing_cache.get(), layer, 0, slot), SlotVec({55.0f, 66.0f + layer}));
+                }
+            }
+        }
+    }
+}
+
+TEST(Gemma4FallbackDecodeTest, NonSharedAttentionStillRequiresAllProjections) {
+    auto model = MakeBaseGemma4GraphModel(2);
+    model->layers[1].Set(model_keys::kAttnKWeight, nullptr);
+    model->layers[1].Set(model_keys::kAttnVWeight, nullptr);
+    EXPECT_THROW(densecore::testing::ExecuteTransformerGraphForTest(
+                     model.get(), nullptr, MakeSingleSequencePrefillBatch({1, 0, 1}), 1),
+                 densecore::InvalidArgumentException);
+}
+
+TEST(Gemma4FallbackDecodeTest, SharedKvSourceValidatesE4BIndexTypeAndHeadShape) {
+    using densecore::llm::graph::detail::RequireGemma4SharedKVSource;
+    auto model = MakeBaseGemma4GraphModel(42);
+    model->gemma4_layer_n_head_kv.assign(42, 2u);
+    model->gemma4_key_length_swa = model->gemma4_value_length_swa = 256;
+    model->gemma4_key_length_full = model->gemma4_value_length_full = 512;
+    for (int layer = 0; layer < 42; ++layer) {
+        model->gemma4_layer_is_sliding[layer] = layer % 6 != 5;
+        model->gemma4_layer_kv_source[layer] = layer < 24 ? layer : (layer % 6 != 5 ? 22 : 23);
+    }
+    auto* key = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F32, 256, 2, 3);
+    auto* value = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F32, 256, 2, 3);
+    const Gemma4SharedKVState state{key, value, 22};
+    EXPECT_EQ(&RequireGemma4SharedKVSource(model.get(), 24, 22, &state, 3), &state);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 24, &state, 3), densecore::InvalidArgumentException);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 23, &state, 3), densecore::InvalidArgumentException);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 22, nullptr, 3), densecore::InvalidArgumentException);
+    auto wrong_type = state;
+    wrong_type.v = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F16, 256, 2, 3);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 22, &wrong_type, 3), densecore::InvalidArgumentException);
+    auto wrong_width = state;
+    wrong_width.k = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F32, 512, 2, 3);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 22, &wrong_width, 3), densecore::InvalidArgumentException);
+    auto wrong_history = state;
+    wrong_history.v = ggml_new_tensor_3d(model->ctx_w, GGML_TYPE_F32, 256, 2, 2);
+    EXPECT_THROW(RequireGemma4SharedKVSource(model.get(), 24, 22, &wrong_history, 3), densecore::InvalidArgumentException);
 }
