@@ -16,9 +16,21 @@ initialization and one complete c1 five-planet/DONE answer (59-token EOS),
 plus two exact-ID/complete-answer repeats.
 The init plan is 3,468,717,568 <= 3,505,483,776 available bytes; whole-child peak
 RSS is 6,240,676 KiB, not a minimum supported RAM estimate. >=128-token
-generation, c4/isolation, HTTP/package/support/performance remain pending.
-Same-source MTP is pending; older MTP passes/failures below retain their source.
+generation and HTTP/package/support/performance remain pending.
+Same-source 0.8B MTP greedy/native/HTTP requalification passes; 2B remains pending; older MTP passes/failures below retain their source.
 The manifest SHA is `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
+
+
+Current `ef9fc61` E4B c4 now passes two waves of four requests: all eight
+retain the own-c1 59-token EOS IDs and complete five-planet/DONE answer.
+This is native request isolation, not mixed physical graph or sustained
+>=128-token generation. The pinned 0.8B MTP artifact
+`ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86`
+passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
+actual accept/reject/rollback, cancel/recovery and HTTP
+stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
+2B MTP and E4B sustained generation remain pending; no performance, automatic
+activation, package or broad support qualification follows.
 
 | Purpose | Repository and full revision | File | SHA-256 | v0.2 qualification |
 |---|---|---|---|---|
@@ -26,12 +38,12 @@ The manifest SHA is `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e
 | Qwen3.5-2B baseline | `unsloth/Qwen3.5-2B-GGUF@f6d5376be1edb4d416d56da11e5397a961aca8ae` | `Qwen3.5-2B-Q4_K_M.gguf` | `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223` | Historical `7ecaf86` combined prefix/5-turn/cancel/eviction checks passed; current final package/platform qualification pending |
 | Qwen3 small dense baseline | `Qwen/Qwen3-0.6B-GGUF@23749fefcc72300e3a2ad315e1317431b06b590a` | `Qwen3-0.6B-Q8_0.gguf` | `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` | Historical `7ecaf86` native prefix parity and 16 HTTP default/off semantic/protocol cases passed; number-only format gate still fails (also pinned llama) |
 | Embedding baseline | `Qwen/Qwen3-Embedding-0.6B-GGUF@370f27d7550e0def9b39c1f16d3fbaa13aa67728` | `Qwen3-Embedding-0.6B-Q8_0.gguf` | `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439` | Historical `7ecaf86` AUTO/LAST C/Python/HTTP 12 comparisons bitwise equal, finite/nonzero and normalized; later-root package qualification separate |
-| Qwen3.5-0.8B MTP target | `unsloth/Qwen3.5-0.8B-MTP-GGUF@cf8a611f6ed2c2060046219a19f12cd3d5ecd67c` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86` | Historical `7ecaf86` greedy checks retained. Integrated `4ad6a35` JSON NONE/MTP c1/c4 native+HTTP/stream/cancel/recovery pass for two object cases. Probabilistic c1 PASS; c4 strict FAIL (French punctuation), plus a separate stop-instruction negative. Historical `48dd55a` adds only the narrow NONE/MTP zero-commit hard-mask lifecycle pass on this file; no new-source JSON/probabilistic or speed/auto/broad support promotion |
+| Qwen3.5-0.8B MTP target | `unsloth/Qwen3.5-0.8B-MTP-GGUF@cf8a611f6ed2c2060046219a19f12cd3d5ecd67c` | `Qwen3.5-0.8B-Q4_K_M.gguf` | `ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86` | Current `ef9fc61` greedy NONE/MTP exact128 native c1/c4 and HTTP/lifecycle PASS. Historical `7ecaf86` greedy checks retained. Integrated `4ad6a35` JSON NONE/MTP c1/c4 native+HTTP/stream/cancel/recovery pass for two object cases. Probabilistic c1 PASS; c4 strict FAIL (French punctuation), plus a separate stop-instruction negative. Historical `48dd55a` adds only the narrow NONE/MTP zero-commit hard-mask lifecycle pass on this file; no new-source JSON/probabilistic or speed/auto/broad support promotion |
 | Qwen3.5-2B MTP target | `unsloth/Qwen3.5-2B-MTP-GGUF@e05864f8066d874d5f85aaff007ae57a2a7d1efe` | `Qwen3.5-2B-Q4_K_M.gguf` | `18c92228fc1498a02506f64593f7cc8cc02f406f732a217c6ba99ad1254d4f0b` | Historical `7ecaf86` greedy checks retained. Integrated `4ad6a35` JSON NONE/MTP c1/c4 native+HTTP/stream/cancel/recovery pass for two object cases; probabilistic c1/c4 PASS. The four-cell matrix still fails on 0.8B c4. No speed/auto or broad support promotion |
 | Qwen3.6-35B MoE MTP candidate | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF@5bc3e238d916f48a861bac2f8a1990a0e9b7e98d` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b` | Upstream metadata + 16 MiB header range only; full-file SHA/runtime/MoE-head/performance/auto unverified |
 | 35B comparison | `ggml-org/Qwen3.6-35B-A3B-GGUF@7878dc9a905c7c9379e5e8d6a1aa9affdd6839c5` | `Qwen3.6-35B-A3B-Q4_K_M.gguf` | `671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7` | Historical native benchmark only; canonical real 35B/C4/C4A/NUMA qualification unverified |
 | Gemma E2B text inference target | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2` | `gemma-4-E2B-it-Q4_K_M.gguf` | `740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8` | Private a9 passes and historical ad1/d408 failures retained. Root `48dd55a` formal 20 cache-ON/OFF c=1/c=4 raw IDs and four staggered own-c1 complete-answer checks PASS. No mixed-physical-graph, HTTP, broad support/default/performance promotion |
-| Gemma E4B text inference target | `ggml-org/gemma-4-E4B-it-GGUF@a69f018d7678a2b9f5e705f8903d6fb29b9b25dc` | `gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2` | Current `ef9fc61` unchanged ctx2048/cap4/t8/Q8/NONE init PASS and one complete 59-EOS c1 five-planet/DONE answer plus two exact repeats. Sustained >=128-token/c4/HTTP/package/support/performance pending. Historical root `48dd55a` context 2048/capacity 4 init capacity FAIL: plan required 5,921,446,144 > available 4,681,576,448 bytes; zero generation. Peak failed-init RSS 6,236,108 KiB is not RAM savings or successful RAM sizing. Private a9 capacity 1 one-case PASS remains separate; no broad support claim |
+| Gemma E4B text inference target | `ggml-org/gemma-4-E4B-it-GGUF@a69f018d7678a2b9f5e705f8903d6fb29b9b25dc` | `gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2` | Current `ef9fc61` unchanged ctx2048/cap4/t8/Q8/NONE init PASS; complete 59-EOS c1/repeat and two c4 waves of four match own-c1 IDs/five-planet/DONE answer. Sustained >=128-token/HTTP/package/support/performance pending. Historical root `48dd55a` context 2048/capacity 4 init capacity FAIL: plan required 5,921,446,144 > available 4,681,576,448 bytes; zero generation. Peak failed-init RSS 6,236,108 KiB is not RAM savings or successful RAM sizing. Private a9 capacity 1 one-case PASS remains separate; no broad support claim |
 | gpt-oss target | `ggml-org/gpt-oss-20b-GGUF@15dcfc7e7c608c6161507211ed43c5b590801b4b` | `gpt-oss-20b-MXFP4.gguf` | `27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901` | Packed quantized native fixtures passed; safe host-capacity rejection observed; actual HTTP/long/c1/c4 inference and supported RAM range unverified |
 
 Integrated `4ad6a35` JSON checks on each pinned MTP file pass 16 main native

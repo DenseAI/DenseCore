@@ -42,11 +42,23 @@ Q8 KV and NONE speculation: required 3,468,717,568 <= available 3,505,483,776 pl
 bytes, peak whole-child RSS 6,240,676 KiB. No capacity/context reduction or retry
 was used. A separate c1 generation gate passes one 59-token EOS answer with all
 five planets and DONE; two subsequent repeats each match its 59-token EOS IDs
-and complete answer. This is not sustained >=128-token generation, c4/isolation,
+and complete answer. This is not sustained >=128-token generation,
 HTTP, package, broad support, minimum-RAM or performance qualification.
-Same-source MTP requalification is pending; the `48dd55a` hard-mask and
+Same-source 0.8B greedy/native/HTTP MTP passes; 2B remains pending. The `48dd55a` hard-mask and
 `4ad6a35` JSON/probabilistic results below keep their original sources.
 Automatic MTP profiles remain zero; no performance/NUMA/GPT-OSS promotion follows.
+
+
+Current `ef9fc61` E4B c4 now passes two waves of four requests: all eight
+retain the own-c1 59-token EOS IDs and complete five-planet/DONE answer.
+This is native request isolation, not mixed physical graph or sustained
+>=128-token generation. The pinned 0.8B MTP artifact
+`ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86`
+passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
+actual accept/reject/rollback, cancel/recovery and HTTP
+stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
+2B MTP and E4B sustained generation remain pending; no performance, automatic
+activation, package or broad support qualification follows.
 
 Prior `4ad6a35` native 1347/1333/14 and ASAN 702/693/9 remain source-labeled,
 including its JSON model passes and probabilistic overall FAIL below. They do
@@ -69,11 +81,11 @@ Python tokenizer is available), not native prompt accounting.
 
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `ef9fc61` native 1363-pass/14-skip, selected ASAN 752-pass/9-skip, Go/race and policy 38 pass | SDK TLS/package contexts remain limited; MTP model requalification pending |
+| A | Integrated `ef9fc61` native 1363-pass/14-skip, selected ASAN 752-pass/9-skip, Go/race and policy 38 pass | SDK TLS/package contexts remain limited; 2B MTP model requalification pending |
 | B/H | `ef9fc61` original200 c1/c8 51-EOS parity, separate80 c1 128-LENGTH, full80 37-request gate PASS with active8/pending8 | Native bounded correctness/admission only; final image/platform and matched performance remain |
-| B Gemma | `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init PASS and complete 59-EOS c1 answer plus two exact repeats; historical `48dd55a` E2B grid retained | >=128-token generation, c4/isolation, HTTP/package/support/performance remain pending |
+| B Gemma | `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init PASS and complete 59-EOS c1/repeats and two c4 waves of four exact-own-c1 answers; historical `48dd55a` E2B grid retained | sustained >=128-token generation and HTTP/package/support/performance remain pending |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
-| D | Root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
+| D | Current `ef9fc61` pinned 0.8B greedy native/HTTP MTP c1/c4 parity/lifecycle PASS. Historical root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
@@ -299,7 +311,9 @@ identities before publishing any claim; use the relative reproduction links abov
   `v02-h-resource-isolation-80-full-ctx512/phase-gate.json`.
 - `v02-gemma-resource-isolation-e4b-cap4-init-only/result.json`,
   `v02-gemma-resource-isolation-e4b-quality-c1/quality-gate.json`,
-  `v02-gemma-resource-isolation-e4b-quality-repeat/quality-gate.json`.
+  `v02-gemma-resource-isolation-e4b-quality-repeat/quality-gate.json`,
+  `v02-gemma-resource-isolation-e4b-quality-c4/quality-gate.json`.
+- `v02-mtp-resource-isolation-08b/receipt.json` and its pinned c1/c4 summaries.
 - Historical `v02-integrated-48dd-artifact.json`, `v02-staging-48dd-asan-report.json`;
   immutable manifest SHA is recorded above. `v02-hard-mask-48dd-v2-report.json`
   binds reviewed local V2 tool/script hashes, callbacks, owners and process receipts;

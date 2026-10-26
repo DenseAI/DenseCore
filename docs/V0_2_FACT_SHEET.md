@@ -24,9 +24,21 @@ and [model catalog](MODEL_CATALOG.md).
   required 3,468,717,568 <= available 3,505,483,776 plan bytes; peak child RSS
   6,240,676 KiB. Separate c1 passes one complete five-planet/DONE answer at
   59-token EOS; two repeats match its IDs and complete answer. Sustained
-  >=128-token generation, c4/isolation, HTTP/package/support
-  and performance remain pending. Same-source MTP requalification is pending.
+  sustained >=128-token generation and HTTP/package/support
+  and performance remain pending. Same-source 0.8B MTP greedy/native/HTTP requalification passes; 2B remains pending.
   Manifest SHA: `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
+
+Current `ef9fc61` E4B c4 now passes two waves of four requests: all eight
+retain the own-c1 59-token EOS IDs and complete five-planet/DONE answer.
+This is native request isolation, not mixed physical graph or sustained
+>=128-token generation. The pinned 0.8B MTP artifact
+`ac7c9d7a1b3e3695bb3bd50f8ceaa97f9c93e99ccc3d3d1a620301b6dd6d3d86`
+passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
+actual accept/reject/rollback, cancel/recovery and HTTP
+stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
+2B MTP and E4B sustained generation remain pending; no performance, automatic
+activation, package or broad support qualification follows.
+
 - Historical `48dd55a` hard-mask NONE/MTP lifecycle passes: four contradictory-mask
   errors with zero output/generated tokens, six healthy peers/recoveries and
   exact terminal/metadata counts. Only healthy MTP requests show proposal
