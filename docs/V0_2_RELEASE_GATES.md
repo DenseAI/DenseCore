@@ -13,6 +13,40 @@ performance/default promotions are qualified.
 
 ## Latest source and portable package (`07fe153`)
 
+Current `07fe153` embedding qualification passes on the original four texts.
+Installed native MI_OFF SDK Python AUTO/LAST and same-handle C default/CEx-LAST
+pass eight comparisons; separate amd64-v3 MI_ON HTTP omitted/LAST passes four.
+Each pair has 1024 finite normalized elements and identical literal F32 bytes,
+with the original norm/cosine/max-error thresholds retained. The old `48dd55a`
+`array_equal` evidence was numeric equality and C-default/Python-LAST comparison;
+it is preserved, not relabeled as this stronger same-interface byte proof.
+Accepted C callbacks occur once, NULL submission has zero callbacks, SDK empty
+batch returns shape `(0,)`, and accepted work drains before Free. HTTP rejects
+empty inputs and numeric `pooling_type:17` with 400, then recovers; unknown strings
+retain the source's AUTO normalization contract. Profiles are never cross-compared.
+
+Current 2B-c1 K2 and K3 each complete all 20 fresh samples / five ABBA blocks,
+with all blocks retained, but both are **FAIL_MATERIAL_REGRESSION**. K2 median
+ratios (decode/completion-speed/aggregate) are
+`0.8443473740423546 / 0.8399898177112242 / 0.8400002680001134`; K3 ratios are
+`0.9604052183066641 / 0.9408523169856156 / 0.9408498530449593`.
+The gate is max(A/A noise,3%) = 3%, plus the decode 1.15/nonregression criteria.
+These are end-to-end production policies, NONE decode-cache ON versus MTP OFF,
+on this host/profile, not isolated algorithm or cross-host causal results.
+Direct K2-versus-K3 selection is NOT_RUN because both fail eligibility; auto stays 0.
+
+Separate current 2B-c1 controlled NONE/K2 and fresh NONE/K3 stop proofs pass:
+each mode has four baselines and eight matching/EOF-partial UTF8 stop responses,
+exact text/API usage parity, observable terminal metadata once and four actual
+native stop-sequence summaries. No native callback-once or unseen duplicate-DONE
+claim follows. Current K3 stochastic integration also passes: 18 native final
+responses, two cancellations, 40 main HTTP responses, two disconnect/recoveries,
+28/28 separate strict-format checks and all four engine-mapping roles. This is
+unseeded integration, not distribution equality, other-model/c4 or speed proof.
+The 2026-10-26 read-only cloud preflight stops at disabled billing (exit 3);
+inventory, prices and session estimates are NOT_RUN. Paid spend remains zero.
+Release readiness remains incomplete; all earlier image/model failures persist.
+
 The native MI_OFF installed wheel now passes 69 SDK contract tests (one
 `asyncio_mode` configuration warning) and 12 actual Python/native completion,
 stream/async/cancel/recovery cases. It is `densecore-0.1.0-cp313-cp313-linux_x86_64.whl`,
@@ -21,8 +55,8 @@ Initial/final actual process maps each bind 24 records to installed artifacts;
 ordinary loading uses no preload/reexec or source fallback. This native-host ISA/
 GLIBC profile is not manylinux, generic-CPU, portable-image or broad model proof.
 Container strict Count and portable E4B c4 failures remain unchanged. MTP
-performance V1 failed a precondition before measurement; fresh V2 A/A is still
-running, so no performance result or automatic activation follows.
+performance V1 failed a precondition before measurement; final K2/K3 results
+below are separate fresh runs and neither qualifies automatic activation.
 
 Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
 `ef9fc61` model evidence below remains a separate source/profile archive.
@@ -48,7 +82,7 @@ On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
 formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
 prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
 five positive client TTFT samples each; this is not a performance comparison.
-ARM, physical NUMA, C4/C4A, actual GPT-OSS, MTP performance/auto, and final
+ARM, physical NUMA, C4/C4A, actual GPT-OSS, untested MTP profiles/automatic activation, and final
 publication remain incomplete; automatic profiles, paid spend and publication
 remain zero. Final portable/source-matched model and prefix checks stay separate.
 
@@ -73,6 +107,19 @@ Independent small-receipt review
 binds receipts and recorded map hashes without rehashing large binaries during
 performance work. Actual generation manifest/result remain separate from the
 installed manifest's earlier “generation pending” preparation scope.
+
+Current independent review pins (local receipts, not public artifact promises):
+
+| Evidence | SHA-256 |
+|---|---|
+| `v02-embedding-07fe-final/wheel-independent-small-review.json` | `e09d37ebb3aaf178a7b899d5ee479858ebaa7ee0f3ec56ea2b4073fbb5ae2a0c` |
+| `v02-embedding-07fe-final/http-independent-small-review.json` | `1f4ee8dae317c63566c651b543da1ef823b9411ef9a489e6da86b813c2a45fe1` |
+| `v02-mtp-perf-07fe-v3-preparation/independent-completed-review.json` (K2) | `391fdd3a3771fac9df573571972937de68a011ce68719397f7ac81f509279e59` |
+| `v02-mtp-perf-07fe-v4-preparation/independent-completed-review.json` (K3) | `6576c1bd31d74c3acb3bb7634a157b34ed64de7deb2d8c4429053a8b73e581af` |
+| `v02-mtp-stop-07fe-amd64-v3-2b-c1/k2-independent-small-review.json` | `3089e6d8c0cc6afff7b2f022fd0910f1e717562e6ff8cc34e1b5cef0046a9500` |
+| `v02-mtp-stop-07fe-amd64-v3-2b-c1-k3/k3-independent-small-review.json` | `00762b59309142e22d43f29b8e5f061f2ba166b3297a8aec22438115f623f989` |
+| `v02-mtp-sampling-07fe-k3-preparation/independent-completed-review.json` | `de34177396b060d27f39ebbbc783c3d9bcc665bf4e4a4eaf944e8fb72f183c86` |
+| `v02-cloud-readonly-preflight-20261026.log` | `5f4589bdf3c1085b3a38bf65fbb2dab3db2b38f03bed51926d7434e00d14a8e8` |
 
 ## Frozen native source qualification (`ef9fc61`)
 

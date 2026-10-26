@@ -11,6 +11,39 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### v0.2 candidates (qualification in progress)
 
+- Current `07fe153` embedding qualification passes on the original four texts.
+  Installed native MI_OFF SDK Python AUTO/LAST and same-handle C default/CEx-LAST
+  pass eight comparisons; separate amd64-v3 MI_ON HTTP omitted/LAST passes four.
+  Each pair has 1024 finite normalized elements and identical literal F32 bytes,
+  with the original norm/cosine/max-error thresholds retained. The old `48dd55a`
+  `array_equal` evidence was numeric equality and C-default/Python-LAST comparison;
+  it is preserved, not relabeled as this stronger same-interface byte proof.
+  Accepted C callbacks occur once, NULL submission has zero callbacks, SDK empty
+  batch returns shape `(0,)`, and accepted work drains before Free. HTTP rejects
+  empty inputs and numeric `pooling_type:17` with 400, then recovers; unknown strings
+  retain the source's AUTO normalization contract. Profiles are never cross-compared.
+
+  Current 2B-c1 K2 and K3 each complete all 20 fresh samples / five ABBA blocks,
+  with all blocks retained, but both are **FAIL_MATERIAL_REGRESSION**. K2 median
+  ratios (decode/completion-speed/aggregate) are
+  `0.8443473740423546 / 0.8399898177112242 / 0.8400002680001134`; K3 ratios are
+  `0.9604052183066641 / 0.9408523169856156 / 0.9408498530449593`.
+  The gate is max(A/A noise,3%) = 3%, plus the decode 1.15/nonregression criteria.
+  These are end-to-end production policies, NONE decode-cache ON versus MTP OFF,
+  on this host/profile, not isolated algorithm or cross-host causal results.
+  Direct K2-versus-K3 selection is NOT_RUN because both fail eligibility; auto stays 0.
+
+  Separate current 2B-c1 controlled NONE/K2 and fresh NONE/K3 stop proofs pass:
+  each mode has four baselines and eight matching/EOF-partial UTF8 stop responses,
+  exact text/API usage parity, observable terminal metadata once and four actual
+  native stop-sequence summaries. No native callback-once or unseen duplicate-DONE
+  claim follows. Current K3 stochastic integration also passes: 18 native final
+  responses, two cancellations, 40 main HTTP responses, two disconnect/recoveries,
+  28/28 separate strict-format checks and all four engine-mapping roles. This is
+  unseeded integration, not distribution equality, other-model/c4 or speed proof.
+  The 2026-10-26 read-only cloud preflight stops at disabled billing (exit 3);
+  inventory, prices and session estimates are NOT_RUN. Paid spend remains zero.
+  Release readiness remains incomplete; all earlier image/model failures persist.
 - The native MI_OFF installed wheel now passes 69 SDK contract tests (one
   `asyncio_mode` configuration warning) and 12 actual Python/native completion,
   stream/async/cancel/recovery cases. It is `densecore-0.1.0-cp313-cp313-linux_x86_64.whl`,
@@ -19,8 +52,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   ordinary loading uses no preload/reexec or source fallback. This native-host ISA/
   GLIBC profile is not manylinux, generic-CPU, portable-image or broad model proof.
   Container strict Count and portable E4B c4 failures remain unchanged. MTP
-  performance V1 failed a precondition before measurement; fresh V2 A/A is still
-  running, so no performance result or automatic activation follows.
+  performance V1 failed a precondition before measurement; final K2/K3 results
+  below are separate fresh runs and neither qualifies automatic activation.
 - Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
   `ef9fc61` model evidence below remains a separate source/profile archive.
   On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
@@ -45,7 +78,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
   prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
   five positive client TTFT samples each; this is not a performance comparison.
-  ARM, physical NUMA, C4/C4A, actual GPT-OSS, MTP performance/auto, and final
+  ARM, physical NUMA, C4/C4A, actual GPT-OSS, untested MTP profiles/automatic activation, and final
   publication remain incomplete; automatic profiles, paid spend and publication
   remain zero. Final portable/source-matched model and prefix checks stay separate.
 - Current `ef9fc61` E4B c4 now passes two waves of four requests: all eight
