@@ -179,3 +179,15 @@ model = DenseCore("./model.gguf", hf_repo_id="Qwen/Qwen3-0.6B")
 - [CLI Guide](../docs/CLI.md)
 
 Apache 2.0 License. Issues: <https://github.com/DenseAI/DenseCore/issues>
+
+### Package an already qualified native build
+
+For a controlled build pipeline, set `DENSECORE_PREBUILT_LIB_DIR` to the directory containing `libdensecore.so` (or `libdensecore.dylib` on macOS) when building a wheel:
+
+```sh
+DENSECORE_PREBUILT_LIB_DIR=/absolute/path/to/qualified/build python -m build --wheel --no-isolation
+```
+
+This opt-in path copies the native library and its matching runtime libraries using the normal wheel packaging helpers, without invoking CMake. An empty or missing directory, or a directory without the required native library, fails without falling back to compilation. With the variable unset, the normal CMake build remains unchanged.
+
+The pipeline must verify the source revision, library and dependency hashes, CPU/ABI compatibility, and the wheel profile (`DENSECORE_USE_MIMALLOC=OFF`) against its qualified manifest before packaging. This switch does not infer those properties from a library filename. Test the actual wheel in an isolated environment with no source checkout on its import path.

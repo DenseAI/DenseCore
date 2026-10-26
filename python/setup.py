@@ -104,7 +104,25 @@ class CMakeBuild(build_ext):
                 self._copy_file(dep_path.resolve(), extdir / soname)
             return
 
+    @staticmethod
+    def _prebuilt_runtime():
+        value = os.environ.get("DENSECORE_PREBUILT_LIB_DIR")
+        if value is None:
+            return None
+        if not value.strip():
+            raise RuntimeError("DENSECORE_PREBUILT_LIB_DIR must name a nonempty directory")
+        directory = Path(value).expanduser().resolve()
+        if not directory.is_dir():
+            raise RuntimeError(f"Prebuilt native library directory does not exist: {directory}")
+        names = ("libdensecore.dylib", "libdensecore.so") if platform.system() == "Darwin" else ("libdensecore.so",)
+        for name in names:
+            library = directory / name
+            if library.is_file():
+                return directory, library
+        raise RuntimeError(f"Prebuilt native library missing in {directory}; expected {names}")
+
     def build_extension(self, ext):
+        prebuilt = self._prebuilt_runtime()
         # Get the full path where setuptools expects the extension module
         ext_fullpath = Path(self.get_ext_fullpath(ext.name)).resolve()
         extdir = ext_fullpath.parent
@@ -112,6 +130,12 @@ class CMakeBuild(build_ext):
         # Ensure the directory exists
         extdir.mkdir(parents=True, exist_ok=True)
         self._remove_runtime_libs(extdir)
+        if prebuilt is not None:
+            directory, library = prebuilt
+            shutil.copy2(library, ext_fullpath)
+            self._copy_matching_runtime_libs(directory, extdir)
+            self._copy_linux_runtime_dependency(library, extdir, "libgomp.so.1")
+            return
 
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         cfg = "Debug" if debug else "Release"
