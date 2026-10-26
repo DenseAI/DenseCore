@@ -11,24 +11,46 @@ performance/default promotions are qualified.
 
 ## Evidence boundaries
 
-The current frozen source is `48dd55a1630b37ca3e5e3658f0293a7beee81392`.
-Full native: 1358 run / 1344 passed / the same 14 skips, zero failures/disabled.
-Strict critical ASAN/LSan: 727 run / 718 passed / the same 9 skips, zero failures/
-disabled/reports. All prior 702 execute, with 11 new source cases and 14 existing
-loader cases newly selected; this remains a selected suite, not all 1358 normal
-tests. Same-source Go all/race 3, SDK 164 unit checks/27 optional skips and personal
-stdlib 88 pass. SDK unit passes do not establish every Linux loading context.
-Final actual wrapper library/test audits are no-work with stable bytes. The
-immutable artifact manifest pins 33 files and has SHA-256
-`34bdec57d3b39db6d1a675a9c9b08322cf456687af89fa65021e24d3cf69c77d`.
-The library SHA is
-`eaa3a208f22bec2e04ddeb3b4bb1060b5ae280dbdf0e59d4ee9bb796522209b3`;
-the server SHA is
-`72c38b718736afe8bc73feb54bbabf859a7414bcd859008a7f47acb2c0e97ad6`.
+## Current source qualification (`ef9fc61`)
+
+The frozen runtime source is `ef9fc61d6dde68bed4f5d6fb72cd52e9afa58b6c`.
+The immutable local manifest `v02-integrated-resource-isolation-artifact.json`
+has SHA-256 `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
+Native: 1377 run / 1363 passed / the same 14 skips; selected strict ASAN/LSan:
+761 run / 752 passed / the same 9 skips, zero failures/disabled/sanitizer reports.
+All prior 727 sanitizer cases and the added required cases execute. Policy 38,
+Go all and targeted race count=3 pass. SDK 164 passed / 27 optional skips is a
+separate cached-UV run, outside the sealed manifest; no personal-test result is
+inherited. SDK unit checks do not qualify all Linux loader contexts.
+
+The initial library and ASAN audits successfully relinked before their respective
+tests; they are historical build steps, not failed test runs. Final library/tests
+and ASAN audits are no-work. ASAN report V2 binds the executed binary and actual
+mapped dependencies to final audit snapshots/current bytes; the preliminary
+before-relink binary hash is explicitly unqualified.
+
+Actual H gates pass in order: original200 c1 and eight c8 requests each retain
+51-token EOS/raw-ID parity; separate80 c1 reaches the 128-token LENGTH limit;
+full80 has 37 recorded requests and a pressure snapshot active=8/pending=8.
+These are bounded native correctness/admission checks. Original200/80c1 use
+cache-OFF/fixed8; full80 retains cache-ON/adaptive settings. Their differences do
+not support a causal or performance comparison, or a complete 80-number answer.
+Earlier `143a2ad` and private `613a` failures remain historical evidence.
+
+Pinned E4B now initializes at unchanged context 2048, capacity 4, threads 8,
+Q8 KV and NONE speculation: required 3,468,717,568 <= available 3,505,483,776 plan
+bytes, peak whole-child RSS 6,240,676 KiB. No capacity/context reduction or retry
+was used. A separate c1 generation gate passes one 59-token EOS answer with all
+five planets and DONE; two subsequent repeats each match its 59-token EOS IDs
+and complete answer. This is not sustained >=128-token generation, c4/isolation,
+HTTP, package, broad support, minimum-RAM or performance qualification.
+Same-source MTP requalification is pending; the `48dd55a` hard-mask and
+`4ad6a35` JSON/probabilistic results below keep their original sources.
+Automatic MTP profiles remain zero; no performance/NUMA/GPT-OSS promotion follows.
 
 Prior `4ad6a35` native 1347/1333/14 and ASAN 702/693/9 remain source-labeled,
 including its JSON model passes and probabilistic overall FAIL below. They do
-not automatically transfer to `48dd55a`. Earlier `db9883a` native 1335/ASAN 688 and
+not automatically transfer to `ef9fc61`. Earlier `db9883a` native 1335/ASAN 688 and
 `3ed5428` sanitizer archives remain preserved as well.
 
 The shared sampler treats top-k=0 as disabling that filter without forcing
@@ -47,16 +69,16 @@ Python tokenizer is available), not native prompt accounting.
 
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `48dd55a` native 1344-pass/14-skip and critical ASAN 718-pass/9-skip; actual hard-mask NONE/MTP request isolation pass | H c8 parity remains unresolved; SDK TLS/package contexts remain limited; later fixes need source-matched checks |
-| B/H | Resource/planner fixtures; earlier 4 GiB serving and explicit 1 GiB rejection without OOM kill; historical `7ecaf86` embedding AUTO/LAST 12 bitwise C/Python/HTTP comparisons | Actual `143a2ad` c=8 resource/cleanup evidence passes, but request isolation does not; final image/platform checks remain |
-| B Gemma | Root `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 plus four staggered own-c1 cases PASS; private a9 passes and ad1/d408 failures retained | Root `48dd55a` E4B context 2048/capacity 4 capacity FAIL before generation. Private a9 capacity 1 is separate. No mixed-physical-graph, broad HTTP/support/default/performance claim |
+| A | Integrated `ef9fc61` native 1363-pass/14-skip, selected ASAN 752-pass/9-skip, Go/race and policy 38 pass | SDK TLS/package contexts remain limited; MTP model requalification pending |
+| B/H | `ef9fc61` original200 c1/c8 51-EOS parity, separate80 c1 128-LENGTH, full80 37-request gate PASS with active8/pending8 | Native bounded correctness/admission only; final image/platform and matched performance remain |
+| B Gemma | `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init PASS and complete 59-EOS c1 answer plus two exact repeats; historical `48dd55a` E2B grid retained | >=128-token generation, c4/isolation, HTTP/package/support/performance remain pending |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
 | D | Root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
 
-## Retained correctness failures
+## Historical correctness failures
 
 Actual H resource testing on `143a2ad` observed a pressure snapshot with 8 active
 and 8 pending requests (maximum observed pending 12). Oversized prompt admission
@@ -268,7 +290,17 @@ D21, record release readiness as incomplete and the release delayed.
 These are local ledger identifiers, not public download promises. Archive raw
 identities before publishing any claim; use the relative reproduction links above.
 
-- `v02-integrated-48dd-artifact.json`, `v02-staging-48dd-asan-report.json`;
+- `v02-integrated-resource-isolation-artifact.json` (SHA above),
+  `v02-resource-isolation-asan-report-v2.json`,
+  `v02-integrated-resource-isolation-execution-receipt.json`,
+  `v02-integrated-resource-isolation-sdk.log` (separate cached-UV run).
+- `v02-h-resource-isolation-original200-c8-ctx512-cache0-fixed8-control/phase-gate.json`,
+  `v02-h-resource-isolation-80-c1-pressure/phase-gate.json`,
+  `v02-h-resource-isolation-80-full-ctx512/phase-gate.json`.
+- `v02-gemma-resource-isolation-e4b-cap4-init-only/result.json`,
+  `v02-gemma-resource-isolation-e4b-quality-c1/quality-gate.json`,
+  `v02-gemma-resource-isolation-e4b-quality-repeat/quality-gate.json`.
+- Historical `v02-integrated-48dd-artifact.json`, `v02-staging-48dd-asan-report.json`;
   immutable manifest SHA is recorded above. `v02-hard-mask-48dd-v2-report.json`
   binds reviewed local V2 tool/script hashes, callbacks, owners and process receipts;
   `v02-hard-mask-48dd-infrastructure-failure.json` preserves V1 UNEXECUTED.

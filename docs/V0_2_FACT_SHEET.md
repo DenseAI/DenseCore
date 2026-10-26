@@ -2,7 +2,7 @@
 
 **Release readiness is incomplete.** No v0.2 image, tag or release has been
 published by this work. Community post text remains the user's responsibility.
-The current integrated source is `48dd55a`; historical private-model and earlier
+The current integrated source is `ef9fc61`; historical private-model and earlier
 package evidence below retain separate identities.
 
 Intended deployments are personal PCs, resource-limited CPU Kubernetes pods and
@@ -11,18 +11,28 @@ metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
 
-- Integrated `48dd55a`: native 1358 / passed 1344 / the same 14 skips; strict
-  critical ASAN/LSan 727 / passed 718 / the same 9 skips, zero failures/disabled/
-  reports. All prior 702 plus 11 added and 14 existing newly selected loader cases
-  execute. Actual final wrapper audits are no-work; an immutable 33-file artifact
-  binds source and runtime bytes. Go all/race 3, SDK 164/27 optional skips and
-  personal stdlib 88 pass. These fixtures do not establish all SDK loader modes.
-- Actual `48dd55a` hard-mask NONE/MTP lifecycle passes: four contradictory-mask
+- Integrated `ef9fc61`: native 1377/1363 passed/14 existing skips; selected
+  ASAN/LSan 761/752 passed/9 existing skips, zero failures/reports. Go all,
+  targeted race count=3 and policy 38 pass. Final actual audits are no-work;
+  initial pretest relinks are historical build steps. ASAN V2 binds executed
+  bytes. Separate cached-UV SDK 164/27 optional skips is outside the manifest.
+- Actual `ef9fc61` H passes original200 c1/c8 51-token EOS parity, separate80
+  c1 128-token LENGTH and full80 37-request gate with active8/pending8.
+  Cache-OFF/fixed8 and cache-ON/adaptive profiles stay distinct; no complete
+  80-number-answer or performance claim follows.
+- Actual `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init passes:
+  required 3,468,717,568 <= available 3,505,483,776 plan bytes; peak child RSS
+  6,240,676 KiB. Separate c1 passes one complete five-planet/DONE answer at
+  59-token EOS; two repeats match its IDs and complete answer. Sustained
+  >=128-token generation, c4/isolation, HTTP/package/support
+  and performance remain pending. Same-source MTP requalification is pending.
+  Manifest SHA: `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
+- Historical `48dd55a` hard-mask NONE/MTP lifecycle passes: four contradictory-mask
   errors with zero output/generated tokens, six healthy peers/recoveries and
   exact terminal/metadata counts. Only healthy MTP requests show proposal
   verification. Original V1 static-TLS failure before engine init is UNEXECUTED;
   reviewed V2 corrects only qualified-library startup preload.
-- Actual root `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 plus four staggered requests
+- Historical root `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 plus four staggered requests
   match old/own c1 IDs and complete answers; no mixed physical graph is claimed.
   E4B context 2048/capacity 4 init FAIL (plan 5,921,446,144 > 4,681,576,448 available bytes),
   zero generation, failed-init RSS 6,236,108 KiB. This is not RAM savings or a
@@ -34,7 +44,7 @@ and [model catalog](MODEL_CATALOG.md).
   static TLS. These loader probes invoke no engine/model.
 - Shared-sampler fixes cover disabled top-k, conditional nucleus filtering and
   grammar intersections. Mock-native full-worker NONE error/peer/recovery checks
-  pass. Same-source Go all/race checks, SDK 164 unit checks/27 optional skips and
+  pass. Historical `48dd55a` Go all/race checks, SDK 164 unit checks/27 optional skips and
   88 standard-library benchmark tests passed; they are not actual Python JSON proof.
 - Source-labeled `4ad6a35` pinned 0.8B and 2B JSON NONE/MTP c1/c4 native and HTTP probes
   pass: each model has 16 main native/32 HTTP requests, native cancel/recovery and

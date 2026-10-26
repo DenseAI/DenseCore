@@ -11,6 +11,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### v0.2 candidates (qualification in progress)
 
+- Requalify frozen `ef9fc61`: native 1377/1363 passed/14 existing skips;
+  selected ASAN/LSan 761/752 passed/9 existing skips; Go all/race count=3 and
+  policy 38 pass. Final audits are no-work; successful initial pretest relinks
+  remain historical build steps. ASAN V2 pins executed bytes. Separate cached-UV
+  SDK has 164 passed/27 optional skips, outside the sealed manifest.
+- Actual `ef9fc61` H passes original200 c1/c8 51-EOS parity, separate80 c1
+  128-LENGTH and full80 37-request gate with active8/pending8. Profiles retain
+  their original cache/thread settings; no speed or complete80-answer claim.
+- Actual `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE initializes and passes
+  one complete five-planet/DONE c1 answer at 59-token EOS, plus two exact-ID
+  complete-answer repeats. Init plan required
+  3,468,717,568 <= available 3,505,483,776 bytes; peak child RSS 6,240,676 KiB.
+  >=128-token generation, c4/isolation, HTTP/package/support remain pending.
+  Same-source MTP is pending; historical results below keep their own sources.
+  Manifest SHA: `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
 - Add common Linux resource budgeting, context-preserving automatic concurrency,
   versioned diagnostics and embedding pooling AUTO. Actual integrated `143a2ad`
   c8 resource/admission/cancellation checks pass, but greedy EOS parity fails,
@@ -57,20 +72,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   during accepted work, bounded stream completion and cleanup. Strict Count
   still fails. Current integrated core image is untested; original successful
   init-log capture has syntax checks only, awaiting final kind validation.
-- Integrated `48dd55a` native: 1358 run / 1344 passed / the same 14 skips;
+- Historical integrated `48dd55a` native: 1358 run / 1344 passed / the same 14 skips;
   strict critical ASAN/LSan: 727 run / 718 passed / the same 9 skips, zero
   failures/disabled/reports. The sanitizer selection contains all prior 702,
   11 added cases and 14 existing loader cases newly selected. Go all/race 3,
   SDK 164/27 optional skips and personal-tool 88 checks pass. Final actual
   wrapper audits are no-work; the immutable artifact pins 33 files. Earlier
   `4ad6a35`, `db9883a` and `3ed5428` evidence remains source-labeled.
-- Actual `48dd55a` hard-mask lifecycle: NONE/MTP contradictory allow 16/deny 16
+- Historical `48dd55a` hard-mask lifecycle: NONE/MTP contradictory allow 16/deny 16
   JSON-off requests at temperatures 0/0.7 produce four zero-output ERROR finishes;
   six active-peer/recovery requests pass. Healthy MTP controls show actual
   verification/rejection/rollback; no successful verification is claimed for
   failing requests. V1 static-TLS failure before engine initialization remains
   UNEXECUTED; reviewed V2 changes only verified-library startup preload.
-- Actual `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 and four staggered requests
+- Historical `48dd55a` E2B formal 20 cache-ON/OFF c=1/c=4 and four staggered requests
   match their old/own c1 IDs and complete answers. E4B context 2048/capacity 4 still
   fails initialization capacity (required 5,921,446,144 > available 4,681,576,448
   plan bytes), with zero generation. Failed-init peak RSS 6,236,108 KiB is not
