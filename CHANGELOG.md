@@ -25,7 +25,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Portable `07fe153` E4B sustained c1 passes its own 246-ID EOS answer. Its c4 run
   fails the unchanged 300-second request deadline with cancellation/incomplete
   waves; no retry or context reduction was made. Native `ef9fc61` 254-ID c4 success
-  is not inherited. A separate amd64-v3 build is pending, with no qualification.
+  is not inherited. The separate amd64-v3 container also fails strict Count, while
+  initialization/drain/explicit memory rejection pass. Its E4B c1 run refuses
+  initialization at ctx2048/cap4: required 3,445,450,752 > available
+  3,319,349,248 plan bytes. No generation capture exists; cascading missing-capture
+  diagnostics are not semantic-quality failures. amd64-v3 E4B c4 is NOT_RUN.
+  Portable own246 c1 PASS/c4 deadline FAIL remain unchanged and separate.
   On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
   formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
   prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and

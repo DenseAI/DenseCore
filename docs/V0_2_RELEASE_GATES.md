@@ -27,7 +27,12 @@ and `release_qualified` remains false. No image was published.
 Portable `07fe153` E4B sustained c1 passes its own 246-ID EOS answer. Its c4 run
 fails the unchanged 300-second request deadline with cancellation/incomplete
 waves; no retry or context reduction was made. Native `ef9fc61` 254-ID c4 success
-is not inherited. A separate amd64-v3 build is pending, with no qualification.
+is not inherited. The separate amd64-v3 container also fails strict Count, while
+initialization/drain/explicit memory rejection pass. Its E4B c1 run refuses
+initialization at ctx2048/cap4: required 3,445,450,752 > available
+3,319,349,248 plan bytes. No generation capture exists; cascading missing-capture
+diagnostics are not semantic-quality failures. amd64-v3 E4B c4 is NOT_RUN.
+Portable own246 c1 PASS/c4 deadline FAIL remain unchanged and separate.
 On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
 formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
 prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
@@ -361,6 +366,9 @@ identities before publishing any claim; use the relative reproduction links abov
 - `artifacts/portable-float-fix/{final-summary,final-skip-identity,independent-source-review-07fe153}.json`.
 - `artifacts/package-07fe153-20261026T083750Z/{final-package-seal,container-qa-receipt,local-image-receipt}.json`
   and `kind-qa/summary.json`; container strict Count FAIL is retained.
+- `v02-container-07fe153-amd64-v3-model-smoke.log`: strict Count FAIL,
+  init/drain/rejection PASS; `v02-gemma-amd64-v3-07fe-c1/{receipt.json,native.log}`
+  records primary initialization-capacity refusal, no semantic result and c4 NOT_RUN.
 - `v02-gemma-portable-07fe-{c1,c4}/receipt.json`: portable own246 c1 PASS,
   c4 deadline/cancel FAIL, separate from native EF9 own254.
 - `v02-qwen3-resource-isolation-matrix.json`,
