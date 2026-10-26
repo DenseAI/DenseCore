@@ -543,6 +543,31 @@ std::vector<float> GemmaRepackOutput(ggml_tensor* weight) {
 }
 
 namespace {
+void ExpectNoGemmaRepackOwnership(const TransformerModel& model) {
+    const auto& weights = model.prepared_weights;
+    EXPECT_EQ(weights.ctx_cpu_repack,nullptr);
+    EXPECT_TRUE(weights.cpu_repack_buffers.empty());
+    EXPECT_TRUE(weights.host_buffers.empty());
+    EXPECT_TRUE(weights.cpu_repack_aliases.empty());
+    EXPECT_TRUE(weights.cpu_repack_alias_sources.empty());
+    EXPECT_TRUE(weights.cpu_repack_alias_layouts.empty());
+}
+
+// Buffer allocation alone does not establish support: ggml may initialize a
+// CPU_REPACK tensor successfully with null extra when no compiled kernel fits.
+bool GemmaRepackSupportsFixture(const GemmaRepackFixture& fixture) {
+    auto bufts = densecore::llm::weights::FindCpuRepackBufferTypes(fixture.model->backend);
+    if (!bufts.cpu_repack) return false;
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> ctx(ggml_init({1024*1024,nullptr,true}),ggml_free);
+    const auto* source = fixture.model->layers[0].Get("attn_q.weight");
+    auto* qkv = ggml_new_tensor_2d(ctx.get(),source->type,fixture.width,source->ne[1]*3);
+    auto* gate_up = ggml_new_tensor_2d(ctx.get(),source->type,fixture.width,source->ne[1]*2);
+    std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),bufts.cpu_repack),ggml_backend_buffer_free);
+    EXPECT_NE(buffer,nullptr);
+    return buffer && (qkv->extra || gate_up->extra);
+}
+
 void CheckGemmaRepackGolden(GemmaRepackFixture& fixture) {
     auto bufts = densecore::llm::weights::FindCpuRepackBufferTypes(fixture.model->backend);
     ASSERT_NE(bufts.cpu_repack,nullptr);
@@ -554,17 +579,29 @@ void CheckGemmaRepackGolden(GemmaRepackFixture& fixture) {
     std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
         ggml_backend_alloc_ctx_tensors_from_buft(expected.get(),bufts.cpu_repack),ggml_backend_buffer_free);
     ASSERT_NE(buffer,nullptr);
-    for (size_t i = 0; i < expected_aliases.size(); ++i)
+    size_t largest = 0;
+    for (size_t i = 0; i < expected_aliases.size(); ++i) {
+        if (!expected_aliases[i]->extra) continue;
         ggml_backend_tensor_set(expected_aliases[i],fixture.old_fused_inputs[i].data(),0,fixture.old_fused_inputs[i].size());
+        largest = std::max(largest,fixture.old_fused_inputs[i].size());
+    }
+    auto* fallback = fixture.model->layers[0].Get("attn_q.weight");
+    const auto fallback_output = GemmaRepackOutput(fallback);
+    ASSERT_FALSE(fallback_output.empty());
+    for (float value : fallback_output) ASSERT_TRUE(std::isfinite(value));
     size_t peak = 0,live = 0;
     ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
     EXPECT_EQ(live,0u);
-    const auto largest = std::max_element(fixture.old_fused_inputs.begin(),fixture.old_fused_inputs.end(),
-        [](const auto& a,const auto& b) { return a.size() < b.size(); })->size();
     EXPECT_LE(peak,largest);
-    EXPECT_GT(peak,0u);
+    if (largest) EXPECT_GT(peak,0u);
+    else ExpectNoGemmaRepackOwnership(*fixture.model);
+    EXPECT_EQ(GemmaRepackOutput(fallback),fallback_output);
     for (size_t i = 0; i < expected_aliases.size(); ++i) {
         auto* alias = fixture.model->layers[i/2].Get(i%2 ? "ffn_gate_up.cpu_repack_fused" : "attn_qkv.cpu_repack_fused");
+        if (!expected_aliases[i]->extra) {
+            EXPECT_EQ(alias,nullptr);
+            continue;
+        }
         ASSERT_NE(alias,nullptr);
         ASSERT_NE(alias->extra,nullptr);
         EXPECT_EQ(ggml_nbytes(alias),fixture.old_fused_inputs[i].size());
@@ -589,7 +626,12 @@ TEST(Gemma4RepackStaging, FailedMaterializationReleasesStagingAndLeavesNoPublish
     for (int fail_after : {0,1,3}) {
         GemmaRepackFixture fixture;
         size_t peak = 0,live = 0;
-        EXPECT_FALSE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,fail_after));
+        const bool supported = GemmaRepackSupportsFixture(fixture);
+        EXPECT_EQ(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,fail_after),!supported);
+        if (!supported) {
+            EXPECT_EQ(peak,0u);
+            ExpectNoGemmaRepackOwnership(*fixture.model);
+        }
         EXPECT_EQ(live,0u);
         EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
         EXPECT_TRUE(fixture.model->prepared_weights.host_buffers.empty());
@@ -619,7 +661,12 @@ TEST(Gemma4RepackStaging, PublicationFailureRestoresOlderKeysAndAllowsCleanRetry
         auto* previous = fixture.model->layers[0].Get("attn_q.weight");
         fixture.model->layers[0].Set("attn_qkv.cpu_repack_fused",previous);
         size_t peak = 0,live = 0;
-        EXPECT_FALSE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1,publication));
+        const bool supported = GemmaRepackSupportsFixture(fixture);
+        EXPECT_EQ(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1,publication),!supported);
+        if (!supported) {
+            EXPECT_EQ(peak,0u);
+            ExpectNoGemmaRepackOwnership(*fixture.model);
+        }
         EXPECT_EQ(live,0u);
         EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
         EXPECT_EQ(fixture.model->layers[0].Get("ffn_gate_up.cpu_repack_fused"),nullptr);
@@ -627,7 +674,8 @@ TEST(Gemma4RepackStaging, PublicationFailureRestoresOlderKeysAndAllowsCleanRetry
         EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_buffers.empty());
         EXPECT_TRUE(fixture.model->prepared_weights.cpu_repack_aliases.empty());
         EXPECT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
-        EXPECT_NE(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
+        if (supported) EXPECT_NE(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
+        else EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),previous);
     }
 }
 
@@ -636,29 +684,44 @@ TEST(Gemma4RepackStaging, AlreadyOwnedPreparationIsIdempotentAndIncompleteContex
     size_t peak = 0,live = 0;
     ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
     auto& weights = fixture.model->prepared_weights;
-    auto* context = weights.ctx_cpu_repack;
-    const auto buffers = weights.cpu_repack_buffers;
-    const auto aliases = weights.cpu_repack_aliases;
-    const auto sources = weights.cpu_repack_alias_sources;
-    const auto layouts = weights.cpu_repack_alias_layouts;
-    auto* fused = fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused");
-    ASSERT_NE(context,nullptr);
-    ASSERT_NE(fused,nullptr);
-    ASSERT_FALSE(aliases.empty());
-    const auto output = GemmaRepackOutput(fused);
-    const auto* bytes = static_cast<const uint8_t*>(fused->data);
-    const std::vector<uint8_t> packed(bytes,bytes+ggml_nbytes(fused));
-    ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,0));
-    EXPECT_EQ(peak,0u);
-    EXPECT_EQ(live,0u);
-    EXPECT_EQ(weights.ctx_cpu_repack,context);
-    EXPECT_EQ(weights.cpu_repack_buffers,buffers);
-    EXPECT_EQ(weights.cpu_repack_aliases,aliases);
-    EXPECT_EQ(weights.cpu_repack_alias_sources,sources);
-    EXPECT_EQ(weights.cpu_repack_alias_layouts,layouts);
-    EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),fused);
-    EXPECT_EQ(std::memcmp(packed.data(),fused->data,packed.size()),0);
-    EXPECT_EQ(GemmaRepackOutput(fused),output);
+    if (!GemmaRepackSupportsFixture(fixture)) {
+        EXPECT_EQ(peak,0u);
+        EXPECT_EQ(live,0u);
+        ExpectNoGemmaRepackOwnership(*fixture.model);
+        EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),nullptr);
+        const auto output = GemmaRepackOutput(fixture.model->layers[0].Get("attn_q.weight"));
+        ASSERT_FALSE(output.empty());
+        for (float value : output) ASSERT_TRUE(std::isfinite(value));
+        ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,0));
+        EXPECT_EQ(peak,0u);
+        EXPECT_EQ(live,0u);
+        ExpectNoGemmaRepackOwnership(*fixture.model);
+        EXPECT_EQ(GemmaRepackOutput(fixture.model->layers[0].Get("attn_q.weight")),output);
+    } else {
+        auto* context = weights.ctx_cpu_repack;
+        const auto buffers = weights.cpu_repack_buffers;
+        const auto aliases = weights.cpu_repack_aliases;
+        const auto sources = weights.cpu_repack_alias_sources;
+        const auto layouts = weights.cpu_repack_alias_layouts;
+        auto* fused = fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused");
+        ASSERT_NE(context,nullptr);
+        ASSERT_NE(fused,nullptr);
+        ASSERT_FALSE(aliases.empty());
+        const auto output = GemmaRepackOutput(fused);
+        const auto* bytes = static_cast<const uint8_t*>(fused->data);
+        const std::vector<uint8_t> packed(bytes,bytes+ggml_nbytes(fused));
+        ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,0));
+        EXPECT_EQ(peak,0u);
+        EXPECT_EQ(live,0u);
+        EXPECT_EQ(weights.ctx_cpu_repack,context);
+        EXPECT_EQ(weights.cpu_repack_buffers,buffers);
+        EXPECT_EQ(weights.cpu_repack_aliases,aliases);
+        EXPECT_EQ(weights.cpu_repack_alias_sources,sources);
+        EXPECT_EQ(weights.cpu_repack_alias_layouts,layouts);
+        EXPECT_EQ(fixture.model->layers[0].Get("attn_qkv.cpu_repack_fused"),fused);
+        EXPECT_EQ(std::memcmp(packed.data(),fused->data,packed.size()),0);
+        EXPECT_EQ(GemmaRepackOutput(fused),output);
+    }
     GemmaRepackFixture incomplete;
     incomplete.model->prepared_weights.ctx_cpu_repack = ggml_init({1024*1024,nullptr,true});
     auto* original = incomplete.model->prepared_weights.ctx_cpu_repack;
