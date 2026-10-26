@@ -8,6 +8,7 @@
 #include "llm/attention/internal.h"
 #include "llm/matmul/diagnostics.h"
 #include "llm/matmul/execution_policy.h"
+#include "llm/matmul/float_projection.h"
 #include "llm/matmul/q8_kernels.h"
 #include "llm/matmul/quant_cache.h"
 #include "llm/matmul/userdata.h"
@@ -255,7 +256,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
         column_ud.phase_snapshot = callback_phase;
         for (int m = 0; m < M; ++m) {
             if (canonical_ple_f32 && weight_row_stride != static_cast<size_t>(N) * sizeof(float)) {
-                // A padded F32 row takes Gemma4FloatProjection/DotF32 at M=1,
+                // A padded F32 row takes Gemma4FloatProjection at M=1,
                 // while a contiguous row takes cb_gemv_custom/GemvParallel.
                 // Keep both old singleton primitives, rather than assuming
                 // that two mathematically equivalent SIMD dots have equal bits.
@@ -263,7 +264,7 @@ void cb_gemv_batched_custom(struct ggml_tensor* dst, int ith, int nth, void* use
                 for (int k = k_start; k < k_end; ++k) {
                     const auto* row = reinterpret_cast<const float*>(
                         static_cast<const char*>(weight_tensor->data) + static_cast<size_t>(k) * weight_row_stride);
-                    output[k] = densecore::simd::DotF32(row, x_rows[static_cast<size_t>(m)], static_cast<size_t>(N));
+                    output[k] = densecore::llm::matmul::Gemma4FloatProjectionDot(row, x_rows[static_cast<size_t>(m)], static_cast<size_t>(N));
                 }
                 continue;
             }

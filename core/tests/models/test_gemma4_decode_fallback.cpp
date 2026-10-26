@@ -1217,6 +1217,69 @@ TEST(Gemma4FallbackDecodeTest, NativeFloatProjectionMatchesRepresentedWeightsFor
     }
 }
 
+// The large terms share one SIMD lane and cancel exactly. Small represented
+// terms in the other lanes remain observable on both native SIMD and portable
+// projections, whereas a sequential F32 reduction loses them before cancellation.
+TEST(Gemma4FallbackDecodeTest, FloatProjectionPreservesSmallTermsAcrossCancellation) {
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int columns : {1, 25}) {
+            SCOPED_TRACE(static_cast<int>(type));
+            SCOPED_TRACE(columns);
+            constexpr int k = 256;
+            constexpr int rows = 3;
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+                ggml_init({1024 * 1024, nullptr, false}), ggml_free);
+            ASSERT_NE(ctx, nullptr);
+            auto* storage = ggml_new_tensor_2d(ctx.get(), type, k + 3, rows);
+            auto* weight = ggml_view_2d(ctx.get(), storage, k, rows, storage->nb[1], 0);
+            auto* input_storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k + 5, columns);
+            auto* input = ggml_view_2d(ctx.get(), input_storage, k, columns, input_storage->nb[1], sizeof(float));
+            for (int row = 0; row < rows; ++row) {
+                const float value = row == 0 ? 1.0f : row == 1 ? -1.0f : 0.5f;
+                char* data = static_cast<char*>(weight->data) + row * weight->nb[1];
+                for (int j = 0; j < k; ++j) {
+                    if (type == GGML_TYPE_F32) {
+                        std::memcpy(data + j * sizeof(float), &value, sizeof(value));
+                    } else if (type == GGML_TYPE_F16) {
+                        const auto half = ggml_fp32_to_fp16(value);
+                        std::memcpy(data + j * sizeof(half), &half, sizeof(half));
+                    } else {
+                        const auto half = ggml_fp32_to_bf16(value);
+                        std::memcpy(data + j * sizeof(half), &half, sizeof(half));
+                    }
+                }
+            }
+            for (int col = 0; col < columns; ++col) {
+                auto* values = reinterpret_cast<float*>(static_cast<char*>(input->data) + col * input->nb[1]);
+                for (int j = 0; j < k; ++j) values[j] = j % 4 == 0 ? 0.0f : 1.0f / 4096.0f;
+                values[0] = 16384.0f;
+                values[k - 8] = -16384.0f;
+            }
+            TransformerModel model{};
+            model.variant = ModelVariant::GEMMA4;
+            model.arch_flags.is_gemma4 = true;
+            auto* result = densecore::testing::SmartMulMatWithPhaseTest(
+                ctx.get(), weight, input, &model,
+                static_cast<int>(columns == 1 ? InferenceExecutionPhase::Decode : InferenceExecutionPhase::Prefill));
+            ASSERT_NE(result, nullptr);
+            ASSERT_EQ(result->op, GGML_OP_CUSTOM);
+            auto* graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(graph, result);
+            ASSERT_EQ(ggml_graph_compute_with_ctx(ctx.get(), graph, 4), GGML_STATUS_SUCCESS);
+            const auto* actual = static_cast<const float*>(result->data);
+            for (int col = 0; col < columns; ++col) {
+                for (int row = 0; row < rows; ++row) {
+                    // All weight/input values are binary fractions exactly
+                    // represented by every dtype, so this sum is exact in F64.
+                    const double scale = row == 0 ? 1.0 : row == 1 ? -1.0 : 0.5;
+                    const double reference = scale * (k / 4 * 3) / 4096.0;
+                    EXPECT_NEAR(actual[col * rows + row], reference, 2e-6 * std::max(1.0, std::abs(reference)));
+                }
+            }
+        }
+    }
+}
+
 TEST(Gemma4FallbackDecodeTest, Bf16ProjectionLayerLogitsMatchRoundedF32AcrossDecodeSteps) {
     ScopedFlashAttentionDisableForTest flash_guard;
     auto model = MakeSlidingDecodeGraphModel(false);

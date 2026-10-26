@@ -6,6 +6,7 @@
 #include "llm/attention/internal.h"
 #include "llm/matmul/diagnostics.h"
 #include "llm/matmul/execution_policy.h"
+#include "llm/matmul/float_projection.h"
 #include "llm/matmul/q8_kernels.h"
 #include "llm/matmul/quant_cache.h"
 #include "llm/matmul/userdata.h"
@@ -66,7 +67,7 @@ static void Gemma4FloatProjection(struct ggml_tensor* dst, int ith, int nth, voi
             const float* activation = reinterpret_cast<const float*>(
                 static_cast<const char*>(input->data) + m * input->nb[1]);
             float* output = reinterpret_cast<float*>(static_cast<char*>(dst->data) + m * dst->nb[1]);
-            output[n] = densecore::simd::DotF32(values, activation, static_cast<size_t>(k));
+            output[n] = densecore::llm::matmul::Gemma4FloatProjectionDot(values, activation, static_cast<size_t>(k));
         }
     }
 }
