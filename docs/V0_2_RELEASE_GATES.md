@@ -13,6 +13,17 @@ performance/default promotions are qualified.
 
 ## Latest source and portable package (`07fe153`)
 
+The native MI_OFF installed wheel now passes 69 SDK contract tests (one
+`asyncio_mode` configuration warning) and 12 actual Python/native completion,
+stream/async/cancel/recovery cases. It is `densecore-0.1.0-cp313-cp313-linux_x86_64.whl`,
+packaging source `08c2848` with core `07fe153`, not a published v0.2 wheel.
+Initial/final actual process maps each bind 24 records to installed artifacts;
+ordinary loading uses no preload/reexec or source fallback. This native-host ISA/
+GLIBC profile is not manylinux, generic-CPU, portable-image or broad model proof.
+Container strict Count and portable E4B c4 failures remain unchanged. MTP
+performance V1 failed a precondition before measurement; fresh V2 A/A is still
+running, so no performance result or automatic activation follows.
+
 Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
 `ef9fc61` model evidence below remains a separate source/profile archive.
 On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
@@ -49,6 +60,19 @@ The `package-07fe153-20261026T083750Z/final-package-seal.json` SHA is
 its kind component summary SHA is
 `14ee13052c2753746fc28842c57df96021e450ecc71395dc8de19baaaa545258`.
 Portable E4B c1/c4 receipts retain their native hashes and own baseline.
+
+Installed-wheel manifest SHA:
+`b05497d1bc92721dff3948149a55cc650f3efdb84729d056291db30554c1535e`;
+wheel SHA (recorded by actual package/install pipeline):
+`e7ae9b1973a1210578f70f71345ac142d649fab40ed4e0d0b41cf3afdd8903fa`.
+The actual pytest session import proof SHA is
+`a1cb690b11453b7f121f46bfd35f422e7ef4ade3eaa2ed7873fd63dfe5309622`.
+Independent small-receipt review
+`tools/v02-wheel-07fe-artifacts/independent-wheel-receipt-review.json` SHA
+`bfd3c01eb714f239e7751f5dc916be93dfa9c781071cb2981fd1cfa81f2bb14f`
+binds receipts and recorded map hashes without rehashing large binaries during
+performance work. Actual generation manifest/result remain separate from the
+installed manifest's earlier “generation pending” preparation scope.
 
 ## Frozen native source qualification (`ef9fc61`)
 

@@ -11,6 +11,17 @@ metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
 
+The native MI_OFF installed wheel now passes 69 SDK contract tests (one
+`asyncio_mode` configuration warning) and 12 actual Python/native completion,
+stream/async/cancel/recovery cases. It is `densecore-0.1.0-cp313-cp313-linux_x86_64.whl`,
+packaging source `08c2848` with core `07fe153`, not a published v0.2 wheel.
+Initial/final actual process maps each bind 24 records to installed artifacts;
+ordinary loading uses no preload/reexec or source fallback. This native-host ISA/
+GLIBC profile is not manylinux, generic-CPU, portable-image or broad model proof.
+Container strict Count and portable E4B c4 failures remain unchanged. MTP
+performance V1 failed a precondition before measurement; fresh V2 A/A is still
+running, so no performance result or automatic activation follows.
+
 Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
 `ef9fc61` model evidence below remains a separate source/profile archive.
 On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
