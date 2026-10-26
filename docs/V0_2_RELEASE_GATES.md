@@ -11,7 +11,41 @@ performance/default promotions are qualified.
 
 ## Evidence boundaries
 
-## Current source qualification (`ef9fc61`)
+## Latest source and portable package (`07fe153`)
+
+Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
+`ef9fc61` model evidence below remains a separate source/profile archive.
+On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
+1378/1354 passed/24 skips, exactly the prior set plus ten unavailable compiled
+packed-Q4/Q5 cases. No Float case is skipped. Portable focused strict ASAN passes
+49/49 with actual mapped dependencies; independent float-fix review passes.
+The local portable amd64 image `sha256:95f8e7e70e157222c652611db2deea10f4d081b48305794456f14b183b4bd2db`
+passes initialization/Paris, active drain and explicit 1 GiB rejection, but strict
+stream Count 1-to-2 returns `2` and **fails**. Kind chart/downloader/checksum/
+limits/drain/cleanup components pass; final-answer quality is outside that gate
+and `release_qualified` remains false. No image was published.
+Portable `07fe153` E4B sustained c1 passes its own 246-ID EOS answer. Its c4 run
+fails the unchanged 300-second request deadline with cancellation/incomplete
+waves; no retry or context reduction was made. Native `ef9fc61` 254-ID c4 success
+is not inherited. A separate amd64-v3 build is pending, with no qualification.
+On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
+formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
+prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
+five positive client TTFT samples each; this is not a performance comparison.
+ARM, physical NUMA, C4/C4A, actual GPT-OSS, MTP performance/auto, and final
+publication remain incomplete; automatic profiles, paid spend and publication
+remain zero. Final portable/source-matched model and prefix checks stay separate.
+
+Local evidence: `artifacts/portable-float-fix/final-summary.json` SHA
+`bbcea9dd0463df7d67c6f592973a0b9331805ca11c50d0af25febd35759e7ccf`;
+independent review SHA `f11621f20d5eebd6079a0dc13959abbed3f8fe5cb47bef4b3cb8de93fbac8ec2`.
+The `package-07fe153-20261026T083750Z/final-package-seal.json` SHA is
+`dd4f505412fd1c2345391d84a21a58f35d95afc8976216170df677ae51c6ae77`;
+its kind component summary SHA is
+`14ee13052c2753746fc28842c57df96021e450ecc71395dc8de19baaaa545258`.
+Portable E4B c1/c4 receipts retain their native hashes and own baseline.
+
+## Frozen native source qualification (`ef9fc61`)
 
 The frozen runtime source is `ef9fc61d6dde68bed4f5d6fb72cd52e9afa58b6c`.
 The immutable local manifest `v02-integrated-resource-isolation-artifact.json`
@@ -324,6 +358,13 @@ D21, record release readiness as incomplete and the release delayed.
 These are local ledger identifiers, not public download promises. Archive raw
 identities before publishing any claim; use the relative reproduction links above.
 
+- `artifacts/portable-float-fix/{final-summary,final-skip-identity,independent-source-review-07fe153}.json`.
+- `artifacts/package-07fe153-20261026T083750Z/{final-package-seal,container-qa-receipt,local-image-receipt}.json`
+  and `kind-qa/summary.json`; container strict Count FAIL is retained.
+- `v02-gemma-portable-07fe-{c1,c4}/receipt.json`: portable own246 c1 PASS,
+  c4 deadline/cancel FAIL, separate from native EF9 own254.
+- `v02-qwen3-resource-isolation-matrix.json`,
+  `v02-prefix-resource-isolation-{08b,2b}/all-qualification.json`.
 - `v02-integrated-resource-isolation-artifact.json` (SHA above),
   `v02-resource-isolation-asan-report-v2.json`,
   `v02-integrated-resource-isolation-execution-receipt.json`,

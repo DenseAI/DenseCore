@@ -2,14 +2,37 @@
 
 A pin identifies bytes. It is separate from implementation, real-model quality,
 performance and automatic feature activation. The current v0.2 work does not
-promote MTP or NUMA defaults from fixture tests. The integrated source snapshot is
-`ef9fc61`; qualification rows below keep their own source boundaries. Historical
+promote MTP or NUMA defaults from fixture tests. The latest reviewed source snapshot is
+`07fe153`; qualification rows below keep their own source boundaries. Historical
 `7ecaf86`, private `5ad54a5`, prior Gemma diagnostics and Go-only `386b800` results
 remain preserved. Current bounded H c=8 native gates pass; remaining model,
 package and performance gates still block broad support promotion. Source `4ad6a35` JSON probes pass for the two pinned MTP files; its unchanged
 probabilistic matrix remains overall FAIL and is not inherited by `ef9fc61`. Full gates and local raw ledger names are in
 [release gates](V0_2_RELEASE_GATES.md). Historical v0.1 measurements are
 linked from [Benchmarks](BENCHMARKS.md).
+
+Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
+`ef9fc61` model evidence below remains a separate source/profile archive.
+On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
+1378/1354 passed/24 skips, exactly the prior set plus ten unavailable compiled
+packed-Q4/Q5 cases. No Float case is skipped. Portable focused strict ASAN passes
+49/49 with actual mapped dependencies; independent float-fix review passes.
+The local portable amd64 image `sha256:95f8e7e70e157222c652611db2deea10f4d081b48305794456f14b183b4bd2db`
+passes initialization/Paris, active drain and explicit 1 GiB rejection, but strict
+stream Count 1-to-2 returns `2` and **fails**. Kind chart/downloader/checksum/
+limits/drain/cleanup components pass; final-answer quality is outside that gate
+and `release_qualified` remains false. No image was published.
+Portable `07fe153` E4B sustained c1 passes its own 246-ID EOS answer. Its c4 run
+fails the unchanged 300-second request deadline with cancellation/incomplete
+waves; no retry or context reduction was made. Native `ef9fc61` 254-ID c4 success
+is not inherited. A separate amd64-v3 build is pending, with no qualification.
+On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
+formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
+prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
+five positive client TTFT samples each; this is not a performance comparison.
+ARM, physical NUMA, C4/C4A, actual GPT-OSS, MTP performance/auto, and final
+publication remain incomplete; automatic profiles, paid spend and publication
+remain zero. Final portable/source-matched model and prefix checks stay separate.
 
 Current `ef9fc61` E4B short-answer evidence includes unchanged ctx2048/cap4/t8/Q8/NONE
 initialization and one complete c1 five-planet/DONE answer (59-token EOS),
@@ -65,7 +88,7 @@ cross-run results establish no causal, distribution, speed or automatic claim.
 | Qwen3.6-35B MoE MTP candidate | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF@5bc3e238d916f48a861bac2f8a1990a0e9b7e98d` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b` | Upstream metadata + 16 MiB header range only; full-file SHA/runtime/MoE-head/performance/auto unverified |
 | 35B comparison | `ggml-org/Qwen3.6-35B-A3B-GGUF@7878dc9a905c7c9379e5e8d6a1aa9affdd6839c5` | `Qwen3.6-35B-A3B-Q4_K_M.gguf` | `671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7` | Historical native benchmark only; canonical real 35B/C4/C4A/NUMA qualification unverified |
 | Gemma E2B text inference target | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2` | `gemma-4-E2B-it-Q4_K_M.gguf` | `740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8` | Private a9 passes and historical ad1/d408 failures retained. Root `48dd55a` formal 20 cache-ON/OFF c=1/c=4 raw IDs and four staggered own-c1 complete-answer checks PASS. No mixed-physical-graph, HTTP, broad support/default/performance promotion |
-| Gemma E4B text inference target | `ggml-org/gemma-4-E4B-it-GGUF@a69f018d7678a2b9f5e705f8903d6fb29b9b25dc` | `gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2` | Current `ef9fc61` unchanged ctx2048/cap4/t8/Q8/NONE init PASS; complete 59-EOS c1/repeat and two c4 waves of four match own-c1 IDs/five-planet/DONE answer; sustained c1/c4 254-EOS own-ID gates also pass. HTTP/package/support/performance pending. Historical root `48dd55a` context 2048/capacity 4 init capacity FAIL: plan required 5,921,446,144 > available 4,681,576,448 bytes; zero generation. Peak failed-init RSS 6,236,108 KiB is not RAM savings or successful RAM sizing. Private a9 capacity 1 one-case PASS remains separate; no broad support claim |
+| Gemma E4B text inference target | `ggml-org/gemma-4-E4B-it-GGUF@a69f018d7678a2b9f5e705f8903d6fb29b9b25dc` | `gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2` | Portable `07fe153` sustained c1 own246-EOS PASS; c4 deadline/cancel FAIL with incomplete waves. Native `ef9fc61` evidence stays separate: unchanged ctx2048/cap4/t8/Q8/NONE init PASS; complete 59-EOS c1/repeat and two c4 waves of four match own-c1 IDs/five-planet/DONE answer; sustained c1/c4 254-EOS own-ID gates also pass. HTTP/package/support/performance pending. Historical root `48dd55a` context 2048/capacity 4 init capacity FAIL: plan required 5,921,446,144 > available 4,681,576,448 bytes; zero generation. Peak failed-init RSS 6,236,108 KiB is not RAM savings or successful RAM sizing. Private a9 capacity 1 one-case PASS remains separate; no broad support claim |
 | gpt-oss target | `ggml-org/gpt-oss-20b-GGUF@15dcfc7e7c608c6161507211ed43c5b590801b4b` | `gpt-oss-20b-MXFP4.gguf` | `27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901` | Packed quantized native fixtures passed; safe host-capacity rejection observed; actual HTTP/long/c1/c4 inference and supported RAM range unverified |
 
 Integrated `4ad6a35` JSON checks on each pinned MTP file pass 16 main native

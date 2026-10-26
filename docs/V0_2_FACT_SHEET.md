@@ -2,7 +2,7 @@
 
 **Release readiness is incomplete.** No v0.2 image, tag or release has been
 published by this work. Community post text remains the user's responsibility.
-The current integrated source is `ef9fc61`; historical private-model and earlier
+The latest reviewed runtime source is `07fe153`; historical private-model and earlier
 package evidence below retain separate identities.
 
 Intended deployments are personal PCs, resource-limited CPU Kubernetes pods and
@@ -10,6 +10,29 @@ two-socket NUMA. Candidates add resource budgeting, checked model artifacts,
 metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
+
+Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
+`ef9fc61` model evidence below remains a separate source/profile archive.
+On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
+1378/1354 passed/24 skips, exactly the prior set plus ten unavailable compiled
+packed-Q4/Q5 cases. No Float case is skipped. Portable focused strict ASAN passes
+49/49 with actual mapped dependencies; independent float-fix review passes.
+The local portable amd64 image `sha256:95f8e7e70e157222c652611db2deea10f4d081b48305794456f14b183b4bd2db`
+passes initialization/Paris, active drain and explicit 1 GiB rejection, but strict
+stream Count 1-to-2 returns `2` and **fails**. Kind chart/downloader/checksum/
+limits/drain/cleanup components pass; final-answer quality is outside that gate
+and `release_qualified` remains false. No image was published.
+Portable `07fe153` E4B sustained c1 passes its own 246-ID EOS answer. Its c4 run
+fails the unchanged 300-second request deadline with cancellation/incomplete
+waves; no retry or context reduction was made. Native `ef9fc61` 254-ID c4 success
+is not inherited. A separate amd64-v3 build is pending, with no qualification.
+On `ef9fc61`, Qwen3 six-phase regression checks pass but strict HTTP number-only
+formatting remains FAIL (4/4 off-mode arithmetic answers). Pinned plain 0.8B/2B
+prefix main/pressure/stream HTTP gates pass, including 12 actual hits/restores per streaming model and
+five positive client TTFT samples each; this is not a performance comparison.
+ARM, physical NUMA, C4/C4A, actual GPT-OSS, MTP performance/auto, and final
+publication remain incomplete; automatic profiles, paid spend and publication
+remain zero. Final portable/source-matched model and prefix checks stay separate.
 
 - Integrated `ef9fc61`: native 1377/1363 passed/14 existing skips; selected
   ASAN/LSan 761/752 passed/9 existing skips, zero failures/reports. Go all,
