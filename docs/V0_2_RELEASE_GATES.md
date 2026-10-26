@@ -11,7 +11,38 @@ performance/default promotions are qualified.
 
 ## Evidence boundaries
 
-## Latest source and portable package (`07fe153`)
+## Current local candidate (`1ccca905`)
+
+## Prior source and portable package (`07fe153`)
+
+The latest local review candidate includes source `1ccca9053b98473c84fe19f6d768f8486ef8ae7a`
+(core tree `c827c2bcdca6fe11a846ae0098f5337c2641712a`). It releases the idle
+fallback graph scratch at the completed-worker batch boundary before a separately
+owned Gemma transient prefill arena, preserving the admitted graph budget,
+independent cached graph owners, KV and scheduler state. Scaled exact-capacity
+and ownership tests pass; current native is 1381/1367 passed/14 unchanged skips,
+and selected strict ASAN is 148/148 passed, zero skips/errors.
+A new native MI_OFF installed wheel passes 72 SDK/packaging tests and 12 actual
+completion/lifecycle cases. New-source Gemma installed-DSO raw C API init, C1,
+two sequential repeats and C4 two waves of four pass: all quality requests have
+254 native IDs ending EOS, 216 body words, five ordered paragraphs of three
+sentences, and exact fresh own-C1 IDs/render metadata with post-Free callbacks.
+The fixed profile remains ctx2048/cap4/t8/Q8/NONE/max512/request300/lifetime7200;
+no budget increase, retries, context reduction or old-source ID inheritance.
+This is installed-DSO raw C API evidence, not Python SDK Gemma API, HTTP, new
+server/image, broad support, minimum-RAM, RAM-savings or performance qualification.
+Resource availability/profile differences prevent a cross-run memory-saving claim.
+
+The prior installed `08c2848`/core `07fe153` C4 failure remains preserved: a
+512 MiB metadata lease exceeded the 2368 MiB arena cap with 1920 MiB in use,
+causing a worker exception and failed requests. The current same-budget handoff
+algorithm and actual formerly failing workload pass; the old result is not erased.
+Earlier portable C4 timeout, amd64-v3 Gemma init refusal, strict image Count and
+Qwen3 formatting failures also remain source/profile-labeled. Current `1ccca`
+performance and other-model regressions are UNKNOWN; the K2/K3 performance FAIL
+measurements below belong to `07fe153` and do not transfer to the new source.
+Automatic MTP profiles remain zero. Release readiness remains incomplete with
+billing disabled and GPT-OSS/ARM/physical NUMA/C4/C4A/publication gaps unchanged.
 
 Current `07fe153` embedding qualification passes on the original four texts.
 Installed native MI_OFF SDK Python AUTO/LAST and same-handle C default/CEx-LAST
@@ -58,7 +89,7 @@ Container strict Count and portable E4B c4 failures remain unchanged. MTP
 performance V1 failed a precondition before measurement; final K2/K3 results
 below are separate fresh runs and neither qualifies automatic activation.
 
-Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
+Prior reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
 `ef9fc61` model evidence below remains a separate source/profile archive.
 On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
 1378/1354 passed/24 skips, exactly the prior set plus ten unavailable compiled
@@ -120,6 +151,19 @@ Current independent review pins (local receipts, not public artifact promises):
 | `v02-mtp-stop-07fe-amd64-v3-2b-c1-k3/k3-independent-small-review.json` | `00762b59309142e22d43f29b8e5f061f2ba166b3297a8aec22438115f623f989` |
 | `v02-mtp-sampling-07fe-k3-preparation/independent-completed-review.json` | `de34177396b060d27f39ebbbc783c3d9bcc665bf4e4a4eaf944e8fb72f183c86` |
 | `v02-cloud-readonly-preflight-20261026.log` | `5f4589bdf3c1085b3a38bf65fbb2dab3db2b38f03bed51926d7434e00d14a8e8` |
+
+New-source evidence pins (all old receipts remain immutable):
+
+| Evidence | SHA-256 |
+|---|---|
+| `gemma-arena-isolation-1ccca-pipeline/independent-postreview.json` | `47aba420b341fd19280da086ea97d9de79b013c21d785cc131acc62d46f83c1d` |
+| `wheel-1ccca-20261026/installed-qualified-manifest.json` | `7054fb17c75d3f85b059fdbf7e08d67d35ac1cac5b998018a4be8478a456c125` |
+| `wheel-1ccca-20261026/independent-installed-prerequisite-review.json` | `cbcd43edf4f5b6e50b5f4643675e7c169cc6ccd87e49eacdc82b3abbe13f01ac` |
+| `v02-gemma-wheel-mi-off-1ccca/c4-independent-small-review.json` | `e2d9286597f547e2f78bc030917c5f5c6325685f5f9938fd8b83030da137c015` |
+
+The new wheel SHA is `2ce3689f1b745bd5a8cf4278cfe779cb2f8ff3bdcf12977766db4ed6f6cec986`.
+Its cp313/linux-x86_64/native-host/MI_OFF version remains `0.1.0`; this is local
+source-bound qualification, not a published v0.2 package or a manylinux claim.
 
 ## Frozen native source qualification (`ef9fc61`)
 

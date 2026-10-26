@@ -2,7 +2,7 @@
 
 **Release readiness is incomplete.** No v0.2 image, tag or release has been
 published by this work. Community post text remains the user's responsibility.
-The latest reviewed runtime source is `07fe153`; historical private-model and earlier
+The latest reviewed runtime source is `1ccca905`; historical private-model and earlier
 package evidence below retain separate identities.
 
 Intended deployments are personal PCs, resource-limited CPU Kubernetes pods and
@@ -10,6 +10,35 @@ two-socket NUMA. Candidates add resource budgeting, checked model artifacts,
 metadata-driven pooling, request/prefix ownership, speculative verification and
 native-backed Python completion metadata. See the [release gates](V0_2_RELEASE_GATES.md)
 and [model catalog](MODEL_CATALOG.md).
+
+The latest local review candidate includes source `1ccca9053b98473c84fe19f6d768f8486ef8ae7a`
+(core tree `c827c2bcdca6fe11a846ae0098f5337c2641712a`). It releases the idle
+fallback graph scratch at the completed-worker batch boundary before a separately
+owned Gemma transient prefill arena, preserving the admitted graph budget,
+independent cached graph owners, KV and scheduler state. Scaled exact-capacity
+and ownership tests pass; current native is 1381/1367 passed/14 unchanged skips,
+and selected strict ASAN is 148/148 passed, zero skips/errors.
+A new native MI_OFF installed wheel passes 72 SDK/packaging tests and 12 actual
+completion/lifecycle cases. New-source Gemma installed-DSO raw C API init, C1,
+two sequential repeats and C4 two waves of four pass: all quality requests have
+254 native IDs ending EOS, 216 body words, five ordered paragraphs of three
+sentences, and exact fresh own-C1 IDs/render metadata with post-Free callbacks.
+The fixed profile remains ctx2048/cap4/t8/Q8/NONE/max512/request300/lifetime7200;
+no budget increase, retries, context reduction or old-source ID inheritance.
+This is installed-DSO raw C API evidence, not Python SDK Gemma API, HTTP, new
+server/image, broad support, minimum-RAM, RAM-savings or performance qualification.
+Resource availability/profile differences prevent a cross-run memory-saving claim.
+
+The prior installed `08c2848`/core `07fe153` C4 failure remains preserved: a
+512 MiB metadata lease exceeded the 2368 MiB arena cap with 1920 MiB in use,
+causing a worker exception and failed requests. The current same-budget handoff
+algorithm and actual formerly failing workload pass; the old result is not erased.
+Earlier portable C4 timeout, amd64-v3 Gemma init refusal, strict image Count and
+Qwen3 formatting failures also remain source/profile-labeled. Current `1ccca`
+performance and other-model regressions are UNKNOWN; the K2/K3 performance FAIL
+measurements below belong to `07fe153` and do not transfer to the new source.
+Automatic MTP profiles remain zero. Release readiness remains incomplete with
+billing disabled and GPT-OSS/ARM/physical NUMA/C4/C4A/publication gaps unchanged.
 
 Current `07fe153` embedding qualification passes on the original four texts.
 Installed native MI_OFF SDK Python AUTO/LAST and same-handle C default/CEx-LAST
@@ -56,7 +85,7 @@ Container strict Count and portable E4B c4 failures remain unchanged. MTP
 performance V1 failed a precondition before measurement; final K2/K3 results
 below are separate fresh runs and neither qualifies automatic activation.
 
-Latest reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
+Prior reviewed runtime source is `07fe15377f6c98cd21e4072b6b98b1a2bb6c743a`;
 `ef9fc61` model evidence below remains a separate source/profile archive.
 On `07fe153`, native tests are 1378/1364 passed/14 existing skips; portable
 1378/1354 passed/24 skips, exactly the prior set plus ten unavailable compiled
