@@ -565,7 +565,10 @@ bool GemmaRepackSupportsFixture(const GemmaRepackFixture& fixture) {
     std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
         ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),bufts.cpu_repack),ggml_backend_buffer_free);
     EXPECT_NE(buffer,nullptr);
-    return buffer && (qkv->extra || gate_up->extra);
+    // Failure injection and idempotence fixtures use 16 base rows so both
+    // fused shapes align even when the backend requires groups of 16 rows.
+    EXPECT_EQ(qkv->extra != nullptr,gate_up->extra != nullptr);
+    return buffer && qkv->extra && gate_up->extra;
 }
 
 void CheckGemmaRepackGolden(GemmaRepackFixture& fixture) {
@@ -624,7 +627,7 @@ TEST(Gemma4RepackStaging, GrowingPaddedSourceRowsPreserveBytesOutputsAndSinglePa
 
 TEST(Gemma4RepackStaging, FailedMaterializationReleasesStagingAndLeavesNoPublishedAliases) {
     for (int fail_after : {0,1,3}) {
-        GemmaRepackFixture fixture;
+        GemmaRepackFixture fixture(3,16);
         size_t peak = 0,live = 0;
         const bool supported = GemmaRepackSupportsFixture(fixture);
         EXPECT_EQ(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,fail_after),!supported);
@@ -657,7 +660,7 @@ TEST(Gemma4RepackStaging, NoAliasAndUnsupportedRowsDoNotStageOrRetainBuffers) {
 
 TEST(Gemma4RepackStaging, PublicationFailureRestoresOlderKeysAndAllowsCleanRetry) {
     for (int publication : {0,1,3}) {
-        GemmaRepackFixture fixture;
+        GemmaRepackFixture fixture(3,16);
         auto* previous = fixture.model->layers[0].Get("attn_q.weight");
         fixture.model->layers[0].Set("attn_qkv.cpu_repack_fused",previous);
         size_t peak = 0,live = 0;
@@ -680,7 +683,7 @@ TEST(Gemma4RepackStaging, PublicationFailureRestoresOlderKeysAndAllowsCleanRetry
 }
 
 TEST(Gemma4RepackStaging, AlreadyOwnedPreparationIsIdempotentAndIncompleteContextIsRejected) {
-    GemmaRepackFixture fixture(2,8,GGML_TYPE_Q4_K,false,256);
+    GemmaRepackFixture fixture(2,16,GGML_TYPE_Q4_K,false,256);
     size_t peak = 0,live = 0;
     ASSERT_TRUE(densecore::testing::PrepareGemma4CpuRepackAliasesForTest(fixture.model.get(),&peak,&live,-1));
     auto& weights = fixture.model->prepared_weights;
