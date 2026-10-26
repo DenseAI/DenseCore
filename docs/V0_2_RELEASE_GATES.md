@@ -57,12 +57,12 @@ c4 generation. The pinned 0.8B MTP artifact
 passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
 actual accept/reject/rollback, cancel/recovery and HTTP
 stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
-Sustained E4B c4, stochastic-matrix and portable-package results remain pending; no performance, automatic
+Portable-package and fresh-source prefix results remain pending; no performance, automatic
 activation, package or broad support qualification follows.
 
 The same pinned 2B MTP file also passes c1/repeat1 and c4/repeat2 native
 exact-128 greedy NONE/MTP parity and HTTP/lifecycle checks. These are explicit
-MTP checks; the stochastic matrix is pending and automatic profiles remain zero.
+MTP checks; automatic profiles remain zero.
 A separate README-file native default-policy smoke passes: derived context
 23,338, threads 16, concurrency 1, AUTO selects NONE, and the short Paris answer
 finishes at 8-token EOS with Free/source/mapping pins. This does not qualify
@@ -71,7 +71,16 @@ Offline V3 qualification of the existing sustained E4B c1 capture passes:
 254 native IDs, EOS, 216 body words and five ordered three-sentence paragraphs.
 The independently reviewed correction permits interior cross-planet references;
 original raw FAIL remains immutable, and reevaluation sends zero new requests.
-Sustained c4 is running, not passed; queued statistical/package work has no result.
+Sustained c4 V3 now passes all eight 254-ID EOS requests against its qualified
+own-c1 baseline, retaining five ordered paragraphs, three sentences each and
+216 body words. This is native isolation; HTTP/package/support remain separate.
+The new four-cell stochastic main strict gate passes 160 HTTP requests with zero
+quality failures, 72 native final requests, eight cancellations and eight HTTP
+disconnect/recoveries. All 32 stop probes suppress literal markers; 31 finish by
+actual string stop. Two separate exact-stop-instruction negatives remain:
+0.8B c1 NONE is verbose and 0.8B c4 MTP returns `Paris ` with a trailing space.
+Historical `4ad6a35` French-punctuation/stop failures are preserved. Unseeded
+cross-run results establish no causal, distribution, speed or automatic claim.
 
 Prior `4ad6a35` native 1347/1333/14 and ASAN 702/693/9 remain source-labeled,
 including its JSON model passes and probabilistic overall FAIL below. They do
@@ -94,11 +103,11 @@ Python tokenizer is available), not native prompt accounting.
 
 | Track | Verified evidence and source | Remaining gate |
 |---|---|---|
-| A | Integrated `ef9fc61` native 1363-pass/14-skip, selected ASAN 752-pass/9-skip, Go/race and policy 38 pass | SDK TLS/package contexts remain limited; stochastic-matrix and final package qualification pending |
+| A | Integrated `ef9fc61` native 1363-pass/14-skip, selected ASAN 752-pass/9-skip, Go/race and policy 38 pass | SDK TLS/package contexts remain limited; fresh-source prefix and final package qualification pending |
 | B/H | `ef9fc61` original200 c1/c8 51-EOS parity, separate80 c1 128-LENGTH, full80 37-request gate PASS with active8/pending8 | Native bounded correctness/admission only; final image/platform and matched performance remain |
-| B Gemma | `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init PASS and complete 59-EOS c1/repeats and two c4 waves of four exact-own-c1 answers; historical `48dd55a` E2B grid retained | Sustained c4 generation and HTTP/package/support/performance remain pending |
+| B Gemma | `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init PASS and complete 59-EOS c1/repeats/c4 and sustained 254-EOS c1/c4 own-ID gates; historical `48dd55a` E2B grid retained | HTTP/package/support/performance remain pending |
 | C | Historical `7ecaf86` README-pinned 0.8B/plain 2B combined prefix checks passed c=1/2/4, five-turn answers, restore/skipped prefill, cancellation and eviction | Do not inherit those results across later numerical changes; Qwen3.6, matched performance and default-policy promotion remain separate |
-| D | Current `ef9fc61` pinned 0.8B greedy native/HTTP MTP c1/c4 parity/lifecycle PASS. Historical root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
+| D | Current `ef9fc61` pinned 0.8B/2B greedy native/HTTP MTP c1/c4 and four-cell stochastic main strict PASS; two stop-instruction negatives retained. Historical root `48dd55a` narrow hard-mask NONE/MTP lifecycle PASS. Source `4ad6a35` JSON both-model PASS and probabilistic rejection/rollback/stop evidence retained; historical `7ecaf86` greedy parity separate | Source `4ad6a35` probabilistic matrix overall FAIL: one 0.8B c4 French punctuation failure plus separate stop-instruction negative. No inheritance to `48dd55a`; distribution/speed/35B/auto absent |
 | E | Go-only `386b800` portable amd64 image passed actual container and kind strict active drain, resource limits, checksum rejection and safe memory refusal | Strict Count quality still fails. Current root core has no final image validation; original init-log capture has syntax checks only; native Arm remains unverified |
 | F | GPT-OSS packed MXFP4/bias/router/activation, attention sink/window and tokenizer/Harmony fixtures | Actual HTTP/long/c=1/4/stop/stream inference and supported peak RSS/context remain unverified; safe capacity refusal is not model support |
 | G | Public physical-NUMA preflight and matched ABBA harness | Actual 35B/122B two-socket measurements, 16/48 physical cores and remote-memory penalty; no promotion |
@@ -327,6 +336,8 @@ identities before publishing any claim; use the relative reproduction links abov
   `v02-gemma-resource-isolation-e4b-quality-repeat/quality-gate.json`,
   `v02-gemma-resource-isolation-e4b-quality-c4/quality-gate.json`.
 - `v02-mtp-resource-isolation-{08b,2b}/receipt.json` and pinned c1/c4 summaries.
+- `v02-mtp-sampling-resource-isolation-matrix-{receipt,report}.json`;
+  `v02-gemma-resource-isolation-e4b-quality-sustained-c4-v3/quality-gate.json`.
 - `v02-resource-isolation-default-auto-native-readme/result.json`;
   `v02-gemma-resource-isolation-e4b-quality-sustained-c1-v3/qualification.json`
   binds independent review SHA `c1c7c7c092a310fda03eca22fb1b7e468e0085eb94a04a38a5f4056f3c3f6a28`

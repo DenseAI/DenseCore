@@ -23,8 +23,7 @@ and [model catalog](MODEL_CATALOG.md).
 - Actual `ef9fc61` E4B unchanged ctx2048/cap4/t8/Q8/NONE init passes:
   required 3,468,717,568 <= available 3,505,483,776 plan bytes; peak child RSS
   6,240,676 KiB. Separate c1 passes one complete five-planet/DONE answer at
-  59-token EOS; two repeats match its IDs and complete answer. Sustained
-  c4 generation and HTTP/package/support
+  59-token EOS; two repeats match its IDs and complete answer. HTTP/package/support
   and performance remain pending. Same-source pinned 0.8B and 2B MTP greedy/native/HTTP requalification passes.
   Manifest SHA: `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
 
@@ -36,12 +35,12 @@ c4 generation. The pinned 0.8B MTP artifact
 passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
 actual accept/reject/rollback, cancel/recovery and HTTP
 stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
-Sustained E4B c4, stochastic-matrix and portable-package results remain pending; no performance, automatic
+Portable-package and fresh-source prefix results remain pending; no performance, automatic
 activation, package or broad support qualification follows.
 
 The same pinned 2B MTP file also passes c1/repeat1 and c4/repeat2 native
 exact-128 greedy NONE/MTP parity and HTTP/lifecycle checks. These are explicit
-MTP checks; the stochastic matrix is pending and automatic profiles remain zero.
+MTP checks; automatic profiles remain zero.
 A separate README-file native default-policy smoke passes: derived context
 23,338, threads 16, concurrency 1, AUTO selects NONE, and the short Paris answer
 finishes at 8-token EOS with Free/source/mapping pins. This does not qualify
@@ -50,7 +49,16 @@ Offline V3 qualification of the existing sustained E4B c1 capture passes:
 254 native IDs, EOS, 216 body words and five ordered three-sentence paragraphs.
 The independently reviewed correction permits interior cross-planet references;
 original raw FAIL remains immutable, and reevaluation sends zero new requests.
-Sustained c4 is running, not passed; queued statistical/package work has no result.
+Sustained c4 V3 now passes all eight 254-ID EOS requests against its qualified
+own-c1 baseline, retaining five ordered paragraphs, three sentences each and
+216 body words. This is native isolation; HTTP/package/support remain separate.
+The new four-cell stochastic main strict gate passes 160 HTTP requests with zero
+quality failures, 72 native final requests, eight cancellations and eight HTTP
+disconnect/recoveries. All 32 stop probes suppress literal markers; 31 finish by
+actual string stop. Two separate exact-stop-instruction negatives remain:
+0.8B c1 NONE is verbose and 0.8B c4 MTP returns `Paris ` with a trailing space.
+Historical `4ad6a35` French-punctuation/stop failures are preserved. Unseeded
+cross-run results establish no causal, distribution, speed or automatic claim.
 
 - Historical `48dd55a` hard-mask NONE/MTP lifecycle passes: four contradictory-mask
   errors with zero output/generated tokens, six healthy peers/recoveries and

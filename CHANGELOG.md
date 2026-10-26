@@ -19,11 +19,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   passes c1/repeat1 and c4/repeat2 greedy NONE/MTP exact-128 native parity,
   actual accept/reject/rollback, cancel/recovery and HTTP
   stream/nonstream/disconnect checks. It is separate from README's `f5b14d…` file.
-  Sustained E4B c4, stochastic-matrix and portable-package results remain pending; no performance, automatic
+  Portable-package and fresh-source prefix results remain pending; no performance, automatic
   activation, package or broad support qualification follows.
 - The same pinned 2B MTP file also passes c1/repeat1 and c4/repeat2 native
   exact-128 greedy NONE/MTP parity and HTTP/lifecycle checks. These are explicit
-  MTP checks; the stochastic matrix is pending and automatic profiles remain zero.
+  MTP checks; automatic profiles remain zero.
   A separate README-file native default-policy smoke passes: derived context
   23,338, threads 16, concurrency 1, AUTO selects NONE, and the short Paris answer
   finishes at 8-token EOS with Free/source/mapping pins. This does not qualify
@@ -32,7 +32,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   254 native IDs, EOS, 216 body words and five ordered three-sentence paragraphs.
   The independently reviewed correction permits interior cross-planet references;
   original raw FAIL remains immutable, and reevaluation sends zero new requests.
-  Sustained c4 is running, not passed; queued statistical/package work has no result.
+  Sustained c4 V3 now passes all eight 254-ID EOS requests against its qualified
+  own-c1 baseline, retaining five ordered paragraphs, three sentences each and
+  216 body words. This is native isolation; HTTP/package/support remain separate.
+  The new four-cell stochastic main strict gate passes 160 HTTP requests with zero
+  quality failures, 72 native final requests, eight cancellations and eight HTTP
+  disconnect/recoveries. All 32 stop probes suppress literal markers; 31 finish by
+  actual string stop. Two separate exact-stop-instruction negatives remain:
+  0.8B c1 NONE is verbose and 0.8B c4 MTP returns `Paris ` with a trailing space.
+  Historical `4ad6a35` French-punctuation/stop failures are preserved. Unseeded
+  cross-run results establish no causal, distribution, speed or automatic claim.
 - Requalify frozen `ef9fc61`: native 1377/1363 passed/14 existing skips;
   selected ASAN/LSan 761/752 passed/9 existing skips; Go all/race count=3 and
   policy 38 pass. Final audits are no-work; successful initial pretest relinks
@@ -45,7 +54,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   one complete five-planet/DONE c1 answer at 59-token EOS, plus two exact-ID
   complete-answer repeats. Init plan required
   3,468,717,568 <= available 3,505,483,776 bytes; peak child RSS 6,240,676 KiB.
-  sustained c4 generation and HTTP/package/support remain pending.
+  HTTP/package/support remain pending.
   Same-source pinned 0.8B and 2B MTP greedy/native/HTTP requalification passes; historical results below keep their own sources.
   Manifest SHA: `2fc9bc7640a04aad7796c4a8022828170fbbc31351bdb9071cdc9c10c9e0a5a0`.
 - Add common Linux resource budgeting, context-preserving automatic concurrency,
