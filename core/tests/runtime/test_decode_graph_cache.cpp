@@ -5,7 +5,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "densecore/runtime/inference.h"
@@ -1081,6 +1083,185 @@ TEST(GraphCacheOwnershipTest, IdleTransientArenaRekeysUnderSharedPoolPressureAnd
     }
     ggml_backend_free(backend);
     EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+}
+
+namespace {
+struct HandoffInferenceContext {
+    InferenceContext value;
+    ~HandoffInferenceContext() { value.Free(); }
+};
+}
+
+TEST(GraphCacheOwnershipTest, PersistentToTransientHandoffPreservesIndependentCachedGraphWithinExactBudget) {
+    using namespace densecore::llm::graph;
+    using namespace densecore::runtime;
+    constexpr uint64_t KiB = 1024;
+    constexpr uint64_t capacity = 2368 * KiB;
+    constexpr uint64_t persistent_bytes = 1728 * KiB;
+    constexpr uint64_t cache_bytes = 192 * KiB;
+    constexpr uint64_t metadata_bytes = 512 * KiB;
+    const auto before = ResourceLedgerUsageSnapshot();
+    {
+        RuntimeMemoryPlan plan;
+        plan.graph_bytes = before.graph_bytes + capacity;
+        plan.available_bytes = plan.RequiredBytes();
+        plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+        ResourcePlanLease reservation(plan);
+        {
+            std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+            ASSERT_NE(backend,nullptr);
+            CachedGraphStorage cached;
+            cached.allocation_lease = ResourceAllocationLease::Acquire(AllocationCategory::Graph,cache_bytes);
+            ASSERT_TRUE(cached.allocation_lease);
+            cached.ctx = ggml_init({cache_bytes,nullptr,false});
+            ASSERT_NE(cached.ctx,nullptr);
+            cached.embd_inp = ggml_new_tensor_1d(cached.ctx,GGML_TYPE_F32,4);
+            ASSERT_NE(cached.embd_inp,nullptr);
+            // Independent engine input storage: cached graph inputs must not
+            // acquire a dependency on the fallback context being handed off.
+            std::array<float,4> engine_input{1.f,2.f,3.f,4.f};
+            cached.embd_inp->data = engine_input.data();
+            cached.output = ggml_add(cached.ctx,cached.embd_inp,cached.embd_inp);
+            cached.graph = ggml_new_graph_custom(cached.ctx,32,false);
+            ggml_build_forward_expand(cached.graph,cached.output);
+            const auto compute_cached = [&] {
+                ASSERT_EQ(ggml_graph_compute_with_ctx(cached.ctx,cached.graph,1),GGML_STATUS_SUCCESS);
+                const auto* output = static_cast<const float*>(cached.output->data);
+                for (size_t i = 0; i < engine_input.size(); ++i) EXPECT_FLOAT_EQ(output[i],2*engine_input[i]);
+            };
+            compute_cached();
+            HandoffInferenceContext persistent;
+            persistent.value.Init(persistent_bytes);
+            ASSERT_TRUE(persistent.value.IsInitialized());
+            EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+cache_bytes+persistent_bytes);
+            GraphCache arenas;
+            auto arena = arenas.AcquireArena({},metadata_bytes,2,nullptr).arena;
+            ASSERT_NE(arena,nullptr);
+            // Exact scaled failure: 2368 - (1728 + 192) = 448 < 512.
+            ASSERT_FALSE(arena->Ensure(metadata_bytes,backend.get()));
+            EXPECT_EQ(arena->LastError().find("stage=metadata_lease_denied"),0u);
+            ResourceAllocationRejection rejection;
+            EXPECT_FALSE(ResourceAllocationLease::Acquire(AllocationCategory::Graph,metadata_bytes,&rejection));
+            EXPECT_EQ(rejection.requested_bytes,metadata_bytes);
+            EXPECT_EQ(rejection.used_bytes,before.graph_bytes+1920*KiB);
+            EXPECT_EQ(rejection.available_bytes,448*KiB);
+            EXPECT_EQ(rejection.capacity_bytes,plan.graph_bytes);
+            // This is the production handoff invoked by the worker before
+            // AcquireArena/build, not a manually simulated Free().
+            EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),persistent_bytes);
+            EXPECT_FALSE(persistent.value.IsInitialized());
+            EXPECT_EQ(persistent.value.compute_buffer,nullptr);
+            EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+cache_bytes);
+            EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),0u);
+            ASSERT_TRUE(arena->Ensure(metadata_bytes,backend.get())) << arena->LastError();
+            auto* input = ggml_new_tensor_1d(arena->ctx(),GGML_TYPE_F32,4);
+            ggml_set_input(input);
+            auto* output = ggml_add(arena->ctx(),input,input);
+            ggml_set_output(output);
+            auto* graph = ggml_new_graph_custom(arena->ctx(),32,false);
+            ggml_build_forward_expand(graph,output);
+            ASSERT_TRUE(arena->AllocGraph(graph)) << arena->LastError();
+            const std::array<float,4> values{5.f,6.f,7.f,8.f};
+            std::array<float,4> actual{};
+            ggml_backend_tensor_set(input,values.data(),0,sizeof(values));
+            ASSERT_EQ(ggml_backend_graph_compute(backend.get(),graph),GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(output,actual.data(),0,sizeof(actual));
+            for (size_t i = 0; i < values.size(); ++i) EXPECT_FLOAT_EQ(actual[i],2*values[i]);
+            EXPECT_GT(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+cache_bytes+metadata_bytes);
+            EXPECT_LE(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+capacity);
+            engine_input = {9.f,10.f,11.f,12.f};
+            compute_cached();
+            // Reverse handoff must respect a pinned active arena, then reclaim
+            // its real metadata/payload through the existing idle-cache path.
+            EXPECT_THROW(persistent.value.Init(persistent_bytes),densecore::OutOfMemoryException);
+            EXPECT_FALSE(persistent.value.IsInitialized());
+            EXPECT_EQ(arenas.ReleaseIdleArenasExcept(nullptr),0u);
+            arena.reset();
+            EXPECT_EQ(arenas.ReleaseIdleArenasExcept(nullptr),1u);
+            EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+cache_bytes);
+            persistent.value.Init(persistent_bytes);
+            EXPECT_TRUE(persistent.value.IsInitialized());
+            compute_cached();
+            EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),persistent_bytes);
+            EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),0u);
+            cached.Reset();
+            cached.Reset();
+            EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+        }
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+    }
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes);
+}
+
+TEST(GraphCacheOwnershipTest, TransientHandoffLeavesSelectedAndIneligibleFallbackGraphsAlive) {
+    using namespace densecore::runtime;
+    constexpr uint64_t bytes = 256*1024;
+    const auto before = ResourceLedgerUsageSnapshot();
+    {
+        RuntimeMemoryPlan plan;
+        plan.graph_bytes = before.graph_bytes+bytes;
+        plan.available_bytes = plan.RequiredBytes();
+        plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+        ResourcePlanLease reservation(plan);
+        HandoffInferenceContext persistent;
+        EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),0u);
+        persistent.value.Init(bytes);
+        auto* input = ggml_new_tensor_1d(persistent.value.GetContext(),GGML_TYPE_F32,4);
+        ASSERT_NE(input,nullptr);
+        const std::array<float,4> values{1.f,-2.f,3.f,-4.f};
+        std::memcpy(input->data,values.data(),sizeof(values));
+        auto* output = ggml_add(persistent.value.GetContext(),input,input);
+        auto* graph = ggml_new_graph_custom(persistent.value.GetContext(),32,false);
+        ggml_build_forward_expand(graph,output);
+        for (const auto flags : {std::pair<bool,bool>{false,false},{false,true},{true,true}}) {
+            EXPECT_EQ(persistent.value.ReleaseForTransientGraph(flags.first,flags.second),0u);
+            ASSERT_TRUE(persistent.value.IsInitialized());
+            EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+bytes);
+            ASSERT_EQ(ggml_graph_compute_with_ctx(persistent.value.GetContext(),graph,1),GGML_STATUS_SUCCESS);
+            const auto* actual = static_cast<const float*>(output->data);
+            for (size_t i = 0; i < values.size(); ++i) EXPECT_FLOAT_EQ(actual[i],2*values[i]);
+        }
+        EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),bytes);
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+    }
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes);
+}
+
+TEST(GraphCacheOwnershipTest, TransientHandoffDoesNotManufactureCapacityUnderRealPressure) {
+    using namespace densecore::llm::graph;
+    using namespace densecore::runtime;
+    constexpr uint64_t KiB = 1024;
+    const auto before = ResourceLedgerUsageSnapshot();
+    {
+        RuntimeMemoryPlan plan;
+        plan.graph_bytes = before.graph_bytes+768*KiB;
+        plan.available_bytes = plan.RequiredBytes();
+        plan.resource_capacity_bytes = resource_detail::Add(before.planned_bytes,plan.RequiredBytes());
+        ResourcePlanLease reservation(plan);
+        std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+        ASSERT_NE(backend,nullptr);
+        HandoffInferenceContext persistent;
+        persistent.value.Init(512*KiB);
+        auto in_flight = ResourceAllocationLease::Acquire(AllocationCategory::Graph,256*KiB);
+        ASSERT_TRUE(in_flight);
+        EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),512*KiB);
+        auto other_owner = ResourceAllocationLease::Acquire(AllocationCategory::Graph,512*KiB);
+        ASSERT_TRUE(other_owner);
+        ScopedGgmlGraphArena arena;
+        EXPECT_FALSE(arena.Ensure(128*KiB,backend.get()));
+        EXPECT_EQ(arena.LastError().find("stage=metadata_lease_denied"),0u);
+        EXPECT_EQ(ResourceAllocationLease::AvailableBytes(AllocationCategory::Graph),0u);
+        EXPECT_EQ(persistent.value.ReleaseForTransientGraph(true,false),0u);
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+768*KiB);
+        other_owner.reset();
+        ASSERT_TRUE(arena.Ensure(128*KiB,backend.get())) << arena.LastError();
+        arena.Reset();
+        arena.Reset();
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes+256*KiB);
+        in_flight.reset();
+        EXPECT_EQ(ResourceLedgerUsageSnapshot().graph_bytes,before.graph_bytes);
+    }
+    EXPECT_EQ(ProcessPlannedMemoryBytes(),before.planned_bytes);
 }
 
 TEST(GraphCacheOwnershipTest, ActiveArenaCannotBeRekeyedResetOrEvictedAndDenialReportsExactPool) {

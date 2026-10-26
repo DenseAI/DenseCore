@@ -3527,6 +3527,17 @@ void EngineLoop(EngineState* state) {
                         is_prefill_batch && !is_embedding_batch && cpu_backend_active && current_model &&
                         current_model->arch_flags.is_gemma4 && batch.num_seqs == 1 && batch.lora_map.empty();
                     if (use_transient_prefill_arena) {
+                        // The previous batch has finished computing and sampling.
+                        // This branch has not selected or built a current graph:
+                        // its arena owns metadata/payload independently of the
+                        // fallback pool. Retaining that idle pool would spend the
+                        // same graph reservation twice during this handoff.
+                        // Cached graphs have their own contexts/work contexts;
+                        // their inputs use EngineState::compute_buffer, so keep
+                        // those independent cache entries intact.
+                        state->inference_ctx.ReleaseForTransientGraph(
+                            use_transient_prefill_arena,
+                            gf != nullptr || built_decode_graph_cache_entry || built_prefill_graph_cache_entry);
                         constexpr size_t MB = 1024ULL * 1024ULL;
                         const size_t metadata_bytes = 512ULL * MB;
                         PrefillGraphCacheKey arena_key{};

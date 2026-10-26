@@ -73,6 +73,15 @@ void InferenceContext::Reset() {
     }
 }
 
+size_t InferenceContext::ReleaseForTransientGraph(bool eligible_transient_prefill, bool graph_already_built) {
+    if (!eligible_transient_prefill || graph_already_built || !IsInitialized()) {
+        return 0;
+    }
+    const size_t released_bytes = compute_buffer_size;
+    Free();
+    return released_bytes;
+}
+
 void InferenceContext::Free() {
     if (ctx_compute) {
         ggml_free(ctx_compute);

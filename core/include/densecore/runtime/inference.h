@@ -306,6 +306,12 @@ struct InferenceContext {
     // Cleanup (called at engine shutdown)
     void Free();
 
+    // Handoff from a completed fallback graph to a separately owned transient
+    // prefill arena. Call only at the worker's pre-build batch boundary; a
+    // selected/built graph must retain its storage until execution completes.
+    // Returns the released pool bytes, without changing the graph budget.
+    size_t ReleaseForTransientGraph(bool eligible_transient_prefill, bool graph_already_built);
+
     // Get the compute context for graph building
     GgmlContextHandle* GetContext() const { return ctx_compute; }
 
